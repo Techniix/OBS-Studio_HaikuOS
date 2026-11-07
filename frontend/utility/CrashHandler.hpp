@@ -30,7 +30,7 @@
 
 namespace OBS {
 
-enum class PlatformType { InvalidPlatform, Windows, macOS, Linux, FreeBSD };
+enum class PlatformType { InvalidPlatform, Windows, macOS, Linux, FreeBSD, Haiku };
 
 using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::time_point<Clock>;

@@ -79,6 +79,18 @@ public:
 bool IsRunningOnWine();
 #endif
 
+#ifdef __HAIKU__
+#include <obs.h>
+
+class QKeyEvent;
+
+/* Translate a Qt key event into an OBS key that libobs can poll on Haiku */
+obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event);
+
+/* Nominal CPU core frequency in MHz from the kernel's CPU topology, or 0 if unknown */
+uint32_t HaikuGetCpuFrequencyMHz();
+#endif
+
 #ifdef __APPLE__
 typedef enum {
 	kAudioDeviceAccess = 0,

@@ -5,7 +5,7 @@ if(ENABLE_SCRIPTING_PYTHON)
 
   if(OS_WINDOWS)
     find_package(Python 3.8...<3.11 REQUIRED Interpreter Development)
-  elseif(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
+  elseif(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD OR OS_HAIKU)
     find_package(Python 3.8 REQUIRED Interpreter Development)
   else()
     find_package(Python 3.8...<3.12 REQUIRED Interpreter Development)
@@ -46,7 +46,7 @@ if(ENABLE_SCRIPTING_PYTHON)
     PRIVATE "$<$<PLATFORM_ID:Windows,Darwin>:$<TARGET_PROPERTY:Python::Python,INTERFACE_INCLUDE_DIRECTORIES>>"
   )
 
-  target_link_libraries(obs-scripting PRIVATE $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Python::Python>)
+  target_link_libraries(obs-scripting PRIVATE $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD,Haiku>:Python::Python>)
 
   target_link_options(obs-scripting PRIVATE $<$<PLATFORM_ID:Darwin>:LINKER:-undefined,dynamic_lookup>)
 else()

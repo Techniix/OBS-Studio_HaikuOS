@@ -84,6 +84,8 @@ elseif(OS_LINUX)
   include(cmake/os-linux.cmake)
 elseif(OS_FREEBSD OR OS_OPENBSD)
   include(cmake/os-freebsd.cmake)
+elseif(OS_HAIKU)
+  include(cmake/os-haiku.cmake)
 endif()
 
 foreach(graphics_library IN ITEMS opengl metal d3d11)

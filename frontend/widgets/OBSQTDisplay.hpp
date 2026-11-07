@@ -4,6 +4,13 @@
 
 #include <QWidget>
 
+#ifdef __HAIKU__
+#include <QImage>
+
+#include <atomic>
+#include <mutex>
+#endif
+
 #define GREY_COLOR_BACKGROUND 0xFF4C4C4C
 
 class OBSQTDisplay : public QWidget {
@@ -14,11 +21,25 @@ class OBSQTDisplay : public QWidget {
 	OBSDisplay display;
 	bool destroying = false;
 
+#ifdef __HAIKU__
+	/* libobs renders Haiku swapchains offscreen and hands every frame to us (see gl-haiku.c). */
+	std::mutex frameMutex;
+	QImage frame;
+	std::atomic_bool frameUpdatePending = false;
+
+	static void HaikuPresent(void *param, const uint8_t *bgra, uint32_t width, uint32_t height,
+				 uint32_t linesize);
+#endif
+
 protected:
 	virtual void paintEvent(QPaintEvent *event) override;
 	virtual void moveEvent(QMoveEvent *event) override;
 	virtual void resizeEvent(QResizeEvent *event) override;
 	virtual bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
+#ifdef __HAIKU__
+	virtual void showEvent(QShowEvent *event) override;
+	virtual void hideEvent(QHideEvent *event) override;
+#endif
 
 signals:
 	void DisplayCreated(OBSQTDisplay *window);

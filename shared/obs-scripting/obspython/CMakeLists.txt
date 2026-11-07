@@ -12,7 +12,7 @@ if(POLICY CMP0094)
   cmake_policy(SET CMP0094 NEW)
 endif()
 
-if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
+if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD OR OS_HAIKU)
   find_package(Python 3.8 REQUIRED Interpreter Development)
 else()
   find_package(Python 3.8...<3.12 REQUIRED Interpreter Development)

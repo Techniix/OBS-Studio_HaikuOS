@@ -25,6 +25,10 @@
 
 #include <QKeyEvent>
 
+#ifdef __HAIKU__
+#include <utility/platform.hpp>
+#endif
+
 #include "moc_OBSHotkeyEdit.cpp"
 
 void OBSHotkeyEdit::keyPressEvent(QKeyEvent *event)
@@ -51,7 +55,11 @@ void OBSHotkeyEdit::keyPressEvent(QKeyEvent *event)
 #endif
 
 	default:
+#ifdef __HAIKU__
+		new_key.key = HaikuObsKeyFromQtKeyEvent(event);
+#else
 		new_key.key = obs_key_from_virtual_key(event->nativeVirtualKey());
+#endif
 	}
 
 	new_key.modifiers = TranslateQtKeyboardEventModifiers(event->modifiers());

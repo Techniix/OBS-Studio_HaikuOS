@@ -599,7 +599,7 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 		/* --------------------------------------- */
 	run:
 
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__HAIKU__)
 		// Mounted by termina during chromeOS linux container startup
 		// https://chromium.googlesource.com/chromiumos/overlays/board-overlays/+/master/project-termina/chromeos-base/termina-lxd-scripts/files/lxd_setup.sh
 		os_dir_t *crosDir = os_opendir("/opt/google/cros-containers");
@@ -867,7 +867,7 @@ static void set_process_mitigation_policies()
 }
 #endif
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__)
 #define BASE_PATH ".."
 #else
 #define BASE_PATH "../.."

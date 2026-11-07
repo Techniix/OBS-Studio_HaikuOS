@@ -25,6 +25,7 @@ target_sources(
   frontend-tools
   PRIVATE
     $<$<PLATFORM_ID:Darwin>:auto-scene-switcher-osx.mm>
+    $<$<PLATFORM_ID:Haiku>:auto-scene-switcher-haiku.cpp>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:auto-scene-switcher-nix.cpp>
     $<$<PLATFORM_ID:Windows>:auto-scene-switcher-win.cpp>
     $<$<PLATFORM_ID:Windows>:captions-handler.cpp>
@@ -64,6 +65,7 @@ target_link_libraries(
     Qt::Widgets
     "$<$<PLATFORM_ID:Darwin>:$<LINK_LIBRARY:FRAMEWORK,Cocoa>>"
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:X11::X11>
+    $<$<PLATFORM_ID:Haiku>:be>
 )
 
 add_subdirectory("${CMAKE_SOURCE_DIR}/shared/obs-scripting" "${CMAKE_BINARY_DIR}/shared/obs-scripting")

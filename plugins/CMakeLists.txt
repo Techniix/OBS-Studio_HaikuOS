@@ -67,7 +67,7 @@ add_core_module(
 )
 add_core_module(
     frontend-tools
-    PLATFORMS WINDOWS MACOS LINUX
+    PLATFORMS WINDOWS MACOS LINUX HAIKU
     WITH_MESSAGE
 )
 add_core_module(image-source)

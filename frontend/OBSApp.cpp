@@ -33,6 +33,10 @@
 #endif
 #include <qt-wrappers.hpp>
 
+#ifdef __HAIKU__
+#include <utility/platform.hpp>
+#endif
+
 #include <QCheckBox>
 #include <QDesktopServices>
 #if defined(_WIN32) || defined(ENABLE_SPARKLE_UPDATER)
@@ -273,7 +277,11 @@ QObject *CreateShortcutFilter()
 					return true;
 				/* Falls through. */
 			default:
+#ifdef __HAIKU__
+				hotkey.key = HaikuObsKeyFromQtKeyEvent(event);
+#else
 				hotkey.key = obs_key_from_virtual_key(event->nativeVirtualKey());
+#endif
 			}
 
 			if (event->isAutoRepeat())
@@ -1277,7 +1285,9 @@ bool OBSApp::OBSInit()
 
 	qRegisterMetaType<VoidFunc>("VoidFunc");
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if defined(__HAIKU__)
+	blog(LOG_INFO, "Platform: Haiku (%s)", QT_TO_UTF8(QApplication::platformName()));
+#elif !defined(_WIN32) && !defined(__APPLE__)
 	if (QApplication::platformName() == "xcb") {
 		auto native = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
 
@@ -1390,6 +1400,8 @@ string OBSApp::GetVersionString(bool platform) const
 		ver << "openbsd)";
 #elif __FreeBSD__
 		ver << "freebsd)";
+#elif defined(__HAIKU__)
+		ver << "haiku)";
 #else /* assume linux for the time being */
 		ver << "linux)";
 #endif
