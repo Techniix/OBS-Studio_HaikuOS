@@ -1,0 +1,59 @@
+From 09db74368dd1feabd6fc4fcacbb574bdb70af6d8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 14:59:54 -0500
+Subject: [PATCH 4/5] app_server: ReadBitmap(): never read more than fits into
+ the bitmap
+
+BScreen::ReadBitmap() does not check that the bitmap is as large as the
+requested bounds (by default the whole screen), and ConvertBits() only
+limits a copy by the destination's remaining length, not by its height.
+Since the front buffer patches added for double buffered screens are
+copied at an offset into the bitmap, a patch below the bitmap's last row
+was written past its end, into the client's shared memory area.
+
+Limit the copied width and height to the bitmap's size on both paths;
+on the existing path this also fixes the last row being overrun when the
+bitmap is wider but shorter than the bounds.
+---
+ src/servers/app/drawing/DrawingEngine.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index 89c14479..0267793c 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -1385,6 +1385,12 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 	BRect clip(0, 0, buffer->Width() - 1, buffer->Height() - 1);
+ 	bounds = bounds & clip;
+ 
++	// Never read more than fits into the bitmap: BScreen::ReadBitmap() does
++	// not check that the bitmap is as large as the bounds, and ConvertBits()
++	// does not check destination offsets against the bitmap's height.
++	int32 width = min_c(bounds.IntegerWidth() + 1, bitmap->Width());
++	int32 height = min_c(bounds.IntegerHeight() + 1, bitmap->Height());
++
+ 	status_t result;
+ 	RenderingBuffer* backBuffer = fGraphicsCard->IsDoubleBuffered()
+ 		? fGraphicsCard->BackBuffer() : NULL;
+@@ -1405,8 +1411,6 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 
+ 		// Both buffers are read at integer coordinates; keep the front buffer
+ 		// patches aligned with the back buffer copy.
+-		int32 width = bounds.IntegerWidth() + 1;
+-		int32 height = bounds.IntegerHeight() + 1;
+ 		bounds.left = floorf(bounds.left);
+ 		bounds.top = floorf(bounds.top);
+ 		bounds.right = bounds.left + width - 1;
+@@ -1447,8 +1451,7 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 
+ 		result = bitmap->ImportBits(buffer->Bits(), buffer->BitsLength(),
+ 			buffer->BytesPerRow(), buffer->ColorSpace(),
+-			bounds.LeftTop(), BPoint(0, 0),
+-			bounds.IntegerWidth() + 1, bounds.IntegerHeight() + 1);
++			bounds.LeftTop(), BPoint(0, 0), width, height);
+ 	}
+ 
+ 	if (drawCursor) {
+-- 
+2.43.0
+

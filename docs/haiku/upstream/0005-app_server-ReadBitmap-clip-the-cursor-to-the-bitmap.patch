@@ -1,0 +1,63 @@
+From 806372c729635054fff721ae137b4ad9c698064b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 15:00:45 -0500
+Subject: [PATCH 5/5] app_server: ReadBitmap(): clip the cursor to the bitmap
+
+With drawCursor, the cursor's rectangle was read from and written back
+to the bitmap without clipping it to the bitmap. ConvertBits() handles
+negative offsets but not offsets past the right or bottom edge, so with
+the cursor near or beyond the bottom of the read area, the write-back
+of a B_RGBA32 bitmap (the plain copy path) ran past the bitmap's end.
+
+Only read and write back the part of the cursor inside the bitmap, and
+skip compositing when none of it is.
+---
+ src/servers/app/drawing/DrawingEngine.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index 0267793c..be040404 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -1464,14 +1464,25 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 
+ 		BPoint cursorPosition = fGraphicsCard->CursorPosition();
+ 		cursorPosition -= bounds.LeftTop() + cursor->GetHotSpot();
++		cursorPosition.x = floorf(cursorPosition.x);
++		cursorPosition.y = floorf(cursorPosition.y);
++
++		// Only the part of the cursor that is inside the bitmap is read and
++		// written back: ConvertBits() does not check offsets past the
++		// bitmap's right or bottom edge.
++		BRect visible = BRect(cursorPosition, cursorPosition
++				+ BPoint(cursorWidth - 1, cursorHeight - 1))
++			& BRect(0, 0, bitmap->Width() - 1, bitmap->Height() - 1);
++		if (!visible.IsValid())
++			return result;
++		BPoint visibleInCursor = visible.LeftTop() - cursorPosition;
+ 
+ 		BBitmap cursorArea(BRect(0, 0, cursorWidth - 1, cursorHeight - 1),
+ 			B_BITMAP_NO_SERVER_LINK, B_RGBA32);
+ 
+ 		cursorArea.ImportBits(bitmap->Bits(), bitmap->BitsLength(),
+ 			bitmap->BytesPerRow(), bitmap->ColorSpace(),
+-			cursorPosition,	BPoint(0, 0),
+-			cursorArea.Bounds().Size());
++			visible.LeftTop(), visibleInCursor, visible.Size());
+ 
+ 		uint8* bits = (uint8*)cursorArea.Bits();
+ 		uint8* cursorBits = (uint8*)cursor->Bits();
+@@ -1488,8 +1499,8 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 
+ 		bitmap->ImportBits(cursorArea.Bits(), cursorArea.BitsLength(),
+ 			cursorArea.BytesPerRow(), cursorArea.ColorSpace(),
+-			BPoint(0, 0), cursorPosition,
+-			cursorWidth, cursorHeight);
++			visibleInCursor, visible.LeftTop(),
++			visible.IntegerWidth() + 1, visible.IntegerHeight() + 1);
+ 	}
+ 
+ 	return result;
+-- 
+2.43.0
+

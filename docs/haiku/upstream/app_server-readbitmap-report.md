@@ -14,7 +14,7 @@
 | Affects | Every client that calls `BScreen::ReadBitmap()` repeatedly (screen recorders, streaming software, VNC-like tools), on any accelerant |
 | Symptom | While such a client runs, the mouse pointer moves in bursts and pauses in a regular rhythm, and the whole desktop gets sluggish |
 | Base revision | haiku master `b9fdc8a9e6` (2026-11-06) |
-| Patches | `0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch` (8 files, +138/−14) and `0002-app_server-ReadBitmap-read-front-buffer-areas-with-t.patch` (3 files, +6/−27), which corrects 0001's software-cursor handling and can be squashed into it. A third, independent patch for hardware-cursor issues is in the nvidia-haiku repository (`docs/haiku-upstream/`). |
+| Patches | `0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch` (8 files, +138/−14), the change itself. `0002-app_server-ReadBitmap-read-front-buffer-areas-with-t.patch` (3 files, +6/−27) corrects 0001's software-cursor handling and can be squashed into it. `0004-app_server-ReadBitmap-never-read-more-than-fits-into.patch` fixes an out-of-bounds write in 0001 (and a related existing one) and can be squashed into it too. `0005-app_server-ReadBitmap-clip-the-cursor-to-the-bitmap.patch` fixes an existing out-of-bounds write in the cursor compositing and stands alone. 0003, an independent patch for hardware-cursor issues, is in the nvidia-haiku repository (`docs/haiku-upstream/`); the numbering follows that combined series. |
 
 ## 1. Observed behavior
 
@@ -100,6 +100,16 @@ Where the pieces live:
   - the cursor backup it returned (`fCursorAreaBackup`) is only allocated when *not* double buffered, so it never
     returned anything on that path anyway.
 - **`RemoteDrawingEngine::ReadBitmap()`** gets the same parameter and ignores it.
+- **0004** limits the copied width and height to the bitmap's size. `BScreen::ReadBitmap()` doesn't check that the
+  bitmap is as large as the bounds (by default the whole screen), and `ConvertBits()` limits a copy only by the
+  destination's remaining length, not by its height or by positive offsets. 0001's front-buffer patches are copied
+  at an offset, so a patch below a too-small bitmap's last row was written past its end, into the client's shared
+  memory area. The old path had a smaller form of the same bug (the last row could overrun when the bitmap is wider
+  but shorter than the bounds); the limit applies there too.
+- **0005** fixes an existing bug in the `drawCursor` compositing: the cursor's rectangle was read from and written
+  back to the bitmap unclipped, so with the cursor near or below the bottom of the read area, the write-back into a
+  `B_RGBA32` bitmap (the plain-copy path in `ConvertBits()`) ran past the bitmap's end. Only the part of the cursor
+  inside the bitmap is now read and written back.
 
 ### Behavior changes
 
@@ -114,6 +124,21 @@ Where the pieces live:
 - Right after a mode switch, the back buffer is recreated filled with white (255) until the windows redraw. A read in
   that short window returns white where the old code returned stale front-buffer content.
 
+### Known limitations
+
+- **A software cursor over front-buffer areas** (direct windows, windows in an update session) is captured with
+  them even with `drawCursor = false`, and appears twice with `drawCursor = true`. This was true everywhere before.
+- **New wait on the window lock.** `AS_READ_BITMAP` now takes the Desktop's window write lock. While the Desktop
+  holds that lock it can wait up to 0.5 s for a `BDirectWindow`'s `DirectConnected()` to acknowledge a change. If
+  that app's own drawing thread calls `BScreen::ReadBitmap()` while holding the lock its `DirectConnected()` needs,
+  the acknowledgement times out: the desktop stalls for 0.5 s and the app loses direct access, as with any
+  unresponsive direct window. Before, `ReadBitmap()` only needed the HWInterface lock, which isn't held during that
+  wait. The window lock has no timed variant in userland (`MultiLocker` on `rw_lock`), so this was left as is. No
+  known app captures the screen from inside its own direct-drawing section.
+- **Front-buffer formats `ConvertBits()` can't read** (for example 10-bit or 64-bit modes): the back-buffer part
+  succeeds, but each front-buffer patch fails, so `ReadBitmap()` returns an error only while such areas exist.
+  Before the patch it failed always in those modes, so this isn't a regression.
+
 ## 4. Possible follow-ups (not in the patch)
 
 - `MoveCursorTo()` could avoid blocking on the exclusive lock when a hardware cursor is in use. With this patch, the
@@ -121,10 +146,10 @@ Where the pieces live:
 - A mode for recorders that only needs the parallel lock (accepting tearing) or a damage-tracking API (like
   PipeWire's or `CGDisplayStream`) would let capture tools skip unchanged frames entirely.
 
-### Related app_server findings (not part of the patch)
+### Related app_server findings (fixed by 0003, not by this patch)
 
 These came up while the hardware cursor was being enabled in the nvidia-haiku accelerant. They are independent
-of `ReadBitmap()` and only listed for completeness:
+of `ReadBitmap()`; the nvidia-haiku series' 0003 addresses both:
 
 - With a hardware cursor, the drag bitmap is never shown. `HWInterface::_AdoptDragBitmap()` builds
   `fCursorAndDragBitmap`, but only the plain `ServerCursor` is passed to `set_cursor_bitmap`, and
@@ -138,12 +163,16 @@ of `ReadBitmap()` and only listed for completeness:
 
 What was done:
 
-- **Syntax-checked (not compiled).** 0001 + 0002 applied together: all modified files and their dependents (`DrawingEngine.cpp`,
+- **Syntax-checked (not compiled).** The whole series (0001–0005) applied together: all modified files and their dependents (`DrawingEngine.cpp`,
   `HWInterface.cpp`, `ServerApp.cpp`, `RemoteDrawingEngine.cpp`, `AccelerantHWInterface.cpp`, `Desktop.cpp`,
   `ServerWindow.cpp`, `Window.cpp`) were checked with clang 18 (`--target=x86_64-unknown-haiku -fsyntax-only`),
   against the Haiku tree's headers and the app_server's own include paths from its Jamfiles. No errors or new
   warnings.
-- **0001 and 0002 apply in order to master `b9fdc8a9e6`.**
+- **0001, 0002, 0004 and 0005 apply in order to master `b9fdc8a9e6`, with or without 0003.** None of the files
+  they touch changed up to master `313814a7` (2026-11-07).
+- **Bounds checked with a model.** A model of `ConvertBits()`'s copy path, run over 200,000 random cases (bitmap
+  sizes, negative, fractional and off-screen bounds, front-buffer regions, cursor positions), finds no out-of-bounds
+  read or write with 0004 and 0005, and finds them without.
 - **Reviewed against the source.** A second AI pass, which hadn't written the patch, reviewed the first version. It
   found six problems, all fixed in this version:
   1. a data race from calling `VisibleContentRegion()` under the read lock (now the write lock);
@@ -154,7 +183,11 @@ What was done:
   6. the software cursor leaking into direct-window areas. 0001's fix for this didn't work; 0002 replaces it and
      documents the remaining limitation (see Behavior changes).
 
-  The same review checked every site that takes the window lock and the engine lock and found no lock-order
+  A second full review of the series then found the out-of-bounds write fixed by 0004 (and pointed to the existing
+  one fixed by 0005), the window-lock wait and the front-buffer format case listed under Known limitations, and
+  confirmed that hidden, minimized and other-workspace windows are excluded from the front-buffer region.
+
+  The reviews checked every site that takes the window lock and the engine lock and found no lock-order
   inversion. It also confirmed that nothing in `src/servers/app` writes to the front buffer except
   `_CopyToFront()` (through `CopyBackToFront`, `_DrawCursor`, `_RestoreCursorArea`) and direct-window clients.
 
@@ -184,6 +217,5 @@ The OBS port's author will install it on the RTX 5070 machine; results will be a
 
 ## 6. The patch
 
-See `0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch` and
-`0002-app_server-ReadBitmap-read-front-buffer-areas-with-t.patch` next to this report. Both are `git am`-able, in
-order, against master `b9fdc8a9e6`.
+See the `0001`, `0002`, `0004` and `0005` patches next to this report. They are `git am`-able, in that order,
+against master `b9fdc8a9e6` (and current master), with or without nvidia-haiku's `0003` in between.

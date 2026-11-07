@@ -33,14 +33,20 @@ Note the `hrevNNNNN` number. The examples below use `hrevNNNNN`; replace it with
 mkdir -p ~/haiku-dev && cd ~/haiku-dev
 git clone --depth 1 --branch hrevNNNNN https://review.haiku-os.org/haiku.git
 cd haiku
-git -C ~/OBS-Studio_HaikuOS pull                   # wherever you cloned it; 0002 was added on 2026-11-07
-P=~/OBS-Studio_HaikuOS/docs/haiku/upstream
-git apply --check $P/0001-*.patch && git apply $P/0001-*.patch
-git apply --check $P/0002-*.patch && git apply $P/0002-*.patch
+git -C ~/OBS-Studio_HaikuOS pull     # wherever you cloned it; 0002, 0004 and 0005 were added on 2026-11-07
+rm -rf ~/haiku-dev/patches && mkdir ~/haiku-dev/patches
+cp ~/OBS-Studio_HaikuOS/docs/haiku/upstream/0*.patch ~/haiku-dev/patches/
+# Only for the hardware-cursor tests (nvidia-haiku, branch rtx5070-hw-cursor):
+# cp ~/nvidia-haiku/docs/haiku-upstream/0003-*.patch ~/haiku-dev/patches/
+for f in ~/haiku-dev/patches/0*.patch; do
+	git apply --check "$f" && git apply "$f" && echo "applied $(basename $f)" || { echo "FAILED: $f"; break; }
+done
+git status --short     # 6 modified files under src/servers/app (8 with 0003)
 ```
 
-The patches were made against master of 2026-11-06. If you also test the nvidia-haiku hardware-cursor series, apply its `docs/haiku-upstream/0001`–`0003` instead (its 0001 and 0002 are these same files). If `--check` fails, your revision differs in these files; send me
-the error and the hrev and I'll rebase it.
+The loop applies 0001, 0002, (0003,) 0004 and 0005 in order. They were made against master of 2026-11-06 and still
+apply to master of 2026-11-07. If a `--check` fails, your revision differs in these files; send me the error and the
+hrev and I'll rebase them.
 
 ## 3. Configure the build (on Haiku, no cross-compiler is needed)
 
