@@ -486,6 +486,12 @@ struct gs_window {
 	/* I'm not sure how portable defining id to uint32_t is. */
 	uint32_t id;
 	void *display;
+#elif defined(__HAIKU__)
+	/* Haiku swapchains render offscreen; each presented frame is passed to this callback as top-down BGRA
+	 * pixels. It is called from the graphics thread, so the owner must hand the data over to its own
+	 * looper/UI thread. */
+	void (*present)(void *param, const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t linesize);
+	void *param;
 #endif
 };
 

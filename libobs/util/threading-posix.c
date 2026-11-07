@@ -30,6 +30,10 @@
 #include <pthread_np.h>
 #endif
 
+#if defined(__HAIKU__)
+#include <OS.h>
+#endif
+
 #include "bmem.h"
 #include "threading.h"
 
@@ -261,6 +265,9 @@ void os_set_thread_name(const char *name)
 	pthread_setname_np(name);
 #elif defined(__FreeBSD__)
 	pthread_set_name_np(pthread_self(), name);
+#elif defined(__HAIKU__)
+	/* Kernel thread names are limited to B_OS_NAME_LENGTH (32) and truncated automatically. */
+	rename_thread(find_thread(NULL), name);
 #elif defined(__GLIBC__) && !defined(__MINGW32__)
 	if (strlen(name) <= 15) {
 		pthread_setname_np(pthread_self(), name);

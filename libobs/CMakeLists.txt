@@ -269,6 +269,8 @@ elseif(OS_LINUX)
   include(cmake/os-linux.cmake)
 elseif(OS_FREEBSD OR OS_OPENBSD)
   include(cmake/os-freebsd.cmake)
+elseif(OS_HAIKU)
+  include(cmake/os-haiku.cmake)
 endif()
 
 configure_file(obsconfig.h.in "${CMAKE_BINARY_DIR}/config/obsconfig.h" @ONLY)

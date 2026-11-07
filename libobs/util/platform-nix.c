@@ -27,7 +27,12 @@
 #include <glob.h>
 #include <time.h>
 #include <signal.h>
+#if defined(__HAIKU__)
+#include <OS.h>
+#include <image.h>
+#else
 #include <uuid/uuid.h>
+#endif
 
 #include "obsconfig.h"
 
@@ -48,7 +53,7 @@
 #else
 #include <sys/resource.h>
 #endif
-#if !defined(__OpenBSD__)
+#if !defined(__OpenBSD__) && !defined(__HAIKU__)
 #include <sys/sysinfo.h>
 #endif
 #include <spawn.h>
@@ -224,6 +229,13 @@ uint64_t os_gettime_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
 }
 
+#if defined(__HAIKU__)
+/* Haiku keeps per-user settings in ~/config/settings (B_USER_SETTINGS_DIRECTORY) */
+#define HOME_CONFIG_DIR "/config/settings"
+#else
+#define HOME_CONFIG_DIR "/.config"
+#endif
+
 /* should return $HOME/.config/[name] as default */
 int os_get_config_path(char *dst, size_t size, const char *name)
 {
@@ -237,9 +249,9 @@ int os_get_config_path(char *dst, size_t size, const char *name)
 			bcrash("Could not get $HOME\n");
 
 		if (!name || !*name) {
-			return snprintf(dst, size, "%s/.config", home_ptr);
+			return snprintf(dst, size, "%s" HOME_CONFIG_DIR, home_ptr);
 		} else {
-			return snprintf(dst, size, "%s/.config/%s", home_ptr, name);
+			return snprintf(dst, size, "%s" HOME_CONFIG_DIR "/%s", home_ptr, name);
 		}
 	} else {
 		if (!name || !*name)
@@ -263,7 +275,7 @@ char *os_get_config_path_ptr(const char *name)
 			bcrash("Could not get $HOME\n");
 
 		dstr_init_copy(&path, home_ptr);
-		dstr_cat(&path, "/.config/");
+		dstr_cat(&path, HOME_CONFIG_DIR "/");
 		dstr_cat(&path, name);
 	} else {
 		dstr_init_copy(&path, xdg_ptr);
@@ -357,6 +369,16 @@ char *os_get_executable_path_ptr(const char *name)
 	count = pathlen;
 #elif defined(__OpenBSD__)
 	ssize_t count = os_openbsd_get_executable_path(exe);
+#elif defined(__HAIKU__)
+	ssize_t count = -1;
+	image_info image;
+	int32 cookie = 0;
+	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &image) == B_OK) {
+		if (image.type == B_APP_IMAGE) {
+			count = snprintf(exe, sizeof(exe), "%s", image.name);
+			break;
+		}
+	}
 #else
 	ssize_t count = readlink("/proc/self/exe", exe, PATH_MAX - 1);
 	if (count >= 0) {
@@ -925,6 +947,20 @@ FreeBSD_cores_cleanup:
 	dstr_free(&proc_cores);
 	dstr_free(&proc_packages);
 	bfree(text);
+#elif defined(__HAIKU__)
+	uint32 count = 0;
+	int cores = 0;
+	if (get_cpu_topology_info(NULL, &count) == B_OK && count > 0) {
+		cpu_topology_node_info *nodes = bzalloc(sizeof(*nodes) * count);
+		if (get_cpu_topology_info(nodes, &count) == B_OK) {
+			for (uint32 i = 0; i < count; i++) {
+				if (nodes[i].type == B_TOPOLOGY_CORE)
+					cores++;
+			}
+		}
+		bfree(nodes);
+	}
+	physical_cores = cores > 0 ? cores : logical_cores;
 #else
 	physical_cores = logical_cores;
 #endif
@@ -988,6 +1024,49 @@ uint64_t os_get_proc_virtual_size(void)
 	if (!os_get_proc_memory_usage_internal(&kinfo))
 		return 0;
 	return (uint64_t)kinfo.ki_size;
+}
+#elif defined(__HAIKU__)
+static bool os_get_proc_memory_usage_internal(os_proc_memory_usage_t *usage)
+{
+	area_info area;
+	ssize_t cookie = 0;
+
+	usage->resident_size = 0;
+	usage->virtual_size = 0;
+
+	while (get_next_area_info(B_CURRENT_TEAM, &cookie, &area) == B_OK) {
+		usage->resident_size += area.ram_size;
+		usage->virtual_size += area.size;
+	}
+
+	return true;
+}
+
+bool os_get_proc_memory_usage(os_proc_memory_usage_t *usage)
+{
+	return os_get_proc_memory_usage_internal(usage);
+}
+
+uint64_t os_get_proc_resident_size(void)
+{
+	os_proc_memory_usage_t usage;
+	os_get_proc_memory_usage_internal(&usage);
+	return usage.resident_size;
+}
+
+uint64_t os_get_proc_virtual_size(void)
+{
+	os_proc_memory_usage_t usage;
+	os_get_proc_memory_usage_internal(&usage);
+	return usage.virtual_size;
+}
+
+uint64_t os_get_sys_free_size(void)
+{
+	system_info info;
+	if (get_system_info(&info) != B_OK)
+		return 0;
+	return (uint64_t)info.free_memory;
 }
 #else
 typedef struct {
@@ -1067,7 +1146,13 @@ static void os_get_sys_total_size_internal()
 {
 	total_memory_initialized = true;
 
-#ifndef __OpenBSD__
+#if defined(__HAIKU__)
+	system_info info;
+	if (get_system_info(&info) != B_OK)
+		return;
+
+	total_memory = (uint64_t)info.max_pages * B_PAGE_SIZE;
+#elif !defined(__OpenBSD__)
 	struct sysinfo info;
 	if (sysinfo(&info) < 0)
 		return;
@@ -1097,6 +1182,38 @@ uint64_t os_get_free_disk_space(const char *dir)
 }
 #endif
 
+#if defined(__HAIKU__)
+/* Haiku has no libuuid in the base system; build an RFC 4122 version 4 UUID from the kernel's random source. */
+char *os_generate_uuid(void)
+{
+	uint8_t bytes[16];
+	char *out = bmalloc(37);
+	bool ok = false;
+
+	FILE *f = fopen("/dev/urandom", "rb");
+	if (f) {
+		ok = fread(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
+		fclose(f);
+	}
+
+	if (!ok) {
+		/* Should not happen; fall back to a time/process-seeded PRNG rather than failing. */
+		uint64_t seed = os_gettime_ns() ^ ((uint64_t)getpid() << 32);
+		for (size_t i = 0; i < sizeof(bytes); i++) {
+			seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+			bytes[i] = (uint8_t)(seed >> 56);
+		}
+	}
+
+	bytes[6] = (bytes[6] & 0x0f) | 0x40; /* version 4 */
+	bytes[8] = (bytes[8] & 0x3f) | 0x80; /* RFC 4122 variant */
+
+	snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", bytes[0], bytes[1],
+		 bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+		 bytes[12], bytes[13], bytes[14], bytes[15]);
+	return out;
+}
+#else
 char *os_generate_uuid(void)
 {
 	uuid_t uuid;
@@ -1106,3 +1223,4 @@ char *os_generate_uuid(void)
 	uuid_unparse_lower(uuid, out);
 	return out;
 }
+#endif

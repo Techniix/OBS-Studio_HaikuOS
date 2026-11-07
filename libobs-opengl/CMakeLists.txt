@@ -19,11 +19,17 @@ if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
   endif()
 endif()
 
+if(OS_HAIKU)
+  # Haiku's Mesa provides EGL through libglvnd ("haiku" EGL platform)
+  find_package(OpenGL REQUIRED EGL)
+endif()
+
 target_sources(
   libobs-opengl
   PRIVATE
     $<$<AND:$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>,$<BOOL:${ENABLE_WAYLAND}>>:gl-wayland-egl.c>
     $<$<PLATFORM_ID:Darwin>:gl-cocoa.m>
+    $<$<PLATFORM_ID:Haiku>:gl-haiku.c>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:gl-egl-common.c>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:gl-nix.c>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:gl-x11-egl.c>
@@ -60,6 +66,7 @@ target_link_libraries(
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:X11::XCB>
     $<$<AND:$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>,$<BOOL:${ENABLE_WAYLAND}>>:OpenGL::EGL>
     $<$<AND:$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>,$<BOOL:${ENABLE_WAYLAND}>>:Wayland::Egl>
+    $<$<PLATFORM_ID:Haiku>:OpenGL::EGL>
 )
 
 if(OS_WINDOWS)
