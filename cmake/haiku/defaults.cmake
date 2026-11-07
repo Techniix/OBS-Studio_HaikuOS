@@ -41,3 +41,8 @@ set(OBS_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
 
 # Enable find_package targets to become globally available targets
 set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL TRUE)
+
+# SIMDe is header-only and not packaged in HaikuPorts; fall back to the bundled submodule (deps/simde).
+if(NOT DEFINED SIMDe_INCLUDE_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/deps/simde/simde/simde-common.h")
+  set(SIMDe_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/simde" CACHE PATH "Directory containing simde/simde-common.h")
+endif()
