@@ -11,9 +11,15 @@ SRC="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${1:-$SRC/build}"
 shift || true
 
-if [ ! -f "$SRC/deps/simde/simde/simde-common.h" ]; then
-	echo "==> Fetching the SIMDe submodule"
-	git -C "$SRC" submodule update --init deps/simde || exit 1
+# Submodules used on Haiku (obs-browser and libdshowcapture aren't needed)
+SUBMODULES=(deps/simde deps/asio deps/websocketpp deps/srt deps/librist plugins/obs-websocket)
+missing=()
+for m in "${SUBMODULES[@]}"; do
+	[ -e "$SRC/$m/.git" ] || missing+=("$m")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+	echo "==> Fetching submodules: ${missing[*]}"
+	git -C "$SRC" submodule update --init --recursive "${missing[@]}" || exit 1
 fi
 
 # Turn off features whose dependencies are missing instead of failing the configure step.
@@ -29,6 +35,7 @@ command -v swig >/dev/null 2>&1 || OPTS+=(-DENABLE_SCRIPTING=OFF)
 have_header speex/speex_preprocess.h || OPTS+=(-DENABLE_SPEEXDSP=OFF)
 have_header rnnoise.h || OPTS+=(-DENABLE_RNNOISE=OFF)
 have_header rtc/rtc.hpp || OPTS+=(-DENABLE_WEBRTC=OFF)
+have_header vlc/libvlc.h || OPTS+=(-DENABLE_VLC=OFF)
 [ ${#OPTS[@]} -gt 0 ] && echo "==> Missing optional dependencies, adding: ${OPTS[*]}"
 
 LOG="$BUILD/haiku-build.log"
@@ -38,8 +45,6 @@ mkdir -p "$BUILD"
 echo "==> Configuring (log: $LOG)"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
 	-DCMAKE_BUILD_TYPE=RelWithDebInfo \
-	-DENABLE_WEBSOCKET=OFF \
-	-DENABLE_NEW_MPEGTS_OUTPUT=OFF \
 	"${OPTS[@]}" "$@" 2>&1 | tee -a "$LOG" || { echo "!! configure failed, see $LOG"; exit 1; }
 
 echo "==> Building"

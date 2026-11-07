@@ -11,6 +11,7 @@ REQUIRED=(
 	mesa_devel mesa_eglvnd libglvnd_devel
 	freetype_devel fontconfig_devel
 	nlohmann_json libdatachannel_devel
+	vlc_devel
 )
 
 # Scripting (Lua/Python) and the noise suppression filters
@@ -19,9 +20,9 @@ RECOMMENDED=(
 	speexdsp_devel rnnoise_devel
 )
 
-# VLC video source, FDK AAC encoder, obs-websocket (still needs qrcodegencpp, see docs/haiku/BUILDING.md)
+# FDK AAC encoder (Asio, WebSocket++, qrcodegen, SRT and RIST are bundled in deps/)
 OPTIONAL=(
-	vlc_devel fdk_aac_devel websocketpp asio
+	fdk_aac_devel
 )
 
 echo "==> Installing required packages"

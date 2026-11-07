@@ -21,13 +21,20 @@ def haiku_includes(cxx):
         # Haiku's libstdc++ isn't available here; the host's works once a few glibc-isms are papered over.
         inc = ["-nostdinc++", "-isystem", LIBSTDCXX, "-isystem", LIBSTDCXX_ARCH,
                "-isystem", os.path.join(HERE, "shim"), "-D__GLIBC_PREREQ(a,b)=0", "-D__locale_t=locale_t"] + inc
-    for d in [H + "/posix", H + "/glibc", H, H + "/compatibility/bsd", H + "/config", H + "/os",
-              H + "/os/add-ons/graphics"]:
-        inc += ["-isystem", d]
-    for d in sorted(os.listdir(H + "/os")):
-        p = H + "/os/" + d
+    # Same order as INCLUDE_DEFAULTS in Haiku's GCC (buildtools gcc/gcc/config/haiku.h); the installed
+    # /boot/system/develop/headers/{bsd,gnu} come from headers/compatibility/ in the source tree. The order
+    # matters: headers/bsd/features.h must win over headers/posix/features.h to enable _DEFAULT_SOURCE.
+    osdirs = ["", "app", "device", "drivers", "game", "interface", "kernel", "locale", "mail", "media", "midi",
+              "midi2", "net", "opengl", "storage", "support", "translation", "add-ons/graphics",
+              "add-ons/input_server", "add-ons/mail_daemon", "add-ons/registrar", "add-ons/screen_saver",
+              "add-ons/tracker", "be_apps/Deskbar", "be_apps/NetPositive", "be_apps/Tracker"]
+    for d in osdirs:
+        p = H + "/os" + ("/" + d if d else "")
         if os.path.isdir(p):
             inc += ["-isystem", p]
+    for d in [S + "/boot/system/develop/headers/3rdparty", H + "/compatibility/bsd", H + "/glibc",
+              H + "/compatibility/gnu", H + "/posix", H]:
+        inc += ["-isystem", d]
     inc += ["-isystem", S + "/boot/system/develop/headers"]
     return inc
 

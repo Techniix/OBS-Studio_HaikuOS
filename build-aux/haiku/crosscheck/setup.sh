@@ -46,6 +46,7 @@ clone x264 https://github.com/mirror/x264 stable
 clone freetype https://github.com/freetype/freetype VER-2-13-3 include
 clone egl https://github.com/KhronosGroup/EGL-Registry main api
 clone json https://github.com/nlohmann/json v3.11.3 single_include
+clone vlc https://github.com/videolan/vlc 3.0.21 include/vlc
 clone libdatachannel https://github.com/paullouisageneau/libdatachannel v0.22.5 include
 clone speexdsp https://github.com/xiph/speexdsp SpeexDSP-1.2.1 include
 clone rnnoise https://github.com/xiph/rnnoise main include
@@ -89,6 +90,7 @@ cp -r deps/libdatachannel/include/rtc "$I/"
 cp -r deps/speexdsp/include/speex "$I/"
 printf '#ifndef __SPEEX_TYPES_H__\n#define __SPEEX_TYPES_H__\n#include <stdint.h>\ntypedef int16_t spx_int16_t;\ntypedef uint16_t spx_uint16_t;\ntypedef int32_t spx_int32_t;\ntypedef uint32_t spx_uint32_t;\n#endif\n' > "$I/speex/speexdsp_config_types.h"
 cp deps/rnnoise/include/rnnoise.h "$I/"
+cp -r deps/vlc/include/vlc "$I/"
 cp deps/uthash/src/*.h "$I/"
 mkdir -p "$I/luajit-2.1"
 cp deps/luajit/src/{lua.h,lualib.h,lauxlib.h,luaconf.h,lua.hpp} "$I/luajit-2.1/"
@@ -96,7 +98,7 @@ cp deps/luajit/src/luajit_rolling.h "$I/luajit-2.1/luajit.h"
 
 # Stub libraries: find_library() only needs the files to exist; the harness never links.
 for l in avcodec avformat avutil swscale swresample avdevice avfilter jansson z curl x264 freetype fontconfig \
-	EGL GL OpenGL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel; do
+	EGL GL OpenGL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel vlc; do
 	: > "$L/lib$l.so"
 done
 

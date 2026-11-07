@@ -7,6 +7,8 @@ include_guard(GLOBAL)
 if(CMAKE_SYSTEM_NAME STREQUAL "Haiku" OR CMAKE_HOST_SYSTEM_NAME STREQUAL "Haiku")
   set(CMAKE_CXX_EXTENSIONS FALSE)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/haiku")
+  # Haiku-specific find modules (bundled fallbacks for dependencies HaikuPorts doesn't ship) take precedence
+  list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/haiku/finders")
   set(OS_HAIKU TRUE)
   set(OS_FLATPAK FALSE)
 elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")

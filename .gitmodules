@@ -10,3 +10,9 @@
 [submodule "deps/simde"]
 	path = deps/simde
 	url = https://github.com/simd-everywhere/simde.git
+[submodule "deps/asio"]
+	path = deps/asio
+	url = https://github.com/chriskohlhoff/asio.git
+[submodule "deps/websocketpp"]
+	path = deps/websocketpp
+	url = https://github.com/zaphoyd/websocketpp.git

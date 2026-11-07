@@ -9,7 +9,7 @@
 #include <dxgi.h>
 #endif
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__HAIKU__)
 #include "vaapi-utils.h"
 
 #define LIBAVUTIL_VAAPI_AVAILABLE
