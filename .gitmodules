@@ -16,3 +16,9 @@
 [submodule "deps/websocketpp"]
 	path = deps/websocketpp
 	url = https://github.com/zaphoyd/websocketpp.git
+[submodule "deps/srt"]
+	path = deps/srt
+	url = https://github.com/Haivision/srt.git
+[submodule "deps/librist"]
+	path = deps/librist
+	url = https://github.com/nanake/librist.git

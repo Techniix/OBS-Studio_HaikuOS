@@ -19,7 +19,6 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 	-DCMAKE_TOOLCHAIN_FILE="$HERE/haiku-toolchain.cmake" \
 	-DCMAKE_BUILD_TYPE=RelWithDebInfo \
 	-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-	-DENABLE_NEW_MPEGTS_OUTPUT=OFF \
 	-DENABLE_SCRIPTING=OFF \
 	"$@" 2>&1 | tee "$BUILD/configure.log"
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "!! configure failed"; exit 1; }
