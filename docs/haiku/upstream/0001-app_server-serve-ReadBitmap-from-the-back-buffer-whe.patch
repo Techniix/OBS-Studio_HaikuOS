@@ -1,0 +1,322 @@
+From 88a9d4c0cf1e77d856c361cf47b9d90307a83cf9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 13:42:10 -0500
+Subject: [PATCH] app_server: serve ReadBitmap() from the back buffer when
+ double buffered
+
+BScreen::ReadBitmap() copies from the front buffer while holding the
+drawing engine's exclusive lock. The front buffer is usually uncached or
+write-combined video memory, where CPU reads are slow: on an NVIDIA
+RTX 5070 (nvidia_gsp accelerant) a 2560x1080 read takes about 25-30 ms.
+Drawing and cursor movement (HWInterface::MoveCursorTo() takes the
+parallel lock) are blocked for that time, so screen recorders that call
+ReadBitmap() repeatedly make the mouse pointer stutter in a regular
+rhythm and slow down the whole desktop.
+
+AccelerantHWInterface always keeps a back buffer in main memory, and
+everything the app_server draws goes there before being copied to the
+front buffer. When double buffered, read from the back buffer instead,
+except for areas whose current content is only in the front buffer:
+
+ * windows that are directly accessing the frame buffer (BDirectWindow)
+   and BWindowScreen windows, or the whole screen while a BWindowScreen
+   holds the direct screen lock;
+ * windows in an update session: their back buffer content is partly
+   redrawn and only copied to the front buffer in EndUpdate().
+
+The region is collected in ServerApp under the window write lock (the
+windows' regions are recomputed on access), before taking the engine's
+exclusive lock, the same order Desktop uses. The software cursor lives
+only in the front buffer; its area is read from the back buffer, which
+holds what is under it (new HWInterface::SoftwareCursorFrame()). The
+back buffer is read as B_RGB32, since its alpha channel is not
+meaningful.
+
+Behavior changes:
+ * drawCursor = false no longer captures the software cursor, and
+   drawCursor = true no longer composites it a second time over the copy
+   already in the front buffer.
+ * In 8/15/16-bit modes, pixels outside the front-buffer regions have the
+   back buffer's 32-bit colors rather than the displayed, quantized ones.
+
+Single-buffered and remote HWInterfaces keep the old path (and don't
+take the window lock).
+
+This change was written by an AI assistant (Claude, Anthropic) at the
+request of a Haiku user, and has only been syntax-checked and reviewed,
+not built or run. See the accompanying report. Haiku's policy does not
+accept AI-generated contributions; it is offered as a description of the
+problem and one possible fix, for a developer to rewrite or discard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8nyhEF7AfGHjBoDGtq
+---
+ src/servers/app/Desktop.h                     |  2 +
+ src/servers/app/ServerApp.cpp                 | 45 +++++++++--
+ src/servers/app/drawing/DrawingEngine.cpp     | 74 +++++++++++++++++--
+ src/servers/app/drawing/DrawingEngine.h       |  5 +-
+ src/servers/app/drawing/HWInterface.cpp       | 17 +++++
+ src/servers/app/drawing/HWInterface.h         |  4 +
+ .../interface/remote/RemoteDrawingEngine.cpp  |  2 +-
+ .../interface/remote/RemoteDrawingEngine.h    |  3 +-
+ 8 files changed, 138 insertions(+), 14 deletions(-)
+
+diff --git a/src/servers/app/Desktop.h b/src/servers/app/Desktop.h
+index 743f65f..db56569 100644
+--- a/src/servers/app/Desktop.h
++++ b/src/servers/app/Desktop.h
+@@ -136,6 +136,8 @@ public:
+ 
+ 			status_t			LockDirectScreen(team_id team);
+ 			status_t			UnlockDirectScreen(team_id team);
++			bool				IsDirectScreenLocked() const
++									{ return fDirectScreenTeam >= 0; }
+ 
+ 			const ::VirtualScreen& VirtualScreen() const
+ 									{ return fVirtualScreen; }
+diff --git a/src/servers/app/ServerApp.cpp b/src/servers/app/ServerApp.cpp
+index 1a5fbd9..8ea5c4b 100644
+--- a/src/servers/app/ServerApp.cpp
++++ b/src/servers/app/ServerApp.cpp
+@@ -3402,11 +3402,46 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
+ 			bool success = false;
+ 
+ 			BReference<ServerBitmap> bitmap(GetBitmap(token), true);
+-			if (bitmap != NULL) {
+-				if (fDesktop->GetDrawingEngine()->LockExclusiveAccess()) {
+-					success = fDesktop->GetDrawingEngine()->ReadBitmap(bitmap,
+-						drawCursor, bounds) == B_OK;
+-					fDesktop->GetDrawingEngine()->UnlockExclusiveAccess();
++			DrawingEngine* engine = fDesktop->GetDrawingEngine();
++			if (bitmap != NULL && fDesktop->HWInterface()->IsDoubleBuffered()) {
++				// The drawing engine can read most of the screen from the
++				// back buffer in main memory; tell it which areas only have
++				// their current content in the front buffer. The window
++				// write lock keeps the windows' regions and update state
++				// stable while they are read.
++				if (fDesktop->LockAllWindows()) {
++					BRegion frontRegion;
++					bool wholeScreen = fDesktop->IsDirectScreenLocked();
++					int32 workspace = fDesktop->CurrentWorkspace();
++					for (Window* window = fDesktop->CurrentWindows().FirstWindow();
++							window != NULL && !wholeScreen;
++							window = window->NextWindow(workspace)) {
++						if (!window->IsVisible())
++							continue;
++						// Direct windows draw into the front buffer
++						// themselves; during an update session the back
++						// buffer holds a partly redrawn window that is only
++						// copied to the front buffer when the session ends.
++						if (window->ServerWindow()->IsDirectlyAccessing()
++							|| window->InUpdate()
++							|| (window->Flags() & kWindowScreenFlag) != 0) {
++							frontRegion.Include(
++								&window->VisibleContentRegion());
++						}
++					}
++
++					if (engine->LockExclusiveAccess()) {
++						success = engine->ReadBitmap(bitmap, drawCursor,
++							bounds, wholeScreen ? NULL : &frontRegion) == B_OK;
++						engine->UnlockExclusiveAccess();
++					}
++					fDesktop->UnlockAllWindows();
++				}
++			} else if (bitmap != NULL) {
++				if (engine->LockExclusiveAccess()) {
++					success = engine->ReadBitmap(bitmap, drawCursor,
++						bounds) == B_OK;
++					engine->UnlockExclusiveAccess();
+ 				}
+ 			}
+ 
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index 7dc13d5..6233e3f 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -13,6 +13,7 @@
+ #include <Bitmap.h>
+ #include <StackOrHeapArray.h>
+ 
++#include <math.h>
+ #include <stdio.h>
+ 
+ #include <algorithm>
+@@ -1372,7 +1373,8 @@ DrawingEngine::DumpToBitmap()
+ 
+ 
+ status_t
+-DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds)
++DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
++	const BRegion* frontBufferRegion)
+ {
+ 	ASSERT_EXCLUSIVE_LOCKED();
+ 
+@@ -1382,12 +1384,72 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds)
+ 
+ 	BRect clip(0, 0, buffer->Width() - 1, buffer->Height() - 1);
+ 	bounds = bounds & clip;
+-	AutoFloatingOverlaysHider _(fGraphicsCard, bounds);
+ 
+-	status_t result = bitmap->ImportBits(buffer->Bits(), buffer->BitsLength(),
+-		buffer->BytesPerRow(), buffer->ColorSpace(),
+-		bounds.LeftTop(), BPoint(0, 0),
+-		bounds.IntegerWidth() + 1, bounds.IntegerHeight() + 1);
++	status_t result;
++	RenderingBuffer* backBuffer = fGraphicsCard->IsDoubleBuffered()
++		? fGraphicsCard->BackBuffer() : NULL;
++
++	if (backBuffer != NULL && frontBufferRegion != NULL
++		&& backBuffer->Width() == buffer->Width()
++		&& backBuffer->Height() == buffer->Height()) {
++		// The back buffer is a copy of the screen in main memory: everything
++		// the app_server draws goes there first and is then copied to the
++		// front buffer. Reading main memory is much faster than reading the
++		// frame buffer, which usually is uncached or write-combined video
++		// memory; since the exclusive lock is held during the read (and blocks
++		// drawing and cursor movement), that matters.
++		//
++		// The caller passes in frontBufferRegion the areas whose current
++		// content is only in the front buffer (direct windows, windows in an
++		// update session whose back buffer content is not complete yet).
++
++		// Both buffers are read at integer coordinates; keep the front buffer
++		// patches aligned with the back buffer copy.
++		int32 width = bounds.IntegerWidth() + 1;
++		int32 height = bounds.IntegerHeight() + 1;
++		bounds.left = floorf(bounds.left);
++		bounds.top = floorf(bounds.top);
++		bounds.right = bounds.left + width - 1;
++		bounds.bottom = bounds.top + height - 1;
++
++		// The back buffer's alpha channel is not meaningful (drawing may leave
++		// any value there); read it as B_RGB32 like _CopyToFront() does, so
++		// B_RGBA32 bitmaps get opaque pixels.
++		result = bitmap->ImportBits(backBuffer->Bits(),
++			backBuffer->BitsLength(), backBuffer->BytesPerRow(), B_RGB32,
++			bounds.LeftTop(), BPoint(0, 0), width, height);
++
++		BRegion front(*frontBufferRegion);
++		BRegion boundsRegion(bounds);
++		front.IntersectWith(&boundsRegion);
++
++		// The software cursor is drawn on the front buffer only, composited
++		// from the back buffer: where it is, the back buffer has what is on
++		// screen without the cursor.
++		BRect cursorFrame = fGraphicsCard->SoftwareCursorFrame();
++		if (cursorFrame.IsValid())
++			front.Exclude(cursorFrame);
++
++		if (result == B_OK) {
++			for (int32 i = 0; i < front.CountRects(); i++) {
++				clipping_rect rect = front.RectAtInt(i);
++				status_t status = bitmap->ImportBits(buffer->Bits(),
++					buffer->BitsLength(), buffer->BytesPerRow(),
++					buffer->ColorSpace(), BPoint(rect.left, rect.top),
++					BPoint(rect.left - bounds.left, rect.top - bounds.top),
++					rect.right - rect.left + 1, rect.bottom - rect.top + 1);
++				if (status != B_OK)
++					result = status;
++			}
++		}
++	} else {
++		AutoFloatingOverlaysHider _(fGraphicsCard, bounds);
++
++		result = bitmap->ImportBits(buffer->Bits(), buffer->BitsLength(),
++			buffer->BytesPerRow(), buffer->ColorSpace(),
++			bounds.LeftTop(), BPoint(0, 0),
++			bounds.IntegerWidth() + 1, bounds.IntegerHeight() + 1);
++	}
+ 
+ 	if (drawCursor) {
+ 		ServerCursorReference cursorRef = fGraphicsCard->Cursor();
+diff --git a/src/servers/app/drawing/DrawingEngine.h b/src/servers/app/drawing/DrawingEngine.h
+index 98e829b..93c5e54 100644
+--- a/src/servers/app/drawing/DrawingEngine.h
++++ b/src/servers/app/drawing/DrawingEngine.h
+@@ -63,8 +63,11 @@ public:
+ 
+ 	// for screen shots
+ 			ServerBitmap*	DumpToBitmap();
++	// frontBufferRegion (screen coordinates) names areas whose content is
++	// only in the front buffer (direct windows); NULL means "everywhere"
+ 	virtual	status_t		ReadBitmap(ServerBitmap *bitmap, bool drawCursor,
+-								BRect bounds);
++								BRect bounds,
++								const BRegion* frontBufferRegion = NULL);
+ 
+ 	// clipping for all drawing functions, passing a NULL region
+ 	// will remove any clipping (drawing allowed everywhere)
+diff --git a/src/servers/app/drawing/HWInterface.cpp b/src/servers/app/drawing/HWInterface.cpp
+index 35b431f..221fcf8 100644
+--- a/src/servers/app/drawing/HWInterface.cpp
++++ b/src/servers/app/drawing/HWInterface.cpp
+@@ -483,6 +483,23 @@ HWInterface::HideFloatingOverlays(const BRect& area)
+ }
+ 
+ 
++BRect
++HWInterface::SoftwareCursorFrame() const
++{
++	BRect frame;
++	if (!fFloatingOverlaysLock.Lock())
++		return frame;
++
++	if (fCursorAreaBackup.IsSet() && !fCursorAreaBackup->cursor_hidden) {
++		frame.Set(fCursorAreaBackup->left, fCursorAreaBackup->top,
++			fCursorAreaBackup->right, fCursorAreaBackup->bottom);
++	}
++
++	fFloatingOverlaysLock.Unlock();
++	return frame;
++}
++
++
+ bool
+ HWInterface::HideFloatingOverlays()
+ {
+diff --git a/src/servers/app/drawing/HWInterface.h b/src/servers/app/drawing/HWInterface.h
+index 65992d5..4591192 100644
+--- a/src/servers/app/drawing/HWInterface.h
++++ b/src/servers/app/drawing/HWInterface.h
+@@ -169,6 +169,10 @@ public:
+ 			bool				HideFloatingOverlays();
+ 			void				ShowFloatingOverlays();
+ 
++	// The frame buffer area the software cursor is currently drawn on (it is
++	// not in the back buffer), or an invalid rect if there is none.
++			BRect				SoftwareCursorFrame() const;
++
+ 	// Listener support
+ 			bool				AddListener(HWInterfaceListener* listener);
+ 			void				RemoveListener(HWInterfaceListener* listener);
+diff --git a/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp b/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp
+index 7d44ba2..dab5390 100644
+--- a/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp
++++ b/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.cpp
+@@ -981,7 +981,7 @@ RemoteDrawingEngine::StringWidth(const char* string, int32 length,
+ 
+ status_t
+ RemoteDrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor,
+-	BRect bounds)
++	BRect bounds, const BRegion* frontBufferRegion)
+ {
+ 	if (_AddCallback() != B_OK)
+ 		return B_UNSUPPORTED;
+diff --git a/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.h b/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.h
+index acfa60d..560633d 100644
+--- a/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.h
++++ b/src/servers/app/drawing/interface/remote/RemoteDrawingEngine.h
+@@ -35,7 +35,8 @@ public:
+ 
+ 	// for screen shots
+ 	virtual	status_t			ReadBitmap(ServerBitmap* bitmap,
+-									bool drawCursor, BRect bounds);
++									bool drawCursor, BRect bounds,
++									const BRegion* frontBufferRegion = NULL);
+ 
+ 	// clipping for all drawing functions, passing a NULL region
+ 	// will remove any clipping (drawing allowed everywhere)
+-- 
+2.43.0
+

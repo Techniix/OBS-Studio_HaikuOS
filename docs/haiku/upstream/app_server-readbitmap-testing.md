@@ -1,0 +1,96 @@
+# Testing the app_server `ReadBitmap()` patch on your machine
+
+This builds Haiku's system package (`haiku.hpkg`) from the same revision you're running, with the patch applied,
+and installs it. If anything goes wrong, Haiku's boot menu can return you to the system exactly as it was. Read the
+recovery section before you start.
+
+The patch is unofficial and has only been syntax-checked, never built or run. The install step (5) is the one I'm
+least sure about; stop and report if it doesn't behave as described.
+
+## 0. Recovery, in case the new app_server doesn't start
+
+Every package change makes Haiku keep the previous package set as a "state".
+
+1. Reboot and hold **Shift** (or Space) until the boot menu appears.
+2. **Select boot volume** → your Haiku volume → **Select state**.
+3. Pick the state from before the install (the newest one older than today's change) → **Return to main menu** →
+   **Continue booting**.
+
+That boots the old `haiku.hpkg`. To make it permanent, open a Terminal and run `pkgman install` on the original
+package, or `pkgman full-sync`.
+
+## 1. Find your exact Haiku revision
+
+```sh
+uname -v
+```
+
+Note the `hrevNNNNN` number. The examples below use `hrevNNNNN`; replace it with yours.
+
+## 2. Get the matching source and apply the patch
+
+```sh
+mkdir -p ~/haiku-dev && cd ~/haiku-dev
+git clone --depth 1 --branch hrevNNNNN https://review.haiku-os.org/haiku.git
+cd haiku
+git apply --check ~/OBS-Studio_HaikuOS/docs/haiku/upstream/0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch \
+  && git apply ~/OBS-Studio_HaikuOS/docs/haiku/upstream/0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch
+```
+
+The patch was made against master of 2026-11-06. If `--check` fails, your revision differs in these files; send me
+the error and the hrev and I'll rebase it.
+
+## 3. Configure the build (on Haiku, no cross-compiler is needed)
+
+```sh
+which jam || pkgman install jam
+mkdir generated.x86_64 && cd generated.x86_64
+../configure --target-arch x86_64
+```
+
+## 4. Build: app_server alone first (quick check), then the system package
+
+```sh
+jam -q -j$(nproc) app_server
+jam -q -j$(nproc) haiku.hpkg
+find . -name haiku.hpkg
+```
+
+The first command catches compile errors in minutes. The second builds everything in Haiku's base package (kernel,
+libbe, servers, apps) and takes much longer. The first run also downloads build packages. Save the output of a
+failed step and send it.
+
+## 5. Install
+
+```sh
+pkgman install ./objects/haiku/x86_64/packaging/packages/haiku.hpkg
+```
+
+(Use the path `find` printed.) pkgman shows what it will change: it should be **one package, `haiku`**, being
+replaced. If it wants to change anything else, answer **no** and send me the output. Then reboot.
+
+## 6. Test
+
+1. After rebooting, check that the desktop comes up normally and the pointer and windows behave as before.
+2. Run `screenshot` and `screenshot -m`. Open both images: the first should have **no** pointer, the second
+   exactly one.
+3. In OBS (`OBS_HAIKU_GL=osmesa ./obs --verbose`), add a Screen Capture with **Capture method: Tear-free** at 30
+   FPS. Move the pointer around: it should be smooth now. In the log, the `[haiku-capture]` line about the read
+   time should show a few milliseconds instead of ~25–30. If no such line appears, capture runs at the full rate;
+   say so.
+4. Turn **Capture Cursor** off in the source: the pointer should disappear from the preview and the recording.
+5. Leave a constantly redrawing window on screen (e.g. Terminal running `top`, or a clock) while capturing. The
+   capture must not flicker or show blank/erased areas.
+6. If you have a `BDirectWindow` application (e.g. the Chart demo, or a game that uses SDL's software renderer),
+   capture it with a normal window partly on top of it. Both should look right.
+7. Optional: change the resolution in Screen preferences while OBS captures.
+
+Send back the results (and the hrev). I'll add them to the report for the Haiku developers.
+
+## 7. Going back to the official package
+
+```sh
+pkgman full-sync
+```
+
+Or use the boot menu (section 0).
