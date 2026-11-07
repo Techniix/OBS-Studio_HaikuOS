@@ -32,7 +32,10 @@
 #include <thread>
 
 #include <Bitmap.h>
+#include <OS.h>
 #include <Screen.h>
+
+#include "capture-throttle.hpp"
 
 #define S_CAPTURE_CURSOR "capture_cursor"
 #define S_FPS "fps"
@@ -86,10 +89,12 @@ void ScreenCapture::Run()
 		return;
 	}
 
+	/* below the app_server and normal applications; the copy itself is throttled by CaptureThrottle */
+	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
+
 	std::unique_ptr<BBitmap> bitmap;
 	BRect bitmap_frame;
-
-	uint64_t next_frame = os_gettime_ns();
+	CaptureThrottle throttle("Screen capture");
 
 	while (active) {
 		bool cursor;
@@ -99,8 +104,6 @@ void ScreenCapture::Run()
 			cursor = capture_cursor;
 			rate = fps;
 		}
-
-		const uint64_t interval = 1000000000ULL / (uint64_t)(rate > 0 ? rate : 30);
 
 		BRect frame = screen.Frame();
 		if (!bitmap || frame != bitmap_frame) {
@@ -118,7 +121,11 @@ void ScreenCapture::Run()
 
 		const uint64_t timestamp = os_gettime_ns();
 
-		if (screen.ReadBitmap(bitmap.get(), cursor, &frame) == B_OK) {
+		throttle.BeginRead();
+		const status_t read = screen.ReadBitmap(bitmap.get(), cursor, &frame);
+		throttle.EndRead((uint64_t)(frame.IntegerWidth() + 1) * (uint64_t)(frame.IntegerHeight() + 1));
+
+		if (read == B_OK) {
 			struct obs_source_frame out = {};
 			out.data[0] = (uint8_t *)bitmap->Bits();
 			out.linesize[0] = (uint32_t)bitmap->BytesPerRow();
@@ -131,12 +138,7 @@ void ScreenCapture::Run()
 			obs_source_output_video(source, &out);
 		}
 
-		next_frame += interval;
-		const uint64_t now = os_gettime_ns();
-		if (next_frame < now)
-			next_frame = now; /* fell behind: don't try to catch up */
-		else
-			os_sleepto_ns(next_frame);
+		throttle.Wait(rate);
 	}
 }
 

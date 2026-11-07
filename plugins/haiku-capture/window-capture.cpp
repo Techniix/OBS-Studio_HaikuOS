@@ -44,9 +44,11 @@
 
 #include <Bitmap.h>
 #include <InterfaceDefs.h>
+#include <OS.h>
 #include <Roster.h>
 #include <Screen.h>
 
+#include "capture-throttle.hpp"
 #include "haiku-window-info.h"
 
 #define S_WINDOW "window"
@@ -233,6 +235,7 @@ void WindowCapture::Stop()
 void WindowCapture::Run()
 {
 	os_set_thread_name("haiku-window-capture");
+	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
 
 	BScreen screen(B_MAIN_SCREEN_ID);
 	if (!screen.IsValid()) {
@@ -245,7 +248,7 @@ void WindowCapture::Run()
 	bool have_window = false;
 	bool was_covered = false;
 	bool warned_missing = false;
-	uint64_t next_frame = os_gettime_ns();
+	CaptureThrottle throttle("Window capture");
 	uint64_t next_rescan = 0;
 	uint64_t next_cover_check = 0;
 
@@ -265,7 +268,6 @@ void WindowCapture::Run()
 				settings_changed = false;
 			}
 		}
-		const uint64_t interval = 1000000000ULL / (uint64_t)rate;
 		const uint64_t now = os_gettime_ns();
 
 		/* Refresh the window's geometry each frame; look it up again if it disappeared */
@@ -314,7 +316,14 @@ void WindowCapture::Run()
 				}
 
 				BRect read = rect;
-				if (bitmap && screen.ReadBitmap(bitmap.get(), cursor, &read) == B_OK) {
+				status_t read_status = B_ERROR;
+				if (bitmap) {
+					throttle.BeginRead();
+					read_status = screen.ReadBitmap(bitmap.get(), cursor, &read);
+					throttle.EndRead((uint64_t)(bounds.IntegerWidth() + 1) *
+							 (uint64_t)(bounds.IntegerHeight() + 1));
+				}
+				if (read_status == B_OK) {
 					struct obs_source_frame frame = {};
 					frame.data[0] = (uint8_t *)bitmap->Bits();
 					frame.linesize[0] = (uint32_t)bitmap->BytesPerRow();
@@ -329,12 +338,7 @@ void WindowCapture::Run()
 		}
 		/* Minimized/hidden/other workspace: keep showing the last frame */
 
-		next_frame += interval;
-		const uint64_t after = os_gettime_ns();
-		if (next_frame < after)
-			next_frame = after;
-		else
-			os_sleepto_ns(next_frame);
+		throttle.Wait(rate);
 	}
 }
 
