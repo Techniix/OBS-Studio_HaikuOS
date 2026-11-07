@@ -22,13 +22,15 @@ OBS_MODULE_USE_DEFAULT_LOCALE("haiku-capture", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Haiku screen capture";
+	return "Haiku screen and window capture";
 }
 
 extern void haiku_register_screen_capture(void);
+extern void haiku_register_window_capture(void);
 
 bool obs_module_load(void)
 {
 	haiku_register_screen_capture();
+	haiku_register_window_capture();
 	return true;
 }

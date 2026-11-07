@@ -37,11 +37,13 @@
 #include <cerrno>
 #include <clocale>
 #include <cstring>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <FindDirectory.h>
+#include <InterfaceDefs.h>
 #include <OS.h>
 #include <LocaleRoster.h>
 #include <Message.h>
@@ -226,10 +228,10 @@ uint32_t HaikuGetCpuFrequencyMHz()
 	return 0;
 }
 
-/* Qt's Haiku platform plugin does not report Haiku raw key codes as native virtual keys, so hotkeys are
- * mapped from Qt::Key instead. Shifted symbols are folded back onto the physical key that produced them
- * (US layout) so that the result can be polled with get_key_info() in libobs. */
-obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event)
+/* Fallback mapping from Qt::Key. Qt's Haiku platform plugin derives Qt keys from the raw key position with
+ * a US table (e.g. the comma key is always Key_Less, "=" is Key_Plus) and never sets KeypadModifier, so
+ * these are folded back onto the physical key. */
+static obs_key_t MapQtKey(const QKeyEvent *event)
 {
 	const int key = event->key();
 	const bool keypad = (event->modifiers() & Qt::KeypadModifier) != 0;
@@ -345,8 +347,8 @@ obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event)
 	case Qt::Key_AsciiTilde:
 		return OBS_KEY_QUOTELEFT;
 	case Qt::Key_Less:
-		/* Shift+comma on US layouts, otherwise the ISO "<>" key */
-		return (event->modifiers() & Qt::ShiftModifier) ? OBS_KEY_COMMA : OBS_KEY_LESS;
+		/* The comma key (Qt's Haiku plugin reports it as Key_Less regardless of Shift) */
+		return OBS_KEY_COMMA;
 	case Qt::Key_Greater:
 		return OBS_KEY_PERIOD;
 	case Qt::Key_Question:
@@ -355,6 +357,77 @@ obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event)
 		break;
 	}
 
-	/* Last resort: the platform plugin may still report a Haiku raw key code. */
+	/* Last resort: a platform plugin that does report Haiku raw key codes */
 	return obs_key_from_virtual_key((int)event->nativeVirtualKey());
+}
+
+static bool IsModifierRawKey(int code)
+{
+	switch (code) {
+	case 0x4b: /* left shift */
+	case 0x56: /* right shift */
+	case 0x5c: /* left control */
+	case 0x5d: /* left command (Alt) */
+	case 0x5f: /* right command (AltGr) */
+	case 0x60: /* right control */
+	case 0x66: /* left option (Windows) */
+	case 0x67: /* right option */
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* The physical key that is down right now, read from the app_server. This gives the exact raw key
+ * (numpad vs. main block, any keyboard layout) that libobs will poll later. */
+static obs_key_t PressedPhysicalKey(obs_key_t hint)
+{
+	key_info info;
+	if (get_key_info(&info) != B_OK)
+		return OBS_KEY_NONE;
+
+	obs_key_t found = OBS_KEY_NONE;
+	int count = 0;
+
+	for (int code = 1; code < 0x80; code++) {
+		if (IsModifierRawKey(code) || !(info.key_states[code >> 3] & (1 << (7 - (code & 7)))))
+			continue;
+
+		obs_key_t key = obs_key_from_virtual_key(code);
+		if (key == OBS_KEY_NONE)
+			continue;
+		if (key == hint)
+			return key;
+
+		found = key;
+		count++;
+	}
+
+	return count == 1 ? found : OBS_KEY_NONE;
+}
+
+obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event)
+{
+	/* Qt key -> OBS key decided at press time, so the release maps to the same key even though the
+	 * physical key is no longer down by then. Only used from the UI thread. */
+	static std::map<int, obs_key_t> pressed;
+
+	const int qt_key = event->key();
+
+	if (event->type() == QEvent::KeyRelease) {
+		auto it = pressed.find(qt_key);
+		if (it != pressed.end()) {
+			obs_key_t key = it->second;
+			pressed.erase(it);
+			return key;
+		}
+		return MapQtKey(event);
+	}
+
+	obs_key_t mapped = MapQtKey(event);
+	obs_key_t physical = PressedPhysicalKey(mapped);
+	obs_key_t key = physical != OBS_KEY_NONE ? physical : mapped;
+
+	pressed[qt_key] = key;
+	return key;
 }

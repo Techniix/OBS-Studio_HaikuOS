@@ -311,8 +311,11 @@ static const struct haiku_key_map key_map[] = {
 	{OBS_KEY_NUM2, HK_NUM2},
 	{OBS_KEY_NUM3, HK_NUM3},
 	{OBS_KEY_ENTER, HK_ENTER},
-	{OBS_KEY_CONTROL, HK_LCONTROL},
-	{OBS_KEY_ALT, HK_LCOMMAND},
+	/* Modifiers follow the convention of Qt's Haiku platform plugin, which reports the Command key (Alt on PC
+	 * keyboards) as Control and the Control key as Alt. Bindings recorded in the Qt frontend therefore
+	 * round-trip. Pressed state of modifiers comes from key_info.modifiers, see below. */
+	{OBS_KEY_CONTROL, HK_LCOMMAND},
+	{OBS_KEY_ALT, HK_LCONTROL},
 	{OBS_KEY_SPACE, HK_SPACE},
 	{OBS_KEY_LEFT, HK_LEFT},
 	{OBS_KEY_DOWN, HK_DOWN},
@@ -327,8 +330,8 @@ static const struct haiku_key_map key_map[] = {
 /* Right-hand modifier keys that should also count as the generic modifier being held. */
 static const struct haiku_key_map key_alt_codes[] = {
 	{OBS_KEY_SHIFT, HK_RSHIFT},
-	{OBS_KEY_CONTROL, HK_RCONTROL},
-	{OBS_KEY_ALT, HK_RCOMMAND},
+	{OBS_KEY_CONTROL, HK_RCOMMAND},
+	{OBS_KEY_ALT, HK_RCONTROL},
 	{OBS_KEY_META, HK_ROPTION},
 };
 
@@ -343,6 +346,7 @@ struct obs_hotkeys_platform {
 	pthread_mutex_t mutex;
 	uint64_t last_poll;
 	uint8_t key_states[OBS_HAIKU_KEY_STATE_BYTES];
+	uint32_t modifiers;
 	uint32_t mouse_buttons;
 	bool have_keys;
 	bool have_mouse;
@@ -384,7 +388,7 @@ static void poll_state(obs_hotkeys_platform_t *plat)
 	if (plat->last_poll && now - plat->last_poll < KEY_STATE_CACHE_NS)
 		return;
 
-	plat->have_keys = obs_haiku_get_key_states(plat->key_states);
+	plat->have_keys = obs_haiku_get_key_states(plat->key_states, &plat->modifiers);
 	plat->have_mouse = obs_haiku_get_mouse_buttons(&plat->mouse_buttons);
 	plat->last_poll = now;
 }
@@ -427,6 +431,15 @@ bool obs_hotkeys_platform_is_pressed(obs_hotkeys_platform_t *plat, obs_key_t key
 			uint32_t bit = 1u << (uint32_t)(key - OBS_KEY_MOUSE1);
 			pressed = (plat->mouse_buttons & bit) != 0;
 		}
+	} else if (plat->have_keys && (key == OBS_KEY_SHIFT || key == OBS_KEY_CONTROL || key == OBS_KEY_ALT ||
+					key == OBS_KEY_META)) {
+		/* Use the modifier mask rather than physical keys so remapped modifiers (Keymap preferences)
+		 * behave the same as in Qt's key events. */
+		uint32_t bit = key == OBS_KEY_SHIFT     ? OBS_HAIKU_SHIFT_KEY
+			       : key == OBS_KEY_CONTROL ? OBS_HAIKU_COMMAND_KEY
+			       : key == OBS_KEY_ALT     ? OBS_HAIKU_CONTROL_KEY
+							: OBS_HAIKU_OPTION_KEY;
+		pressed = (plat->modifiers & bit) != 0;
 	} else if (plat->have_keys) {
 		int code = haiku_code_for_key(key);
 		if (code)

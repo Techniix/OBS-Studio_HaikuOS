@@ -2,7 +2,14 @@
 
 include_guard(GLOBAL)
 
-if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+# Haiku is checked first and by target name as well, so that cross-compiling from another host with Haiku's
+# cross tools (-DCMAKE_SYSTEM_NAME=Haiku -DCMAKE_TOOLCHAIN_FILE=...) selects the Haiku configuration.
+if(CMAKE_SYSTEM_NAME STREQUAL "Haiku" OR CMAKE_HOST_SYSTEM_NAME STREQUAL "Haiku")
+  set(CMAKE_CXX_EXTENSIONS FALSE)
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/haiku")
+  set(OS_HAIKU TRUE)
+  set(OS_FLATPAK FALSE)
+elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   set(CMAKE_C_EXTENSIONS FALSE)
   set(CMAKE_CXX_EXTENSIONS FALSE)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/windows")
@@ -26,9 +33,4 @@ elseif(CMAKE_HOST_SYSTEM_NAME MATCHES "Linux|FreeBSD|OpenBSD")
   else()
     set(OS_FLATPAK FALSE)
   endif()
-elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Haiku")
-  set(CMAKE_CXX_EXTENSIONS FALSE)
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/haiku")
-  set(OS_HAIKU TRUE)
-  set(OS_FLATPAK FALSE)
 endif()

@@ -22,7 +22,11 @@
 #include <InterfaceDefs.h>
 #include <Point.h>
 
-extern "C" bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTES])
+static_assert(OBS_HAIKU_SHIFT_KEY == B_SHIFT_KEY && OBS_HAIKU_COMMAND_KEY == B_COMMAND_KEY &&
+		      OBS_HAIKU_CONTROL_KEY == B_CONTROL_KEY && OBS_HAIKU_OPTION_KEY == B_OPTION_KEY,
+	      "modifier constants out of sync with InterfaceDefs.h");
+
+extern "C" bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTES], uint32_t *modifiers)
 {
 	key_info info;
 
@@ -32,6 +36,7 @@ extern "C" bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTE
 
 	static_assert(sizeof(info.key_states) == OBS_HAIKU_KEY_STATE_BYTES, "unexpected key_info layout");
 	memcpy(states, info.key_states, OBS_HAIKU_KEY_STATE_BYTES);
+	*modifiers = info.modifiers;
 	return true;
 }
 

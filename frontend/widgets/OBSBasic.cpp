@@ -381,6 +381,9 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 
 #ifdef __linux__
 	ui->actionE_xit->setShortcut(Qt::CTRL | Qt::Key_Q);
+#elif defined(__HAIKU__)
+	/* Let the Haiku platform theme pick the native quit shortcut (Command+Q) */
+	ui->actionE_xit->setShortcut(QKeySequence::Quit);
 #endif
 
 #ifndef ENABLE_IDIAN_PLAYGROUND

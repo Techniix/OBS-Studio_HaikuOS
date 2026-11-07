@@ -1,0 +1,27 @@
+# Emulated Haiku x86_64 toolchain for build verification (see README.md and hwrap.py).
+get_filename_component(_hcheck_dir "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
+if(DEFINED ENV{HCHECK_WORK})
+  set(_hcheck_work "$ENV{HCHECK_WORK}")
+else()
+  set(_hcheck_work "${_hcheck_dir}/work")
+endif()
+
+set(CMAKE_SYSTEM_NAME Haiku)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(CMAKE_C_COMPILER "${_hcheck_dir}/haiku-cc")
+set(CMAKE_CXX_COMPILER "${_hcheck_dir}/haiku-c++")
+find_program(CMAKE_AR NAMES llvm-ar llvm-ar-18 ar REQUIRED)
+find_program(CMAKE_RANLIB NAMES llvm-ranlib llvm-ranlib-18 ranlib REQUIRED)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+# Dependencies live in a fake sysroot with Haiku's layout (/boot/system/develop/{headers,lib})
+set(CMAKE_FIND_ROOT_PATH "${_hcheck_work}/sysroot")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+set(PKG_CONFIG_EXECUTABLE /bin/false)
+
+# Host-built Qt (headers + moc/uic/rcc)
+list(APPEND CMAKE_PREFIX_PATH "${_hcheck_work}/qt6")
+set(QT_HOST_PATH "${_hcheck_work}/qt6")

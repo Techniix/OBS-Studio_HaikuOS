@@ -1,0 +1,6 @@
+foreach(_l mbedtls mbedcrypto mbedx509)
+  if(NOT TARGET MbedTLS::${_l})
+    add_library(MbedTLS::${_l} SHARED IMPORTED)
+    set_target_properties(MbedTLS::${_l} PROPERTIES IMPORTED_LOCATION "@SYSROOT@/boot/system/develop/lib/lib${_l}.so" IMPORTED_NO_SONAME TRUE INTERFACE_INCLUDE_DIRECTORIES "@SYSROOT@/boot/system/develop/headers")
+  endif()
+endforeach()
