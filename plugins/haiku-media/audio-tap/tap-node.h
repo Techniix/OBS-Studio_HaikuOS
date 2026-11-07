@@ -43,6 +43,9 @@ public:
 
 	/* false once the mixer has been disconnected from us (e.g. rerouted by Media preferences) */
 	bool InputConnected() const { return input.source != media_source::null; }
+	/* Stops the control thread now, so nothing in this team still reads the node's time source when its
+	 * last reference goes away (Quit() is idempotent; the destructor calls it again) */
+	void Shutdown() { Quit(); }
 
 protected:
 	void NodeRegistered() override;

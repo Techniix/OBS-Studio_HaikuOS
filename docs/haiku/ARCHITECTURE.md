@@ -238,7 +238,11 @@ in the real-time media path cannot take OBS down, and so the original routing is
    lock.
 2. Saves the mixer's connected output (`GetConnectedOutputsFor`), registers `TapNode`, slaves it to the mixer's
    time source, disconnects mixer → card, connects tap → card (with the format the mixer and card were already
-   using), then mixer → tap, and starts the node. On any failure the original connection is restored.
+   using), then mixer → tap, and starts the node. On any failure the original connection is restored. The helper
+   keeps its reference to the mixer's time source object until the node is deleted: `SetTimeSourceFor()` only
+   posts a message, and dropping the reference at once could let libmedia delete the object just as the node's
+   control thread picked it up (a use-after-free in `BTimeSource::GetTime()`, seen on real hardware). The node's
+   control thread is also stopped explicitly before its last reference is released.
 3. `TapNode` (`tap-node.cpp`, structured after Haiku's MIT-licensed Equalizer add-on) is a `BBufferConsumer` +
    `BBufferProducer` + `BMediaEventLooper`. Each buffer is `memcpy`'d into the ring and forwarded unchanged with
    `SendBuffer`; `SetBufferGroup` passes the card's buffers upstream so the mixer writes straight into them. What

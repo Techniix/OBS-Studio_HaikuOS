@@ -261,12 +261,14 @@ private:
 			return err;
 		}
 
-		/* follow the sound card's clock like the mixer does */
-		BTimeSource *mixer_ts = roster->MakeTimeSourceFor(mixer);
-		if (mixer_ts) {
-			roster->SetTimeSourceFor(tap->Node().node, mixer_ts->ID());
-			mixer_ts->Release();
-		}
+		/* Follow the sound card's clock like the mixer does. SetTimeSourceFor() only posts a message; the
+		 * node's control thread then takes its own reference to the shared time source object. Releasing
+		 * ours right away could drop the count to zero while that thread looks the object up, leaving it
+		 * with a deleted object (libmedia's TimeSourceObjectManager doesn't guard against that; it crashed
+		 * in BTimeSource::GetTime()). So keep our reference until the node is gone (ReleaseClock()). */
+		clock = roster->MakeTimeSourceFor(mixer);
+		if (clock)
+			roster->SetTimeSourceFor(tap->Node().node, clock->ID());
 
 		/* from here on the original connection is broken until Remove() or the reconnect below */
 		if ((err = roster->Disconnect(mixer.node, orig_out.source, orig_dest_node, orig_out.destination)) !=
@@ -320,9 +322,11 @@ private:
 		if (media_server_gone) {
 			/* nothing to restore: the nodes are gone with the server; just drop our references */
 			if (tap) {
+				tap->Shutdown();
 				tap->Release();
 				tap = nullptr;
 			}
+			ReleaseClock();
 			disconnected = have_up = have_down = have_mixer = have_card = false;
 			if (area >= 0) {
 				delete_area(area);
@@ -355,10 +359,13 @@ private:
 		}
 
 		if (tap) {
-			/* we created the node, so we hold the last reference; this unregisters and deletes it */
+			/* we created the node, so we hold the last reference; this unregisters and deletes it. Stop
+			 * its control thread first in case someone else still holds a reference. */
+			tap->Shutdown();
 			tap->Release();
 			tap = nullptr;
 		}
+		ReleaseClock();
 
 		if (have_mixer)
 			roster->ReleaseNode(mixer);
@@ -370,6 +377,14 @@ private:
 			delete_area(area);
 			area = -1;
 			shm = nullptr;
+		}
+	}
+
+	void ReleaseClock()
+	{
+		if (clock) {
+			clock->Release();
+			clock = nullptr;
 		}
 	}
 
@@ -414,6 +429,7 @@ private:
 	bool disconnected = false;
 
 	TapNode *tap = nullptr;
+	BTimeSource *clock = nullptr; /* the mixer's time source, held while the tap exists */
 	media_output up_out, down_out;
 	media_input up_in, down_in;
 	bool have_up = false, have_down = false;
