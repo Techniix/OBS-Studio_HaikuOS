@@ -50,7 +50,8 @@ frame buffer itself.
 1. **The read holds the HWInterface write lock for its whole duration.** `HWInterface::MoveCursorTo()`
    (`drawing/HWInterface.cpp:233`) starts with `LockParallelAccess()` (the read side of the same lock), so cursor
    movement waits until the copy is done. So does all drawing, which also takes the parallel lock. A hardware cursor
-   doesn't help, because the lock is taken first either way.
+   doesn't help: `AccelerantHWInterface::MoveCursorTo()` additionally takes the *exclusive* lock to call the
+   accelerant's `move_cursor` hook.
 2. **The copy reads video memory.** Frame buffers are mapped uncached or write-combined, where CPU reads are an order
    of magnitude or more slower than reads from main memory. 2560×1080×4 bytes (10.5 MiB) in ~25–30 ms is ~400 MB/s.
 3. **The same image is already in main memory.** `AccelerantHWInterface` always has a back buffer
@@ -117,6 +118,19 @@ Where the pieces live:
   lock is held so briefly that it matters much less.
 - A mode for recorders that only needs the parallel lock (accepting tearing) or a damage-tracking API (like
   PipeWire's or `CGDisplayStream`) would let capture tools skip unchanged frames entirely.
+
+### Related app_server findings (not part of the patch)
+
+These came up while the hardware cursor was being enabled in the nvidia-haiku accelerant. They are independent
+of `ReadBitmap()` and only listed for completeness:
+
+- With a hardware cursor, the drag bitmap is never shown. `HWInterface::_AdoptDragBitmap()` builds
+  `fCursorAndDragBitmap`, but only the plain `ServerCursor` is passed to `set_cursor_bitmap`, and
+  `AccelerantHWInterface::_DrawCursor()` skips drawing while `fHardwareCursorEnabled`. So dragging in Tracker shows
+  no icon.
+- `AccelerantHWInterface::SetCursor()` calls `fAccShowCursor(cursorSet)` after every cursor change, which makes a
+  hidden cursor (`SetCursorVisible(false)`) reappear on the next shape change. `fAccShowCursor(cursorSet &&
+  fCursorVisible)` would keep it hidden.
 
 ## 5. Verification
 

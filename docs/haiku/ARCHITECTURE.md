@@ -280,8 +280,11 @@ drawing between bands, not from the monitor's refresh. A complete fix would be i
 copy of the screen in system memory (it is double-buffered with accelerant drivers), and serving `ReadBitmap()`
 from that copy instead of from video memory would make a full-frame read take a few milliseconds.
 
-With accelerant drivers the app_server composites the software cursor into the frame buffer, so the cursor can
-appear in the capture even with *Capture Cursor* off.
+With accelerant drivers that use the **software** cursor, the app_server composites it into the frame buffer, so it
+can appear in the capture even with *Capture Cursor* off. With a **hardware** cursor (for example the nvidia-haiku
+driver's `rtx5070-hw-cursor` branch), it isn't in the frame buffer, and `ReadBitmap(drawCursor)` adds it only when
+asked, so the toggle works. The app_server patch in `docs/haiku/upstream/` makes the toggle work with software
+cursors too.
 
 **Window capture** (`window-capture.cpp`). The app_server composes windows straight into the frame buffer and keeps
 no per-window backing store another team could read, so isolated window capture (like PipeWire or
