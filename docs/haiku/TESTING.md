@@ -53,7 +53,9 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
 - [ ] The log contains lines like these (exact text varies):
   ```
   Platform: Haiku (haiku)
-  Haiku EGL: version 1.5, vendor: Mesa Project
+  Haiku EGL: eglInitialize failed: ...           (expected with Mesa 22)
+  Haiku GL: using OSMesa (offscreen Mesa) for rendering
+  Haiku GL: llvmpipe (LLVM ..., 256 bits)
   ---------------------------------
   OBS 33.0.1... (haiku)
   CPU Name: ...

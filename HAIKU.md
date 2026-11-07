@@ -34,7 +34,7 @@ Column meanings:
 | --- | --- | --- | --- | --- | --- | --- |
 | Build system (`OS_HAIKU`, `cmake/haiku`) | Yes | clang | – | – | – | Configures in the harness; native configure untested |
 | libobs platform layer (paths, system info, threads, UUIDs) | Yes | clang | – | – | – | Sleep inhibition is a no-op (Haiku has no API) |
-| OpenGL renderer (Mesa EGL pbuffers + readback) | Yes | clang | – | – | – | One `glReadPixels` per displayed preview frame |
+| OpenGL renderer (Mesa OSMesa or EGL, offscreen + readback) | Yes | clang | – | – | – | Software rendering (llvmpipe); one `glReadPixels` per displayed preview frame |
 | Qt frontend (preview, projectors, multiview, settings) | Yes | clang | – | – | – | Preview is painted from a CPU copy |
 | Global hotkeys | Yes | clang | – | – | – | OBS "Ctrl" = Haiku Command key (Alt by default); punctuation on non-US layouts may bind to another key |
 | Recording / streaming (FFmpeg, x264, RTMP, WHIP) | Yes (portable) | clang | – | – | – | Software encoders only; no hardware encoders on Haiku |
@@ -72,7 +72,7 @@ cd build/rundir/RelWithDebInfo/bin && ./obs
 | `cmake/haiku/`, `cmake/common/osconfig.cmake` | Platform detection, compiler flags, install layout, finders that fall back to bundled deps |
 | `libobs/obs-haiku.c`, `libobs/obs-haiku-be.cpp`, `libobs/util/platform-nix.c` | System info, data paths, hotkeys, platform utilities |
 | `libobs/audio-monitoring/haiku/` | Audio monitoring through `BSoundPlayer` |
-| `libobs-opengl/gl-haiku.c` | EGL pbuffer swapchains with readback |
+| `libobs-opengl/gl-haiku.c` | Offscreen swapchains (OSMesa or EGL pbuffers) with readback |
 | `frontend/utility/*-haiku.cpp`, `frontend/widgets/OBSQTDisplay.*` | Frontend platform glue, preview painting |
 | `plugins/haiku-capture/` | Screen capture, window capture |
 | `plugins/haiku-media/` | Audio input, desktop audio (with the `obs-haiku-audio-tap` helper), video capture devices |

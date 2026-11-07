@@ -38,7 +38,7 @@ Or by hand:
 | Toolchain | `cmake ninja pkgconfig` (GCC comes with Haiku) |
 | Core | `ffmpeg8_devel x264_devel jansson_devel curl_devel mbedtls3_devel zlib_devel uthash` |
 | UI | `qt6_base_devel qt6_svg_devel` |
-| Rendering | `mesa_devel mesa_eglvnd libglvnd_devel` |
+| Rendering | `mesa_devel mesa_swpipe` (Mesa 22: OSMesa; Mesa 25+: also `mesa_eglvnd libglvnd_devel`) |
 | Text source | `freetype_devel fontconfig_devel` |
 | Plugin manager, WebRTC | `nlohmann_json libdatachannel_devel` |
 | Scripting (optional) | `luajit_devel swig python3.12` |
@@ -50,7 +50,9 @@ Or by hand:
 OBS 33 needs FFmpeg 8 (`ffmpeg8_devel`). If `pkgman` reports a conflict with an older `ffmpeg*_devel`
 package, uninstall that one first.
 
-`mesa_eglvnd` provides the EGL driver used at runtime; without it OBS can't create its OpenGL context.
+OBS renders through Mesa's OSMesa library (Mesa 22.0.5, the current HaikuPorts version, has its Haiku EGL driver
+disabled). When HaikuPorts publishes Mesa 25 with `mesa_eglvnd`, OBS uses EGL instead, without rebuilding; the
+install script installs it automatically once it exists.
 
 `haikuwebkit` (the engine of WebPositive) is part of a standard Haiku install; `haikuwebkit_devel` adds the headers
 and libraries the browser helper links against.
@@ -125,12 +127,13 @@ cmake --install build
 | Log says `[haiku-browser] ... helper ... is missing` | `obs-haiku-browser` isn't next to `obs`; rebuild or reinstall. |
 | No sound at all after OBS crashed while capturing desktop audio | Run `obs-haiku-audio-tap --repair` (in OBS's `bin` directory), or restart the media services in the Media preferences. |
 | `Could NOT find FFmpeg (... minimum required is "8.0")` | Install `ffmpeg8_devel` (and remove older FFmpeg devel packages). |
-| `Could NOT find OpenGL (missing: EGL)` | Install `libglvnd_devel` and `mesa_devel`. |
+| `Could NOT find OpenGL (missing: EGL)` | Install `mesa_devel`. |
 | `Could not find a package configuration file provided by "Qt6"` | Install `qt6_base_devel qt6_svg_devel`. |
 | `Could not find ... "MbedTLS"` | Install `mbedtls3_devel` (OBS needs mbedTLS 3, not 2). |
 | `Could NOT find SIMDe` | The `deps/simde` submodule is missing, see step 1. |
 | `Could not find ... "LibDataChannel"` | Install `libdatachannel_devel` or pass `-DENABLE_WEBRTC=OFF`. |
-| Log says `Haiku EGL: eglInitialize failed` | `mesa_eglvnd` isn't installed, or no EGL vendor JSON is found. |
+| Log says `Haiku EGL: eglInitialize failed` | Expected with Mesa 22; the next lines should say `using OSMesa`. |
+| Log says `no OpenGL backend available` / `libOSMesa not found` | `pkgman install mesa mesa_devel`. |
 | Log says `Haiku GL: OpenGL 3.3 is required` | The GL driver in use only offers an older version; check the GLInfo app. |
 
 When reporting a problem, run `build-aux/haiku/collect-logs.sh` and attach the zip it puts on the Desktop.

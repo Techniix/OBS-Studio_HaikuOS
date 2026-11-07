@@ -18,17 +18,28 @@
 /*
  * Haiku window system integration for the OpenGL renderer.
  *
- * Haiku's Mesa exposes EGL (through libglvnd) with the "haiku" platform. A Haiku window surface belongs to a
- * BWindow/BView whose looper thread owns it, which does not fit OBS's model of a single graphics thread
- * rendering into arbitrary windows. Instead, every swapchain renders into its own EGL pbuffer surface; on
- * present, the finished frame is read back and handed to the owner of the window through the callback in
- * struct gs_window. The owner (e.g. the Qt frontend) blits it into its view.
+ * A Haiku window surface belongs to a BWindow/BView whose looper thread owns it, which does not fit OBS's model
+ * of a single graphics thread rendering into arbitrary windows. Instead, every swapchain renders into its own
+ * offscreen buffer; on present, the finished frame is read back and handed to the owner of the window through
+ * the callback in struct gs_window. The owner (e.g. the Qt frontend) blits it into its view.
+ *
+ * Two backends provide those offscreen buffers, tried in this order:
+ *
+ *  - EGL pbuffers. Mesa 25 and later (packages mesa_eglvnd + libglvnd) implement EGL for Haiku.
+ *  - OSMesa. Mesa 22.0.5, the version HaikuPorts currently ships, has its Haiku EGL driver disabled (its
+ *    eglInitialize() always fails), but it builds OSMesa on the same llvmpipe renderer. OSMesa contexts render
+ *    into a caller-provided memory buffer, which maps onto swapchains exactly like pbuffers. libOSMesa is
+ *    loaded at runtime, so the same binary works whether or not it is installed (Mesa 25 dropped OSMesa).
+ *
+ * OBS_HAIKU_GL=egl or OBS_HAIKU_GL=osmesa forces one backend.
  *
  * Readback costs one glReadPixels per displayed frame, which is acceptable for preview/projector sizes and
  * keeps the renderer independent of any toolkit.
  */
 
+#include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <obs.h>
@@ -62,8 +73,34 @@ static const EGLint config_attribs[] = {
 };
 /* clang-format on */
 
+/* OSMesa (GL/osmesa.h), declared here because it is loaded with dlopen() */
+typedef struct osmesa_context *OSMesaContext;
+typedef void (*OSMESAproc)(void);
+#define OSMESA_BGRA 0x1
+#define OSMESA_Y_UP 0x11
+#define OSMESA_FORMAT 0x22
+#define OSMESA_DEPTH_BITS 0x30
+#define OSMESA_STENCIL_BITS 0x31
+#define OSMESA_ACCUM_BITS 0x32
+#define OSMESA_PROFILE 0x33
+#define OSMESA_CORE_PROFILE 0x34
+#define OSMESA_CONTEXT_MAJOR_VERSION 0x36
+#define OSMESA_CONTEXT_MINOR_VERSION 0x37
+
+struct osmesa_api {
+	void *lib;
+	OSMesaContext (*CreateContextAttribs)(const int *attribs, OSMesaContext share);
+	void (*DestroyContext)(OSMesaContext ctx);
+	unsigned char (*MakeCurrent)(OSMesaContext ctx, void *buffer, unsigned int type, int width, int height);
+	void (*PixelStore)(int pname, int value);
+	OSMESAproc (*GetProcAddress)(const char *name);
+};
+
+static struct osmesa_api osmesa;
+
 struct gl_windowinfo {
 	EGLSurface surface;
+	uint8_t *osmesa_buffer; /* OSMesa backend: the swapchain's color buffer (cx * cy * 4) */
 	uint32_t cx;
 	uint32_t cy;
 
@@ -75,12 +112,88 @@ struct gl_windowinfo {
 };
 
 struct gl_platform {
+	bool use_osmesa;
+
+	/* EGL backend */
 	EGLDisplay display;
 	EGLConfig config;
 	EGLContext context;
 	EGLSurface pbuffer; /* 1x1 surface used when no swapchain is loaded */
 	bool surfaceless;
+
+	/* OSMesa backend */
+	OSMesaContext osmesa_ctx;
+	uint32_t osmesa_dummy; /* 1x1 buffer used when no swapchain is loaded */
 };
+
+#define GL_UNSIGNED_BYTE_VALUE 0x1401 /* GL_UNSIGNED_BYTE, for OSMesaMakeCurrent */
+
+static bool osmesa_load(void)
+{
+	if (osmesa.lib)
+		return true;
+
+	static const char *names[] = {"libOSMesa.so.8", "libOSMesa.so", NULL};
+	for (const char **name = names; *name && !osmesa.lib; name++)
+		osmesa.lib = dlopen(*name, RTLD_NOW | RTLD_LOCAL);
+	if (!osmesa.lib) {
+		blog(LOG_ERROR, "Haiku GL: libOSMesa not found: %s", dlerror());
+		return false;
+	}
+
+	osmesa.CreateContextAttribs = dlsym(osmesa.lib, "OSMesaCreateContextAttribs");
+	osmesa.DestroyContext = dlsym(osmesa.lib, "OSMesaDestroyContext");
+	osmesa.MakeCurrent = dlsym(osmesa.lib, "OSMesaMakeCurrent");
+	osmesa.PixelStore = dlsym(osmesa.lib, "OSMesaPixelStore");
+	osmesa.GetProcAddress = dlsym(osmesa.lib, "OSMesaGetProcAddress");
+
+	if (!osmesa.CreateContextAttribs || !osmesa.DestroyContext || !osmesa.MakeCurrent || !osmesa.PixelStore ||
+	    !osmesa.GetProcAddress) {
+		blog(LOG_ERROR, "Haiku GL: libOSMesa lacks required functions");
+		dlclose(osmesa.lib);
+		memset(&osmesa, 0, sizeof(osmesa));
+		return false;
+	}
+	return true;
+}
+
+static bool osmesa_context_create(struct gl_platform *plat)
+{
+	if (!osmesa_load())
+		return false;
+
+	/* clang-format off */
+	const int attribs[] = {
+		OSMESA_FORMAT, OSMESA_BGRA,
+		OSMESA_DEPTH_BITS, 0,
+		OSMESA_STENCIL_BITS, 0,
+		OSMESA_ACCUM_BITS, 0,
+		OSMESA_PROFILE, OSMESA_CORE_PROFILE,
+		OSMESA_CONTEXT_MAJOR_VERSION, 3,
+		OSMESA_CONTEXT_MINOR_VERSION, 3,
+		0,
+	};
+	/* clang-format on */
+
+	plat->osmesa_ctx = osmesa.CreateContextAttribs(attribs, NULL);
+	if (!plat->osmesa_ctx) {
+		blog(LOG_ERROR, "Haiku GL: OSMesa could not create an OpenGL 3.3 core context");
+		return false;
+	}
+
+	plat->use_osmesa = true;
+	blog(LOG_INFO, "Haiku GL: using OSMesa (offscreen Mesa) for rendering");
+	return true;
+}
+
+static void osmesa_context_destroy(struct gl_platform *plat)
+{
+	if (!plat->osmesa_ctx)
+		return;
+	osmesa.MakeCurrent(NULL, NULL, 0, 0, 0);
+	osmesa.DestroyContext(plat->osmesa_ctx);
+	plat->osmesa_ctx = NULL;
+}
 
 static const char *egl_error_string(EGLint error)
 {
@@ -155,6 +268,23 @@ static EGLSurface current_surface(gs_device_t *device)
 static bool make_current(gs_device_t *device)
 {
 	struct gl_platform *plat = device->plat;
+
+	if (plat->use_osmesa) {
+		struct gl_windowinfo *wi = device->cur_swap ? device->cur_swap->wi : NULL;
+		void *buffer = &plat->osmesa_dummy;
+		int cx = 1, cy = 1;
+		if (wi && wi->osmesa_buffer) {
+			buffer = wi->osmesa_buffer;
+			cx = (int)wi->cx;
+			cy = (int)wi->cy;
+		}
+		if (!osmesa.MakeCurrent(plat->osmesa_ctx, buffer, GL_UNSIGNED_BYTE_VALUE, cx, cy)) {
+			blog(LOG_ERROR, "Haiku GL: OSMesaMakeCurrent(%dx%d) failed", cx, cy);
+			return false;
+		}
+		return true;
+	}
+
 	EGLSurface surface = current_surface(device);
 
 	if (!eglMakeCurrent(plat->display, surface, surface, plat->context)) {
@@ -163,6 +293,16 @@ static bool make_current(gs_device_t *device)
 	}
 
 	return true;
+}
+
+static void release_current(struct gl_platform *plat)
+{
+	if (plat->use_osmesa) {
+		osmesa.MakeCurrent(NULL, NULL, 0, 0, 0);
+		return;
+	}
+	if (!eglMakeCurrent(plat->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
+		blog(LOG_ERROR, "Haiku EGL: failed to release context: %s", egl_last_error());
 }
 
 static bool gl_context_create(struct gl_platform *plat)
@@ -268,7 +408,18 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 	plat->context = EGL_NO_CONTEXT;
 	plat->pbuffer = EGL_NO_SURFACE;
 
-	if (!gl_context_create(plat)) {
+	const char *forced = getenv("OBS_HAIKU_GL");
+	const bool want_egl = !forced || strcmp(forced, "osmesa") != 0;
+	const bool want_osmesa = !forced || strcmp(forced, "egl") != 0;
+
+	bool created = want_egl && gl_context_create(plat);
+	if (!created && want_osmesa) {
+		if (want_egl)
+			blog(LOG_INFO, "Haiku GL: EGL unavailable (expected with Mesa 22), trying OSMesa");
+		created = osmesa_context_create(plat);
+	}
+	if (!created) {
+		blog(LOG_ERROR, "Haiku GL: no OpenGL backend available. Install Mesa: 'pkgman install mesa mesa_swpipe'");
 		bfree(plat);
 		return NULL;
 	}
@@ -278,9 +429,14 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 	if (!make_current(device))
 		goto fail;
 
-	/* eglGetProcAddress returns core entry points too (EGL 1.5 / EGL_KHR_get_all_proc_addresses);
-	 * fall back to dlsym on libGL if that is not available. */
-	gladLoadGLLoader((GLADloadproc)eglGetProcAddress);
+	if (plat->use_osmesa) {
+		/* OSMesaGetProcAddress resolves every GL entry point through Mesa's dispatch table */
+		gladLoadGLLoader((GLADloadproc)osmesa.GetProcAddress);
+	} else {
+		/* eglGetProcAddress returns core entry points too (EGL 1.5 / EGL_KHR_get_all_proc_addresses);
+		 * fall back to dlsym on libGL if that is not available. */
+		gladLoadGLLoader((GLADloadproc)eglGetProcAddress);
+	}
 	if (!GLAD_GL_VERSION_3_3 && !gladLoadGL()) {
 		blog(LOG_ERROR, "Haiku GL: failed to load OpenGL entry points");
 		goto fail;
@@ -291,16 +447,12 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 		goto fail;
 	}
 
+	blog(LOG_INFO, "Haiku GL: %s", (const char *)glGetString(GL_RENDERER));
 	return plat;
 
 fail:
-	eglMakeCurrent(plat->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-	if (plat->pbuffer != EGL_NO_SURFACE)
-		eglDestroySurface(plat->display, plat->pbuffer);
-	eglDestroyContext(plat->display, plat->context);
-	eglTerminate(plat->display);
+	gl_platform_destroy(plat);
 	device->plat = NULL;
-	bfree(plat);
 	return NULL;
 }
 
@@ -309,6 +461,12 @@ extern void gl_platform_destroy(struct gl_platform *plat)
 	if (!plat)
 		return;
 
+	if (plat->use_osmesa) {
+		osmesa_context_destroy(plat);
+		bfree(plat);
+		return;
+	}
+
 	eglMakeCurrent(plat->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 	if (plat->pbuffer != EGL_NO_SURFACE)
 		eglDestroySurface(plat->display, plat->pbuffer);
@@ -317,12 +475,33 @@ extern void gl_platform_destroy(struct gl_platform *plat)
 	bfree(plat);
 }
 
+static bool swapchain_alloc(struct gl_platform *plat, struct gl_windowinfo *wi, uint32_t cx, uint32_t cy)
+{
+	if (plat->use_osmesa) {
+		uint8_t *buffer = bzalloc((size_t)cx * cy * 4);
+		bfree(wi->osmesa_buffer);
+		wi->osmesa_buffer = buffer;
+		return true;
+	}
+
+	EGLSurface surface = create_pbuffer(plat, cx, cy);
+	if (surface == EGL_NO_SURFACE)
+		return false;
+	if (wi->surface != EGL_NO_SURFACE)
+		eglDestroySurface(plat->display, wi->surface);
+	wi->surface = surface;
+	return true;
+}
+
+static bool swapchain_valid(const struct gl_platform *plat, const struct gl_windowinfo *wi)
+{
+	return plat->use_osmesa ? wi->osmesa_buffer != NULL : wi->surface != EGL_NO_SURFACE;
+}
+
 extern bool gl_platform_init_swapchain(struct gs_swap_chain *swap)
 {
 	struct gl_windowinfo *wi = swap->wi;
-
-	wi->surface = create_pbuffer(swap->device->plat, wi->cx, wi->cy);
-	return wi->surface != EGL_NO_SURFACE;
+	return swapchain_alloc(swap->device->plat, wi, wi->cx, wi->cy);
 }
 
 extern void gl_platform_cleanup_swapchain(struct gs_swap_chain *swap)
@@ -330,7 +509,21 @@ extern void gl_platform_cleanup_swapchain(struct gs_swap_chain *swap)
 	struct gl_windowinfo *wi = swap->wi;
 	struct gl_platform *plat = swap->device->plat;
 
-	if (wi && wi->surface != EGL_NO_SURFACE) {
+	if (!wi)
+		return;
+
+	if (plat->use_osmesa) {
+		/* the buffer may be the current draw buffer: switch away before freeing it */
+		if (swap->device->cur_swap == swap) {
+			swap->device->cur_swap = NULL;
+			make_current(swap->device);
+		}
+		bfree(wi->osmesa_buffer);
+		wi->osmesa_buffer = NULL;
+		return;
+	}
+
+	if (wi->surface != EGL_NO_SURFACE) {
 		eglDestroySurface(plat->display, wi->surface);
 		wi->surface = EGL_NO_SURFACE;
 	}
@@ -350,8 +543,7 @@ extern void device_leave_context(gs_device_t *device)
 	device->cur_swap = NULL;
 	device->cur_fbo = NULL;
 
-	if (!eglMakeCurrent(device->plat->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
-		blog(LOG_ERROR, "Haiku EGL: failed to release context: %s", egl_last_error());
+	release_current(device->plat);
 }
 
 extern bool device_enum_adapters(gs_device_t *device, bool (*callback)(void *param, const char *name, uint32_t id),
@@ -366,7 +558,7 @@ extern bool device_enum_adapters(gs_device_t *device, bool (*callback)(void *par
 
 extern void *device_get_device_obj(gs_device_t *device)
 {
-	return device->plat->context;
+	return device->plat->use_osmesa ? (void *)device->plat->osmesa_ctx : (void *)device->plat->context;
 }
 
 extern void gl_getclientsize(const struct gs_swap_chain *swap, uint32_t *width, uint32_t *height)
@@ -377,37 +569,47 @@ extern void gl_getclientsize(const struct gs_swap_chain *swap, uint32_t *width, 
 
 extern void gl_clear_context(gs_device_t *device)
 {
-	if (!eglMakeCurrent(device->plat->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
-		blog(LOG_ERROR, "Haiku EGL: failed to clear context: %s", egl_last_error());
+	release_current(device->plat);
 }
 
-/* Called after device_resize(): reallocate the current swapchain's pbuffer at the new size. */
+/* Called after device_resize(): reallocate the current swapchain's buffer at the new size. */
 extern void gl_update(gs_device_t *device)
 {
 	struct gs_swap_chain *swap = device->cur_swap;
 	if (!swap)
 		return;
 
+	struct gl_platform *plat = device->plat;
 	struct gl_windowinfo *wi = swap->wi;
 	uint32_t cx = swap->info.cx ? swap->info.cx : 1;
 	uint32_t cy = swap->info.cy ? swap->info.cy : 1;
 
-	if (wi->surface != EGL_NO_SURFACE && wi->cx == cx && wi->cy == cy)
+	if (swapchain_valid(plat, wi) && wi->cx == cx && wi->cy == cy)
 		return;
 
-	EGLSurface surface = create_pbuffer(device->plat, cx, cy);
-	if (surface == EGL_NO_SURFACE)
+	if (!plat->use_osmesa) {
+		/* keep the old pbuffer current until the new one exists */
+		EGLSurface old = wi->surface;
+		wi->surface = EGL_NO_SURFACE;
+		if (!swapchain_alloc(plat, wi, cx, cy)) {
+			wi->surface = old;
+			return;
+		}
+		wi->cx = cx;
+		wi->cy = cy;
+		make_current(device);
+		if (old != EGL_NO_SURFACE)
+			eglDestroySurface(plat->display, old);
 		return;
+	}
 
-	EGLSurface old = wi->surface;
-	wi->surface = surface;
+	/* OSMesa: the old buffer is current; bind the new one before the old one is freed */
+	uint8_t *old = wi->osmesa_buffer;
+	wi->osmesa_buffer = bzalloc((size_t)cx * cy * 4);
 	wi->cx = cx;
 	wi->cy = cy;
-
 	make_current(device);
-
-	if (old != EGL_NO_SURFACE)
-		eglDestroySurface(device->plat->display, old);
+	bfree(old);
 }
 
 extern void device_load_swapchain(gs_device_t *device, gs_swapchain_t *swap)
@@ -428,7 +630,7 @@ extern bool device_is_present_ready(gs_device_t *device)
 extern void device_present(gs_device_t *device)
 {
 	struct gs_swap_chain *swap = device->cur_swap;
-	if (!swap || !swap->wi || swap->wi->surface == EGL_NO_SURFACE)
+	if (!swap || !swap->wi || !swapchain_valid(device->plat, swap->wi))
 		return;
 
 	struct gl_windowinfo *wi = swap->wi;
@@ -450,7 +652,8 @@ extern void device_present(gs_device_t *device)
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
-	glReadBuffer(GL_BACK);
+	/* EGL pbuffers are double buffered; OSMesa's framebuffer is single buffered */
+	glReadBuffer(device->plat->use_osmesa ? GL_FRONT : GL_BACK);
 
 	uint8_t *raw = wi->readback + size;
 	glReadPixels(0, 0, (GLsizei)cx, (GLsizei)cy, GL_BGRA, GL_UNSIGNED_BYTE, raw);

@@ -101,22 +101,30 @@ navigation keys are layout independent.
 
 `libobs-opengl/gl-haiku.c`.
 
-Haiku's Mesa (HaikuPorts `mesa` + `mesa_eglvnd`, dispatched through `libglvnd`) implements EGL with the
-`haiku` platform. An EGL *window* surface on Haiku belongs to a BWindow/BView, and that view is driven by its
-window's looper thread. OBS renders every display (preview, projectors, multiview, property previews) from
+An OpenGL *window* surface on Haiku belongs to a BWindow/BView, and that view is driven by its window's
+looper thread. OBS renders every display (preview, projectors, multiview, property previews) from
 one graphics thread, and the frontend's widgets are Qt widgets rather than BViews. Rendering straight into
 them isn't possible.
 
-Instead:
+Instead every swapchain renders offscreen and the result is handed to the widget. Two Mesa backends provide
+the offscreen buffers, chosen at startup (`OBS_HAIKU_GL=egl|osmesa` forces one):
 
-1. One EGL context (desktop OpenGL 3.3 core) is created on `EGL_DEFAULT_DISPLAY`. A 1×1 pbuffer serves as
-   the surface when no swapchain is current; if pbuffers are unavailable, `EGL_KHR_surfaceless_context` is
-   used.
-2. Each swapchain gets its own pbuffer surface the size of the widget. `device_load_swapchain()` makes it
-   current, so OBS's "render to framebuffer 0" lands in that pbuffer. `device_resize()` → `gl_update()`
-   reallocates it.
-3. `device_present()` reads the pbuffer back with `glReadPixels(GL_BGRA)`, flips it to top-down order and
-   calls `gs_window.present(param, pixels, width, height, linesize)`.
+| Backend | Mesa version | How |
+| --- | --- | --- |
+| EGL pbuffers | Mesa 25+ (`mesa_eglvnd` + `libglvnd`, not yet published by HaikuPorts) | One EGL context on `EGL_DEFAULT_DISPLAY`, a pbuffer per swapchain |
+| OSMesa | Mesa 22.0.5 (current HaikuPorts `mesa`) | One OSMesa context; each swapchain is a memory buffer bound with `OSMesaMakeCurrent()` |
+
+Mesa 22.0.5 ships `libEGL`, but HaikuPorts patches its Haiku EGL driver to fail `eglInitialize()` ("Does not
+work"), so EGL is tried first and OSMesa is the fallback. HaikuPorts builds that Mesa with `-Dosmesa=true` on the
+llvmpipe (`swrast` + LLVM) driver, which provides OpenGL 3.3 core and beyond. `libOSMesa` is loaded with
+`dlopen()` (Mesa 25 no longer has it), so one binary works with either Mesa.
+
+1. One context (desktop OpenGL 3.3 core). A 1×1 surface/buffer is current when no swapchain is.
+2. Each swapchain gets its own pbuffer or buffer the size of the widget. `device_load_swapchain()` makes it
+   current, so OBS's "render to framebuffer 0" lands in it. `device_resize()` → `gl_update()` reallocates it.
+3. `device_present()` reads it back with `glReadPixels(GL_BGRA)` (from `GL_BACK` for pbuffers, `GL_FRONT` for
+   the single-buffered OSMesa framebuffer), flips it to top-down order and calls
+   `gs_window.present(param, pixels, width, height, linesize)`.
 
 `struct gs_window` on Haiku (in `libobs/graphics/graphics.h`) is therefore a callback rather than a native
 handle:
@@ -363,7 +371,7 @@ Decisions taken during the port, with the reasons, so they can be revisited:
 
 | Decision | Reason |
 | --- | --- |
-| Render every display into its own EGL pbuffer and read it back | Haiku EGL window surfaces belong to BViews driven by their window thread; OBS renders all displays from one graphics thread into Qt widgets. |
+| Render every display into its own offscreen buffer (EGL pbuffer or OSMesa) and read it back | Haiku EGL window surfaces belong to BViews driven by their window thread; OBS renders all displays from one graphics thread into Qt widgets. |
 | Desktop audio and browser rendering in helper processes | Crash isolation (WebKit, real-time media path) and guaranteed restoration of the audio routing. Shared memory keeps the per-frame cost at one copy. |
 | Helpers started on demand by the plugins, not by the frontend | No frontend changes; works for any OBS profile and for headless use of libobs. |
 | HaikuWebKit instead of porting CEF | CEF/Chromium is not available for Haiku and porting it is a project of its own; HaikuWebKit ships with every Haiku install. |
@@ -371,4 +379,5 @@ Decisions taken during the port, with the reasons, so they can be revisited:
 | Window capture as a labelled screen-region capture | No per-window buffers exist in the app_server; this is the closest faithful behavior. |
 | Bundle libraries missing from HaikuPorts, patching copies at configure time | No feature has to be disabled, the submodules stay pristine, and system packages win as soon as they exist. |
 | Haiku modifier convention (Ctrl = Command) | Matches Haiku's Qt plugin, so hotkeys captured in the UI are the ones polled. |
+| EGL first, OSMesa fallback, OSMesa loaded at runtime | The Mesa HaikuPorts ships today (22.0.5) has EGL disabled; Mesa 25 has working EGL but no OSMesa. Supporting both means OBS works now and keeps working after the Mesa update. |
 | Warnings not treated as errors | Haiku headers and GCC produce warnings upstream CI never sees. |

@@ -20,7 +20,8 @@ if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
 endif()
 
 if(OS_HAIKU)
-  # Haiku's Mesa provides EGL through libglvnd ("haiku" EGL platform)
+  # EGL headers/library come from Mesa (22: libEGL in mesa_devel, 25+: libglvnd). With Mesa 22 the Haiku EGL
+  # driver is disabled at runtime and gl-haiku.c falls back to OSMesa, which it loads with dlopen().
   find_package(OpenGL REQUIRED EGL)
 endif()
 
