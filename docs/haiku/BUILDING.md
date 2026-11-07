@@ -8,20 +8,27 @@ Linux is covered at the end.
 ```sh
 git clone https://github.com/Techniix/OBS-Studio_HaikuOS.git
 cd OBS-Studio_HaikuOS
-git submodule update --init deps/simde
+git submodule update --init --recursive deps/simde deps/asio deps/websocketpp deps/srt deps/librist \
+    plugins/obs-websocket plugins/obs-browser
 ```
 
-SIMDe comes from the `deps/simde` submodule, so it must be checked out. `plugins/obs-websocket` is only
-needed if you build obs-websocket (`-DENABLE_WEBSOCKET=ON`, which also needs `qrcodegencpp`). The build
-script fetches SIMDe itself if it's missing.
+`build-aux/haiku/build.sh` fetches any of these that are missing, so the last step is optional when you use it.
 
-The `obs-browser` and `libdshowcapture` submodules aren't used on Haiku.
+| Submodule | Why Haiku needs it |
+| --- | --- |
+| `deps/simde` | SIMD intrinsics wrapper; not packaged in HaikuPorts |
+| `deps/asio`, `deps/websocketpp` | obs-websocket (HaikuPorts' Asio 1.38 removed APIs WebSocket++ uses; 1.30.2 is bundled) |
+| `deps/srt`, `deps/librist` | SRT/RIST output; built from source by `deps/srt-haiku` and `deps/librist-haiku` |
+| `plugins/obs-websocket` | obs-websocket itself |
+| `plugins/obs-browser` | Only `panel/browser-panel.hpp`, the browser dock interface; the CEF plugin is not built |
+
+`libdshowcapture` is Windows-only and not needed.
 
 ## 2. Install dependencies
 
 ```sh
 build-aux/haiku/install-deps.sh            # required + recommended
-build-aux/haiku/install-deps.sh --optional # also VLC, FDK AAC
+build-aux/haiku/install-deps.sh --optional # also FDK AAC
 ```
 
 Or by hand:
@@ -36,12 +43,20 @@ Or by hand:
 | Plugin manager, WebRTC | `nlohmann_json libdatachannel_devel` |
 | Scripting (optional) | `luajit_devel swig python3.12` |
 | Noise suppression (optional) | `speexdsp_devel rnnoise_devel` |
-| VLC source, FDK AAC (optional) | `vlc_devel fdk_aac_devel` |
+| VLC video source | `vlc_devel` |
+| Browser source and docks | `haikuwebkit_devel` |
+| FDK AAC encoder (optional) | `fdk_aac_devel` |
 
 OBS 33 needs FFmpeg 8 (`ffmpeg8_devel`). If `pkgman` reports a conflict with an older `ffmpeg*_devel`
 package, uninstall that one first.
 
 `mesa_eglvnd` provides the EGL driver used at runtime; without it OBS can't create its OpenGL context.
+
+`haikuwebkit` (the engine of WebPositive) is part of a standard Haiku install; `haikuwebkit_devel` adds the headers
+and libraries the browser helper links against.
+
+qrcodegen (for obs-websocket's QR code), libsrt and librist aren't in HaikuPorts; the build uses a system copy if one
+is installed and otherwise builds the bundled one.
 
 ## 3. Configure and build
 
@@ -56,10 +71,7 @@ build-aux/haiku/build.sh build-dbg -DCMAKE_BUILD_TYPE=Debug
 Manual equivalent:
 
 ```sh
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DENABLE_WEBSOCKET=OFF \
-    -DENABLE_NEW_MPEGTS_OUTPUT=OFF
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 ```
 
@@ -67,16 +79,22 @@ cmake --build build
 
 | Option | Default on Haiku | Notes |
 | --- | --- | --- |
-| `ENABLE_WEBSOCKET` | ON | Turn **off**: obs-websocket needs `qrcodegencpp`, which isn't in HaikuPorts. |
-| `ENABLE_NEW_MPEGTS_OUTPUT` | ON | Turn **off**: needs `libsrt` and `librist`. |
+| `ENABLE_WEBSOCKET` | ON | obs-websocket with bundled Asio/WebSocket++/qrcodegen. |
+| `ENABLE_NEW_MPEGTS_OUTPUT` | ON | Native SRT/RIST output with bundled libsrt/librist. |
+| `ENABLE_BROWSER` | ON | Browser source and docks via HaikuWebKit (`haikuwebkit_devel`). `build.sh` turns it off if the headers are missing. |
 | `ENABLE_SCRIPTING` | ON | Needs SWIG, LuaJIT and Python. `ENABLE_SCRIPTING_LUA`/`ENABLE_SCRIPTING_PYTHON` toggle each. |
 | `ENABLE_WEBRTC` | ON | WHIP output, needs `libdatachannel_devel`. |
+| `ENABLE_VLC` | ON | VLC video source, needs `vlc_devel`. |
 | `ENABLE_SPEEXDSP`, `ENABLE_RNNOISE` | ON | Noise suppression filter. RNNoise falls back to a bundled copy. |
 | `CMAKE_COMPILE_WARNING_AS_ERROR` | OFF | Upstream uses ON; Haiku defaults to OFF. |
 | `ENABLE_RELOCATABLE` | OFF | Use `$ORIGIN` RPATHs so the install tree can be moved. |
 | `CMAKE_INSTALL_PREFIX` | `/boot/home/config/non-packaged` | |
 
-Browser source, AJA, DeckLink, VST and the Linux capture plugins are skipped automatically.
+AJA, DeckLink, NVENC/QSV/VA-API and the Linux capture plugins have no Haiku drivers and are skipped.
+
+The build produces two helper programs next to `obs` in `bin/`: `obs-haiku-audio-tap` (desktop audio) and
+`obs-haiku-browser` (browser rendering). OBS starts them itself; they must stay in the same directory as `obs`
+(or be installed to `/boot/home/config/non-packaged/bin`).
 
 ## 4. Run
 
@@ -101,7 +119,11 @@ cmake --install build
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| `Required submodule 'obs-websocket' not available` | Pass `-DENABLE_WEBSOCKET=OFF` (the build script does), or fetch the submodule. |
+| `Required submodule 'obs-websocket' not available` | Fetch the submodules (step 1). |
+| `HaikuWebKit not found` | `pkgman install haikuwebkit_devel`, or `-DENABLE_BROWSER=OFF`. |
+| `plugins/obs-browser submodule missing` warning | Browser docks are skipped; fetch `plugins/obs-browser` (step 1). |
+| Log says `[haiku-browser] ... helper ... is missing` | `obs-haiku-browser` isn't next to `obs`; rebuild or reinstall. |
+| No sound at all after OBS crashed while capturing desktop audio | Run `obs-haiku-audio-tap --repair` (in OBS's `bin` directory), or restart the media services in the Media preferences. |
 | `Could NOT find FFmpeg (... minimum required is "8.0")` | Install `ffmpeg8_devel` (and remove older FFmpeg devel packages). |
 | `Could NOT find OpenGL (missing: EGL)` | Install `libglvnd_devel` and `mesa_devel`. |
 | `Could not find a package configuration file provided by "Qt6"` | Install `qt6_base_devel qt6_svg_devel`. |
@@ -121,8 +143,7 @@ The build system selects the Haiku configuration from the target name, so a Haik
 ```sh
 cmake -S . -B build-haiku -G Ninja \
     -DCMAKE_SYSTEM_NAME=Haiku \
-    -DCMAKE_TOOLCHAIN_FILE=/path/to/haiku-toolchain.cmake \
-    -DENABLE_WEBSOCKET=OFF -DENABLE_NEW_MPEGTS_OUTPUT=OFF
+    -DCMAKE_TOOLCHAIN_FILE=/path/to/haiku-toolchain.cmake
 ```
 
 Pass `CMAKE_SYSTEM_NAME` on the command line as well as in the toolchain file; OBS decides the platform

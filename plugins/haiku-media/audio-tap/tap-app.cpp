@@ -96,6 +96,41 @@ static status_t connect_mixer_to_output(BMediaRoster *roster, const media_node &
 	return err;
 }
 
+static bool port_is_dead(port_id port)
+{
+	port_info info;
+	return port < 0 || get_port_info(port, &info) != B_OK;
+}
+
+/* A helper killed with SIGKILL leaves the mixer's output and the card's input "connected" to its dead ports:
+ * the media roster does not track connections centrally (MediaRoster.cpp: "TODO: unregister connection with
+ * server"), and nodes only learn about a disconnect when told. Tell each live side, then they are free again.
+ * Disconnect() only needs valid node ids to proceed; the messages go to the ports of the source/destination. */
+static void break_dead_links(BMediaRoster *roster, const media_node &mixer, const media_node &out)
+{
+	media_output outputs[8];
+	int32 count = 0;
+	if (roster->GetConnectedOutputsFor(mixer, outputs, 8, &count) == B_OK) {
+		for (int32 i = 0; i < count; i++) {
+			if (port_is_dead(outputs[i].destination.port)) {
+				fprintf(stderr, "obs-haiku-audio-tap: freeing mixer output left connected to a dead node\n");
+				roster->Disconnect(mixer.node, outputs[i].source, out.node, outputs[i].destination);
+			}
+		}
+	}
+
+	media_input inputs[8];
+	count = 0;
+	if (roster->GetConnectedInputsFor(out, inputs, 8, &count) == B_OK) {
+		for (int32 i = 0; i < count; i++) {
+			if (port_is_dead(inputs[i].source.port)) {
+				fprintf(stderr, "obs-haiku-audio-tap: freeing audio output input left connected to a dead node\n");
+				roster->Disconnect(mixer.node, inputs[i].source, out.node, inputs[i].destination);
+			}
+		}
+	}
+}
+
 class TapApp : public BApplication {
 public:
 	explicit TapApp(bool repair_only) : BApplication(TAP_SIGNATURE), repair_only(repair_only) {}
@@ -118,6 +153,11 @@ public:
 			return;
 		}
 
+		/* media services restarting or the default output changing invalidate the routing we inserted
+		 * into; quit (OBS starts a new helper, which inserts the tap into the new routing) */
+		roster->StartWatching(BMessenger(this), B_MEDIA_SERVER_QUIT);
+		roster->StartWatching(BMessenger(this), B_MEDIA_DEFAULT_CHANGED);
+
 		BMessage tick(MSG_WATCHDOG);
 		watchdog = new BMessageRunner(BMessenger(this), &tick, 500000);
 		fprintf(stderr, "obs-haiku-audio-tap: tap inserted (%.0f Hz, %u channels, format 0x%x)\n",
@@ -134,7 +174,22 @@ public:
 			if (system_time() - shm->client_heartbeat > OBS_TAP_CLIENT_TIMEOUT) {
 				fprintf(stderr, "obs-haiku-audio-tap: no client, exiting\n");
 				PostMessage(B_QUIT_REQUESTED);
+			} else if (tap && !tap->InputConnected()) {
+				/* someone (Media preferences, Cortex) rerouted the mixer away from us */
+				fprintf(stderr, "obs-haiku-audio-tap: mixer was disconnected from the tap, exiting\n");
+				PostMessage(B_QUIT_REQUESTED);
 			}
+			return;
+		}
+		if (msg->what == B_MEDIA_SERVER_QUIT) {
+			fprintf(stderr, "obs-haiku-audio-tap: media services quit, exiting\n");
+			media_server_gone = true;
+			PostMessage(B_QUIT_REQUESTED);
+			return;
+		}
+		if (msg->what == B_MEDIA_DEFAULT_CHANGED) {
+			fprintf(stderr, "obs-haiku-audio-tap: default audio output changed, exiting\n");
+			PostMessage(B_QUIT_REQUESTED);
 			return;
 		}
 		BApplication::MessageReceived(msg);
@@ -183,18 +238,13 @@ private:
 			return err;
 		have_card = true;
 
-		/* the existing mixer -> sound card connection */
+		/* undo whatever a previous helper killed with SIGKILL left behind, then find the mixer -> sound
+		 * card connection */
+		Repair();
 		int32 count = 0;
 		err = roster->GetConnectedOutputsFor(mixer, &orig_out, 1, &count);
-		if (err != B_OK)
-			return err;
-		if (count < 1) {
-			/* a previous helper was killed: rebuild the chain, then look again */
-			Repair();
-			err = roster->GetConnectedOutputsFor(mixer, &orig_out, 1, &count);
-			if (err != B_OK || count < 1)
-				return err != B_OK ? err : B_MEDIA_NOT_CONNECTED;
-		}
+		if (err != B_OK || count < 1)
+			return err != B_OK ? err : B_MEDIA_NOT_CONNECTED;
 		if (roster->NodeIDFor(orig_out.destination.port) != card.node) {
 			/* someone else is already between the mixer and the card (or the output was rerouted);
 			 * insert after the mixer anyway, the original destination is what we reconnect to */
@@ -267,6 +317,21 @@ private:
 		if (!roster)
 			return;
 
+		if (media_server_gone) {
+			/* nothing to restore: the nodes are gone with the server; just drop our references */
+			if (tap) {
+				tap->Release();
+				tap = nullptr;
+			}
+			disconnected = have_up = have_down = have_mixer = have_card = false;
+			if (area >= 0) {
+				delete_area(area);
+				area = -1;
+				shm = nullptr;
+			}
+			return;
+		}
+
 		if (tap) {
 			roster->StopNode(tap->Node(), 0, true);
 			if (have_up)
@@ -321,6 +386,7 @@ private:
 			fprintf(stderr, "obs-haiku-audio-tap: no system mixer or audio output\n");
 			return;
 		}
+		break_dead_links(r, m, c);
 		err = connect_mixer_to_output(r, m, c, nullptr);
 		if (err == B_OK)
 			fprintf(stderr, "obs-haiku-audio-tap: reconnected system mixer to the audio output\n");
@@ -331,6 +397,7 @@ private:
 	}
 
 	const bool repair_only;
+	bool media_server_gone = false;
 	int exit_code = 0;
 	BMediaRoster *roster = nullptr;
 	BMessageRunner *watchdog = nullptr;

@@ -99,6 +99,22 @@ static void escape_js_string(const std::string &in, std::string &out)
 	}
 }
 
+/* BWebView allocates its offscreen bitmap in FrameResized(), which runs asynchronously after the view gets a
+ * real size; until then getOffscreen() would dereference a null view. */
+class HelperView : public BWebView {
+public:
+	HelperView() : BWebView("obs browser view") {}
+
+	void FrameResized(float width, float height) override
+	{
+		BWebView::FrameResized(width, height);
+		if (width >= 0.0f && height >= 0.0f)
+			offscreen_ready = true;
+	}
+
+	std::atomic_bool offscreen_ready{false};
+};
+
 class HelperWindow : public BWebWindow {
 public:
 	HelperWindow(BRect frame)
@@ -198,11 +214,17 @@ public:
 
 		window = new HelperWindow(BRect(PARK_X, PARK_Y, PARK_X + width - 1, PARK_Y + height - 1));
 		window->shm = shm;
-		view = new BWebView("obs browser view");
+		view = new HelperView();
 		window->AddChild(view);
 		window->SetCurrentWebView(view);
 		view->ResizeTo(width - 1, height - 1);
 		window->Show();
+		/* the window avoids focus and is never activated by the app_server; tell the page it is active so
+		 * carets, focus rings and keyboard input behave as in a focused browser */
+		if (window->Lock()) {
+			view->WindowActivated(true);
+			window->Unlock();
+		}
 
 		shm->helper_team = (int32_t)Team();
 		shm->helper_heartbeat = system_time();
@@ -276,7 +298,9 @@ public:
 			return;
 		case OBS_BROWSER_MSG_FOCUS:
 			if (view && window->Lock()) {
-				view->MakeFocus(message->GetBool("focus", true));
+				const bool focus = message->GetBool("focus", true);
+				view->MakeFocus(focus);
+				view->WindowActivated(true);
 				window->Unlock();
 			}
 			return;
@@ -331,6 +355,7 @@ private:
 			mapped->helper_state = old->helper_state;
 		}
 		mapped->helper_heartbeat = system_time();
+		mapped->helper_team = (int32_t)Team();
 		shm = mapped;
 		area = clone;
 		if (window && window->Lock()) {
@@ -453,11 +478,29 @@ private:
 		const BPoint screen(where.x + PARK_X, where.y + PARK_Y);
 		const int32 modifiers = in->GetInt32("modifiers", 0);
 
+		/* A secondary-button press would make BWebPage open its native context menu, synchronously, on this
+		 * thread (WebCore's main thread), at a position on the real screen. Deliver the DOM events instead. */
+		const int32 pressed = in->GetInt32("buttons", B_PRIMARY_MOUSE_BUTTON);
+		if ((in->what == OBS_BROWSER_MSG_MOUSE_DOWN || in->what == OBS_BROWSER_MSG_MOUSE_UP) &&
+		    (pressed & B_SECONDARY_MOUSE_BUTTON)) {
+			char js[512];
+			snprintf(js, sizeof(js),
+				 "(function(x,y){var e=document.elementFromPoint(x,y)||document.body;if(!e)return;"
+				 "function f(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,"
+				 "clientX:x,clientY:y,button:2,buttons:%d}));}%s})(%d,%d);",
+				 in->what == OBS_BROWSER_MSG_MOUSE_DOWN ? 2 : 0,
+				 in->what == OBS_BROWSER_MSG_MOUSE_DOWN ? "f('mousedown');"
+									: "f('mouseup');f('contextmenu');",
+				 (int)where.x, (int)where.y);
+			RunScript(js);
+			return;
+		}
+
 		BMessage out;
 		switch (in->what) {
 		case OBS_BROWSER_MSG_MOUSE_DOWN: {
 			out.what = B_MOUSE_DOWN;
-			buttons |= in->GetInt32("buttons", B_PRIMARY_MOUSE_BUTTON);
+			buttons |= pressed;
 			out.AddInt32("buttons", buttons);
 			out.AddInt32("clicks", in->GetInt32("clicks", 1));
 			if (view && window->Lock()) {
@@ -468,9 +511,8 @@ private:
 		}
 		case OBS_BROWSER_MSG_MOUSE_UP: {
 			out.what = B_MOUSE_UP;
-			const int32 released = in->GetInt32("buttons", B_PRIMARY_MOUSE_BUTTON);
-			out.AddInt32("previous buttons", released);
-			buttons &= ~released;
+			out.AddInt32("previous buttons", pressed);
+			buttons &= ~pressed;
 			out.AddInt32("buttons", buttons);
 			out.AddInt32("clicks", in->GetInt32("clicks", 1));
 			break;
@@ -543,7 +585,7 @@ private:
 				return;
 			}
 
-			if (window && window->LockWithTimeout(interval) == B_OK) {
+			if (window && view->offscreen_ready && window->LockWithTimeout(interval) == B_OK) {
 				BBitmap *bitmap = WebCore::DumpRenderTreeClient::getOffscreen(view);
 				if (bitmap && bitmap->Lock()) {
 					CopyFrame(s, bitmap, warned_alpha);
@@ -627,7 +669,7 @@ private:
 	BLocker frame_lock{"obs browser frame lock"};
 
 	HelperWindow *window = nullptr;
-	BWebView *view = nullptr;
+	HelperView *view = nullptr;
 	thread_id pump = -1;
 	std::atomic_bool quitting{false};
 

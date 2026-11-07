@@ -10,7 +10,8 @@ text and log lines are the most useful thing to send back.
 ## 0. What was verified before this test
 
 The port has **not** been built on Haiku yet. Without a Haiku machine, it was checked with a harness
-(`build-aux/haiku/crosscheck/`):
+(`build-aux/haiku/crosscheck/`), which now also covers the desktop audio helper, the browser helper and the browser
+dock code (HaikuWebKit's installed API headers are part of the harness sysroot):
 
 - CMake configures the whole project as `CMAKE_SYSTEM_NAME=Haiku` against Haiku-layout dependencies.
 - Every C/C++ file in the build, including Qt moc/uic output, compiles (syntax-only) with clang for
@@ -22,16 +23,18 @@ behavior. Those are what this test is for.
 ## 1. Build
 
 ```sh
-cd ~/OBS-Studio_HaikuOS            # wherever you cloned it (with --recursive)
-git pull && git submodule update --init deps/simde
-build-aux/haiku/install-deps.sh
-build-aux/haiku/build.sh
+cd ~/OBS-Studio_HaikuOS            # wherever you cloned it
+git pull
+build-aux/haiku/install-deps.sh    # now also installs haikuwebkit_devel
+build-aux/haiku/build.sh           # fetches the submodules it needs
 ```
 
 - [ ] `install-deps.sh` finishes without "!!" lines for the required packages.
 - [ ] CMake configure succeeds. The summary at the end lists enabled/disabled features; note which
-      plugins are disabled.
+      plugins are disabled. Expected enabled on Haiku: obs-websocket, the new MPEG-TS output, `obs-browser`
+      ("Browser docks (HaikuWebKit)"), `haiku-capture`, `haiku-media`.
 - [ ] The build finishes.
+- [ ] `build/rundir/RelWithDebInfo/bin/` contains `obs`, `obs-haiku-audio-tap` and `obs-haiku-browser`.
 
 If configure or the build fails, send `build/haiku-build.log` (or just everything from the first
 `error:`/`CMake Error` onward). The build script keeps going after errors (`-k 0`) so one log shows all
@@ -61,6 +64,8 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
       ...
       haiku-capture.so
       haiku-media.so
+      obs-browser.so
+      obs-websocket.so
       ...
   ```
   If a module is missing from that list, search the log for its name; libobs logs why it failed to load
@@ -84,6 +89,17 @@ Add each with the **+** button under *Sources*.
 - [ ] **Screen Capture** (haiku-capture): shows the desktop and updates live.
   - [ ] Toggling *Capture Cursor* shows/hides the mouse pointer.
   - [ ] At 1920×1080 and 30 fps, ProcessController shows reasonable CPU usage. Try 60 fps as well.
+- [ ] **Window Capture (screen region)** (haiku-capture):
+  - [ ] The *Window* list shows open windows as "[Application] Title"; OBS's own windows are not listed.
+        *Refresh window list* updates it.
+  - [ ] Pick a Terminal window: the source shows exactly that window. Move and resize the window: the source
+        follows.
+  - [ ] Minimize the window or switch to another workspace: the source pauses (keeps the last frame) and the log
+        says so; restoring it resumes.
+  - [ ] Put another window over it: the covering window appears in the capture (expected, documented) and the log
+        mentions the window is covered.
+  - [ ] *Include window border and tab* on/off changes whether the tab and border are captured.
+  - [ ] Quit and restart OBS: the source finds the same window again.
 - [ ] **Audio Input Capture (Media Kit)**:
   - [ ] The *Device* list shows "Default (Media preferences)" plus your input device(s).
   - [ ] Speaking into the mic moves its meter in the *Audio Mixer* dock.
@@ -97,7 +113,33 @@ Add each with the **+** button under *Sources*.
 - [ ] **Media Source** (FFmpeg): plays a local video file with sound.
 - [ ] **VLC Video Source** (only if `vlc_devel` was installed): plays a playlist.
 
-## 4. Audio monitoring
+## 4. Desktop audio
+
+**Before this test, note how to restore sound if something goes wrong:** run
+`build/rundir/RelWithDebInfo/bin/obs-haiku-audio-tap --repair`, or open *Media* preferences and click
+*Restart media services*.
+
+1. Play something (MediaPlayer, or a video in WebPositive).
+2. *Settings → Audio → Global Audio Devices → Desktop Audio*: choose "System mixer output".
+
+- [ ] You **still hear** the playback normally, without new crackling or added delay.
+- [ ] The *Desktop Audio* meter in the Audio Mixer moves with the playback.
+- [ ] The Terminal shows `obs-haiku-audio-tap: tap inserted (48000 Hz, 2 channels, format 0x...)` and
+      `[haiku-media] 'Desktop Audio': attached to the desktop audio tap`. Note the format.
+- [ ] If the Cortex app is installed (`pkgman install cortex`), it shows "OBS Desktop Audio Tap" between the system mixer and
+      the sound card while OBS runs.
+- [ ] Record 30 s with only desktop audio: the recording has the played sound, in sync, without gaps or
+      doubled/sped-up audio.
+- [ ] Set *Desktop Audio* to "Disabled" (or quit OBS): within a second, the tap disappears from the media
+      routing and playback continues normally (`obs-haiku-audio-tap: ...` lines in the Terminal). ProcessController
+      no longer lists `obs-haiku-audio-tap`.
+- [ ] Crash recovery: with desktop audio active, kill OBS from ProcessController (Kill). Within ~10 s the helper
+      exits and sound continues. Then kill `obs-haiku-audio-tap` itself with Kill while OBS is running: OBS logs
+      that the helper died, starts a new one and capture resumes; sound keeps working.
+- [ ] Settings → Audio: the *Sample Rate* setting (44.1 or 48 kHz) different from the mixer's rate still gives
+      correct pitch in recordings.
+
+## 5. Audio monitoring
 
 1. *Settings → Audio → Advanced → Monitoring Device*: "Default".
 2. In the Audio Mixer, open the gear menu of the mic source → *Advanced Audio Properties* →
@@ -107,8 +149,44 @@ Add each with the **+** button under *Sources*.
 - [ ] Volume changes on the source's fader change the monitored volume.
 - [ ] Switching back to *Monitor Off* stops it. No crash when switching repeatedly.
 - [ ] A Media Source with *Monitor Only (mute output)* is audible but its meter in the recording is silent.
+- [ ] With Desktop Audio enabled, set *Monitor and Output* on Desktop Audio itself: there must be **no** echo or
+      feedback (OBS skips monitoring of Desktop Audio). Monitoring another source is heard and is also captured by
+      Desktop Audio (same as other platforms when monitoring and desktop audio use the same device).
 
-## 5. Recording
+## 6. Browser source and docks
+
+- [ ] **Browser** source with the default URL (`https://obsproject.com/browser-source`): the page renders in the
+      preview within a few seconds. ProcessController lists one `obs-haiku-browser` per browser source. No
+      `obs-haiku-browser` entry appears in the Deskbar (after the first start).
+- [ ] Width/Height 1280×720: the page re-lays out to that size.
+- [ ] Transparency: set the URL to a page with a transparent background, e.g. a local file containing
+      `<html><body style="background:transparent"><h1 style="color:red">Hello</h1></body></html>` (*Local file*
+      checkbox). Put it over a color source: only the text is visible. If the whole page is opaque, note the log line
+      `obs-haiku-browser: page rendered without an alpha channel`.
+- [ ] *Custom CSS* `body { background: blue !important; }` turns the page blue immediately.
+- [ ] *Refresh cache of current page* reloads it.
+- [ ] Animation: a page with a CSS animation or a clock (e.g. `https://time.is`) updates continuously at the source
+      frame rate.
+- [ ] *Shutdown source when not visible*: hiding the source (eye icon) ends its `obs-haiku-browser` process;
+      showing it starts one and the page comes back.
+- [ ] *Interact* (right-click the source → Interact): clicking links, scrolling with the wheel, typing into a text
+      field (letters, Backspace, arrows, Enter) all work.
+- [ ] Crash recovery: kill an `obs-haiku-browser` process in ProcessController. OBS logs `browser helper ... exited
+      unexpectedly` and the page comes back within a few seconds.
+- [ ] Twitch/StreamElements-style alert page or a chat overlay URL you normally use: note whether it renders and
+      animates (HaikuWebKit has no WebGL, so WebGL-based overlays won't).
+- [ ] **Custom browser docks**: *Docks → Custom Browser Docks...*, add one with `https://obsproject.com`. The dock
+      shows the page, follows dock resizing, scrolls with the wheel, links can be clicked, the dock's title follows
+      the page title. Restart OBS: the dock comes back.
+
+## 7. obs-websocket
+
+- [ ] *Tools → WebSocket Server Settings* opens; enable the server (port 4455), *Show Connect Info* shows a QR code.
+- [ ] From another machine (or WebPositive on `http://localhost` with a test page), connect with an obs-websocket
+      5 client (e.g. https://github.com/obsproject/obs-websocket-js examples or the *OBS Blade* app) using the
+      password: switching scenes and starting/stopping recording from the client works.
+
+## 8. Recording
 
 *Settings → Output*: Output Mode "Simple", Recording Path somewhere writable, Recording Format "Matroska
 Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder "AAC" (FFmpeg).
@@ -119,23 +197,31 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
       Note the CPU usage and render time if frames are dropped.
 - [ ] Try "Advanced" output mode with "Hybrid MP4" as well.
 
-## 6. Streaming (optional)
+## 9. Streaming (optional)
 
 - [ ] *Settings → Stream*: a service with a stream key (e.g. YouTube or Twitch, preferably an unlisted/test
       stream). *Start Streaming* connects and the stream plays on the service.
 - [ ] Bandwidth test or a custom RTMP server if available.
 - [ ] WHIP (WebRTC) to a test server, if `libdatachannel_devel` was installed.
+- [ ] **SRT**: *Settings → Stream → Service: Custom*, server `srt://<other-machine>:9000?mode=caller` with a listener
+      on the other machine (e.g. `ffplay -i "srt://0.0.0.0:9000?mode=listener"` or OBS's own Media Source in
+      listener mode on another computer). The stream plays.
+- [ ] **RIST**: server `rist://<other-machine>:9000`, receiver `ffplay rist://@:9000`. The stream plays.
 
-## 7. Hotkeys
+## 10. Hotkeys
+
+On Haiku, OBS's "Ctrl" is Haiku's **Command** modifier, which is the **Alt** key with Haiku's default keyboard
+settings (the same key Haiku's own shortcuts use). OBS's "Alt" is Haiku's Control key.
 
 - [ ] *Settings → Hotkeys*: click the field for *Start Recording* and press **F9**; the field shows "F9".
-      Try a combination like **Ctrl+Shift+R**; it shows "Control + Shift + R".
+      Press **Alt+Shift+R** (physical keys, default Haiku settings); the field shows "Ctrl + Shift + R".
+      Press the physical **Ctrl+R**; it shows "Alt + R".
 - [ ] With another application focused (e.g. a Terminal), press the hotkey; recording starts. Press the
       Stop hotkey; it stops. (These are global hotkeys polled from the app_server.)
 - [ ] Try a numpad key and a punctuation key. Note any key that shows the wrong name or doesn't trigger,
       along with your keyboard layout.
 
-## 8. Windows and projectors
+## 11. Windows and projectors
 
 - [ ] Right-click the preview → *Windowed Projector (Preview)*: a separate window shows the canvas and
       resizes correctly.
@@ -144,7 +230,7 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
 - [ ] *View → Multiview*: renders all scenes.
 - [ ] Source properties dialogs show their live preview at the top.
 
-## 9. Tools
+## 12. Tools
 
 - [ ] *Tools → Automatic Scene Switcher*: the window list shows running applications (e.g. "Terminal",
       "WebPositive"). A rule switches scenes when you activate that application.
@@ -152,7 +238,7 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
       settings tab shows the path.
 - [ ] *Tools → Plugin Manager* opens.
 
-## 10. Lifecycle
+## 13. Lifecycle
 
 - [ ] Quit OBS and start it again: scenes, sources and settings are restored from
       `~/config/settings/obs-studio`.
@@ -160,8 +246,10 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
 - [ ] Quitting doesn't crash or hang. A clean exit doesn't trigger the "OBS didn't shut down properly"
       dialog on the next start.
 - [ ] Logs exist in `~/config/settings/obs-studio/logs/`.
+- [ ] After quitting, ProcessController shows no leftover `obs-haiku-audio-tap` or `obs-haiku-browser` (allow ~10 s),
+      and system sound works.
 
-## 11. Reporting back
+## 14. Reporting back
 
 Run:
 

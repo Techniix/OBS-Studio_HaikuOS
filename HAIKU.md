@@ -1,108 +1,81 @@
 # OBS Studio for Haiku
 
-This repository is a port of [OBS Studio](https://github.com/obsproject/obs-studio) to
-[Haiku](https://www.haiku-os.org/). It tracks upstream releases (currently **33.0.1**) and keeps the
-Haiku-specific changes as separate commits on top, so they can be rebased onto new releases.
+This repository ports [OBS Studio](https://github.com/obsproject/obs-studio) to [Haiku](https://www.haiku-os.org/).
+It tracks upstream release **33.0.1** and keeps the Haiku work in separate commits on top, so it can be rebased
+onto new releases. Everything is under OBS's license, GPL v2 or later (see `COPYING`).
 
-OBS Studio is licensed under the GNU General Public License v2 or later (see `COPYING`); all changes in
-this fork are under the same license.
+The goal is full feature parity. No OBS feature is switched off for Haiku; where Haiku lacks what upstream relies on
+(CEF, PulseAudio loopback devices, per-window buffers), the port provides a Haiku implementation behind the same
+interfaces.
+
+| Document | Contents |
+| --- | --- |
+| [docs/haiku/BUILDING.md](docs/haiku/BUILDING.md) | Dependencies, build, run, install, troubleshooting |
+| [docs/haiku/TESTING.md](docs/haiku/TESTING.md) | Step-by-step checklist for testing on real hardware |
+| [docs/haiku/ARCHITECTURE.md](docs/haiku/ARCHITECTURE.md) | How each subsystem was adapted and why |
 
 ## Status
 
-Early bring-up. The code has been checked against the Haiku system headers but has **not yet been built
-or run on Haiku** — expect build fixes on the first real compile.
+**The port has not been compiled with Haiku's GCC or run on Haiku yet.** Every translation unit of the build (about
+550, including Qt moc/uic output) passes a syntax-only compile with clang for `x86_64-unknown-haiku` against the real
+Haiku system headers and the real dependency headers (`build-aux/haiku/crosscheck/`). GCC-specific errors, link
+errors and all runtime behavior are still unverified; the first test on hardware is the next milestone.
 
-| Area | State |
-| --- | --- |
-| Build system (`OS_HAIKU`, `cmake/haiku`) | Done |
-| libobs platform layer (paths, system info, threads, UUIDs) | Done |
-| Global hotkeys (`get_key_info()` / `get_mouse()`) | Done |
-| OpenGL renderer (Mesa EGL, offscreen pbuffers + readback) | Done |
-| Qt frontend (preview, projectors, settings, hotkey capture) | Done |
-| Screen capture (`haiku-capture`, `BScreen::ReadBitmap`) | Done |
-| Automatic scene switcher (matches running app names) | Done |
-| Encoding/streaming/recording (FFmpeg, x264, RTMP, WebRTC) | Portable code, enabled |
-| Audio input/output capture (Media Kit) | Not started |
-| Audio monitoring (Media Kit / `BSoundPlayer`) | Not started (null backend) |
-| Webcam / video capture devices (Media Kit) | Not started |
-| Window capture | Not started |
-| Browser source / docks (CEF) | Not available on Haiku |
+### Feature matrix
 
-### How rendering works
+Column meanings:
 
-Haiku has no way to let another thread render straight into a Qt widget's window with EGL, so
-`libobs-opengl/gl-haiku.c` renders every display (preview, projector, multiview) into its own EGL pbuffer.
-On present, the frame is read back and passed to the owner through a callback in `struct gs_window`.
-The Qt frontend (`OBSQTDisplay`) copies it into a `QImage` and paints it on the UI thread. This costs
-one `glReadPixels` per displayed frame, which is fine at preview sizes. It does not affect what gets
-recorded or streamed.
+- **Implemented**: the code exists for Haiku.
+- **Compiles**: "clang" means it passes the cross-check harness (syntax-only, clang, real Haiku headers); "GCC" would
+  mean a real build on Haiku.
+- **Runs**, **Functionally tested**, **Fully verified**: on real Haiku hardware. Nothing has reached these yet.
 
-## Building
+| Feature | Implemented | Compiles | Runs | Functionally tested | Fully verified | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- |
+| Build system (`OS_HAIKU`, `cmake/haiku`) | Yes | clang | – | – | – | Configures in the harness; native configure untested |
+| libobs platform layer (paths, system info, threads, UUIDs) | Yes | clang | – | – | – | Sleep inhibition is a no-op (Haiku has no API) |
+| OpenGL renderer (Mesa EGL pbuffers + readback) | Yes | clang | – | – | – | One `glReadPixels` per displayed preview frame |
+| Qt frontend (preview, projectors, multiview, settings) | Yes | clang | – | – | – | Preview is painted from a CPU copy |
+| Global hotkeys | Yes | clang | – | – | – | OBS "Ctrl" = Haiku Command key (Alt by default); punctuation on non-US layouts may bind to another key |
+| Recording / streaming (FFmpeg, x264, RTMP, WHIP) | Yes (portable) | clang | – | – | – | Software encoders only; no hardware encoders on Haiku |
+| SRT / RIST output (native MPEG-TS) | Yes (bundled libsrt 1.5.4, librist 0.2.12) | clang | – | – | – | Built from source with small Haiku patches |
+| obs-websocket 5 | Yes (bundled qrcodegen, Asio, WebSocket++) | clang | – | – | – | – |
+| Audio input capture (mic, line-in) | Yes (Media Kit `BMediaRecorder`) | clang | – | – | – | Busy devices stay silent until the source is re-saved |
+| Desktop audio capture | Yes (tap node helper, `obs-haiku-audio-tap`) | clang | – | – | – | Captures the whole system mix (no per-application capture); monitored sources are captured too |
+| Audio monitoring | Yes (`BSoundPlayer`) | clang | – | – | – | "Default" (system mixer) is the only device; ~50–250 ms latency |
+| Webcam / video capture devices | Yes (Media Kit) | clang | – | – | – | Uses the device's current format; no resolution/format picker yet |
+| Screen capture | Yes (`BScreen::ReadBitmap`) | clang | – | – | – | Main screen only |
+| Window capture | Yes, as screen-region capture of the tracked window | clang | – | – | – | Not isolated: windows covering it are captured too (app_server keeps no per-window buffers) |
+| Browser source | Yes (HaikuWebKit helper `obs-haiku-browser`) | clang | – | – | – | No WebGL, no per-source audio (page audio goes to Desktop Audio), transparency depends on WebKit's alpha output |
+| Browser docks (custom docks, service integrations) | Yes (QCef interface on HaikuWebKit) | clang | – | – | – | Cookies are kept per helper process in memory, not persisted |
+| Automatic scene switcher | Yes (matches application names) | clang | – | – | – | Window titles of other apps aren't used |
+| Scripting (Lua, Python) | Yes (portable) | clang | – | – | – | Needs SWIG, LuaJIT, Python packages |
+| Third-party plugins | Yes (standard module loading, plugin manager) | clang | – | – | – | Plugins must be built for Haiku |
+| AJA, DeckLink, NVENC, QSV, VA-API | No | – | – | – | – | No drivers/SDKs exist for Haiku |
 
-### Dependencies
-
-Install with `pkgman install` (secondary-architecture builds aren't supported):
-
-```sh
-pkgman install cmake ninja pkgconfig \
-    ffmpeg8_devel x264_devel jansson_devel curl_devel mbedtls3_devel zlib_devel uthash \
-    qt6_base_devel qt6_svg_devel qt6_tools \
-    mesa_devel libglvnd_devel freetype_devel fontconfig_devel \
-    nlohmann_json libdatachannel_devel \
-    luajit_devel swig python3.10_devel \
-    speexdsp_devel rnnoise_devel
-```
-
-Optional: `vlc_devel` (VLC video source), `fdk_aac_devel` (libfdk AAC encoder).
-
-SIMDe isn't packaged in HaikuPorts; it is bundled as the `deps/simde` submodule and found automatically.
-
-### Configure and build
+## Quick start
 
 ```sh
-git clone --recursive https://github.com/Techniix/OBS-Studio_HaikuOS.git
+git clone https://github.com/Techniix/OBS-Studio_HaikuOS.git
 cd OBS-Studio_HaikuOS
-
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DENABLE_WEBSOCKET=OFF \
-    -DENABLE_NEW_MPEGTS_OUTPUT=OFF
-cmake --build build
+build-aux/haiku/install-deps.sh
+build-aux/haiku/build.sh
+cd build/rundir/RelWithDebInfo/bin && ./obs
 ```
 
-- `ENABLE_WEBSOCKET=OFF`: obs-websocket needs `qrcodegencpp`, which isn't in HaikuPorts yet.
-- `ENABLE_NEW_MPEGTS_OUTPUT=OFF`: the native SRT/RIST output needs `libsrt` and `librist`, which aren't
-  in HaikuPorts yet.
-- Browser source, AJA, DeckLink and VST plugins are skipped automatically on Haiku.
-- Warnings are not treated as errors on Haiku. Pass `-DCMAKE_COMPILE_WARNING_AS_ERROR=ON` to opt in.
+`build.sh` fetches the submodules it needs. Settings and logs are in `~/config/settings/obs-studio`.
 
-### Running from the build tree
-
-```sh
-cd build/rundir/RelWithDebInfo/bin
-./obs
-```
-
-Settings and logs are stored in `~/config/settings/obs-studio`.
-
-### Installing
-
-The default install prefix is `/boot/home/config/non-packaged`:
-
-```sh
-cmake --install build
-```
-
-## Haiku-specific files
+## Where the Haiku code is
 
 | Path | Purpose |
 | --- | --- |
-| `cmake/haiku/` | Compiler flags, install layout, helpers |
-| `libobs/cmake/os-haiku.cmake` | libobs sources/libraries for Haiku |
-| `libobs/obs-haiku.c`, `libobs/obs-haiku-be.cpp` | System info, data paths, hotkeys |
-| `libobs/util/platform-nix.c` (`__HAIKU__` blocks) | Executable path, config dir, memory/CPU queries, UUIDs |
+| `cmake/haiku/`, `cmake/common/osconfig.cmake` | Platform detection, compiler flags, install layout, finders that fall back to bundled deps |
+| `libobs/obs-haiku.c`, `libobs/obs-haiku-be.cpp`, `libobs/util/platform-nix.c` | System info, data paths, hotkeys, platform utilities |
+| `libobs/audio-monitoring/haiku/` | Audio monitoring through `BSoundPlayer` |
 | `libobs-opengl/gl-haiku.c` | EGL pbuffer swapchains with readback |
-| `frontend/cmake/os-haiku.cmake`, `frontend/utility/*-haiku.cpp` | Frontend platform glue |
-| `frontend/widgets/OBSQTDisplay.*` (`__HAIKU__` blocks) | Paints frames handed back by libobs |
-| `plugins/haiku-capture/` | Screen capture source |
-| `plugins/frontend-tools/auto-scene-switcher-haiku.cpp` | Scene switcher backend |
+| `frontend/utility/*-haiku.cpp`, `frontend/widgets/OBSQTDisplay.*` | Frontend platform glue, preview painting |
+| `plugins/haiku-capture/` | Screen capture, window capture |
+| `plugins/haiku-media/` | Audio input, desktop audio (with the `obs-haiku-audio-tap` helper), video capture devices |
+| `plugins/haiku-browser/` | Browser source and docks (module `obs-browser`, helper `obs-haiku-browser`) |
+| `deps/qrcodegen`, `deps/srt-haiku`, `deps/librist-haiku` | Bundled builds of libraries HaikuPorts doesn't package |
+| `build-aux/haiku/` | Dependency installer, build script, log collector, cross-check harness |

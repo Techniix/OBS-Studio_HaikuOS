@@ -27,6 +27,7 @@
 #include "browser-shm.h"
 
 #include <Message.h>
+#include <Messenger.h>
 #include <OS.h>
 
 #include <mutex>
@@ -98,6 +99,9 @@ public:
 private:
 	bool CreateArea(uint32_t width, uint32_t height);
 	void DestroyArea();
+	void RetireArea();
+	bool TrySendAttach();
+	obs_browser_shm *HelperShm() const;
 	bool SpawnHelper();
 	void StopHelper();
 	bool HelperAlive() const;
@@ -115,6 +119,14 @@ private:
 	area_id area = -1;
 	obs_browser_shm *shm = nullptr;
 	uint32_t area_width = 0, area_height = 0;
+
+	/* While a switch to a bigger area hasn't reached the helper, it keeps using the previous one: keep it
+	 * mapped, read the helper's state from it and keep its heartbeat going. */
+	area_id retired_area = -1;
+	obs_browser_shm *retired_shm = nullptr;
+	bool attach_pending = false;
+
+	BMessenger messenger;
 
 	pid_t helper = -1;
 	bigtime_t helper_started = 0;

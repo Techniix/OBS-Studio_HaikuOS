@@ -41,6 +41,9 @@ public:
 	BMediaAddOn *AddOn(int32 *id) const override;
 	status_t HandleMessage(int32 message, const void *data, size_t size) override;
 
+	/* false once the mixer has been disconnected from us (e.g. rerouted by Media preferences) */
+	bool InputConnected() const { return input.source != media_source::null; }
+
 protected:
 	void NodeRegistered() override;
 

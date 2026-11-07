@@ -175,6 +175,7 @@ struct DesktopAudio {
 	const obs_tap_shm *shm = nullptr;
 	volatile int64_t *heartbeat = nullptr;
 	int64_t read_pos = 0;
+	bigtime_t attached_at = 0;
 	int32_t format_serial = -1;
 	bool format_ok = false;
 	bool warned_format = false;
@@ -213,6 +214,7 @@ bool DesktopAudio::Attach()
 	shm = mapped;
 	heartbeat = &mapped->client_heartbeat;
 	*heartbeat = system_time();
+	attached_at = system_time();
 	read_pos = shm->write_pos; /* start with what is played from now on */
 	format_serial = -1;
 	blog(LOG_INFO, "[haiku-media] '%s': attached to the desktop audio tap", obs_source_get_name(source));
@@ -307,12 +309,16 @@ void DesktopAudio::Run()
 	os_set_thread_name("haiku-desktop-audio");
 
 	bigtime_t last_spawn = 0;
+	/* grows while the helper keeps failing (no sound card, media server down) so the log isn't flooded */
+	bigtime_t spawn_interval = HELPER_START_TIMEOUT_US;
 	while (!stop) {
 		if (!shm) {
 			reap_helper();
 			if (!Attach()) {
 				const bigtime_t now = system_time();
-				if (now - last_spawn > HELPER_START_TIMEOUT_US) {
+				if (now - last_spawn > spawn_interval) {
+					if (last_spawn)
+						spawn_interval = std::min<bigtime_t>(spawn_interval * 2, 60000000);
 					spawn_helper();
 					last_spawn = now;
 				}
@@ -329,12 +335,16 @@ void DesktopAudio::Run()
 			continue;
 		}
 
-		if (!shm->helper_alive && system_time() - *heartbeat > 1000000) {
+		/* not (or no longer) inserted; allow a freshly started helper a moment to insert the tap */
+		if (!shm->helper_alive && system_time() - attached_at > 2000000) {
 			/* the helper is shutting down (or failed to insert the tap) */
 			blog(LOG_INFO, "[haiku-media] '%s': desktop audio tap went away", obs_source_get_name(source));
 			Detach();
 			continue;
 		}
+
+		if (shm->helper_alive)
+			spawn_interval = HELPER_START_TIMEOUT_US;
 
 		area_info info;
 		if (get_area_info(clone, &info) != B_OK) {

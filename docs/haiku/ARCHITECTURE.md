@@ -16,9 +16,13 @@ whole port and rebasing onto a new upstream release stays manageable.
 5. [Qt frontend](#5-qt-frontend)
 6. [Audio monitoring](#6-audio-monitoring)
 7. [haiku-media: audio and video capture](#7-haiku-media-audio-and-video-capture)
-8. [haiku-capture: screen capture](#8-haiku-capture-screen-capture)
-9. [Other plugins](#9-other-plugins)
-10. [Known limitations and ideas](#10-known-limitations-and-ideas)
+8. [Desktop audio capture](#8-desktop-audio-capture)
+9. [haiku-capture: screen and window capture](#9-haiku-capture-screen-and-window-capture)
+10. [Browser source and docks](#10-browser-source-and-docks)
+11. [Bundled dependencies: obs-websocket, SRT, RIST](#11-bundled-dependencies-obs-websocket-srt-rist)
+12. [Other plugins](#12-other-plugins)
+13. [Known limitations and ideas](#13-known-limitations-and-ideas)
+14. [Design decisions](#14-design-decisions)
 
 ## 1. Build system
 
@@ -28,8 +32,14 @@ whole port and rebasing onto a new upstream release stays manageable.
 | `cmake/haiku/compilerconfig.cmake` | Reuses the Linux GCC/Clang flags. `CMAKE_COMPILE_WARNING_AS_ERROR` defaults to `OFF` because Haiku's headers and GCC 13 produce warnings upstream CI never sees. |
 | `cmake/haiku/defaults.cmake` | Install layout (default prefix `/boot/home/config/non-packaged`; CMake's own Haiku default would be `/boot/system`, which is read-only). Sets `ENABLE_PULSEAUDIO`/`ENABLE_WAYLAND` to `OFF` as plain variables, and points FindSIMDe at the bundled `deps/simde` submodule. |
 | `cmake/haiku/helpers.cmake` | Reuses the Linux target helpers (rundir layout, RPATH, install rules). Haiku's runtime loader understands ELF RPATH/`$ORIGIN`. |
+| `cmake/haiku/finders/` | Prepended to the module path. `Find{qrcodegencpp,Libsrt,Librist}.cmake` run the upstream finder first and, if nothing is installed, build the bundled copy (section 11) and provide the same imported target name, so upstream CMake code is untouched. |
+| `cmake/haiku/haiku-patch.cmake` | `haiku_copy_tree()`/`haiku_patch_file()`: copy a submodule's sources into the build tree and apply literal replacements, failing loudly if an expected snippet is missing. Submodules stay pristine. |
 | `cmake/common/versionconfig.cmake` | Falls back to version `33.0.1-g<hash>` when `git describe` finds no release tag (fork clones often have none). |
 | `libobs/cmake/os-haiku.cmake`, `frontend/cmake/os-haiku.cmake` | Platform sources and libraries (`be`, `media`, `locale`, `network`). |
+
+C++ code is compiled with `_DEFAULT_SOURCE`. Haiku's `bsd/features.h` enables BSD/GNU extensions such as
+`NI_MAXHOST` only when `__STRICT_ANSI__` is undefined, and `-std=c++17` (not `gnu++17`) defines it; Asio needs those
+declarations.
 
 Haiku keeps libc, libm, libdl and pthreads in `libroot` (linked implicitly), sockets in `libnetwork`, and the
 C++ kits in `libbe`/`libmedia`/`liblocale`.
@@ -69,9 +79,15 @@ Global hotkeys poll the keyboard state from the app_server, the same model as X1
 - `libobs/obs-haiku-be.cpp` wraps `get_key_info()` (128-bit key state bitmap indexed by Haiku raw key code)
   and `get_mouse()` (button mask) for C.
 - `libobs/obs-haiku.c` maps `obs_key_t` ↔ Haiku raw key codes. The table was checked against
-  `data/system/data/KeyboardLayouts/Generic 105-key International` from the Haiku tree. Left and right
-  modifiers both count (`Shift`, `Control`, `Alt` = Command, `Super` = Option/Windows key).
+  `data/system/data/KeyboardLayouts/Generic 105-key International` from the Haiku tree.
   Polling is cached for 4 ms because the hotkey thread asks for every bound key on each tick.
+- **Modifier convention.** Haiku's Qt plugin reports Haiku's *Command* modifier as Qt's Control and Haiku's
+  *Control* modifier as Qt's Alt (Command is what Haiku shortcuts use, like Ctrl elsewhere). libobs follows the same
+  convention so hotkeys captured in the UI match what is polled: `OBS_KEY_CONTROL` = Command (raw keys 0x5d/0x5f),
+  `OBS_KEY_ALT` = Control (0x5c/0x60), `OBS_KEY_META` = Option (0x66/0x67). Modifier state comes from the
+  `key_info.modifiers` bits, so remapped modifier keys (Keymap preferences) behave as the user configured them. With
+  Haiku's default settings the physical **Alt** key is Command, so an OBS hotkey shown as "Ctrl + R" is pressed with
+  Alt+R.
 - "Virtual keys" (`obs_key_from_virtual_key()`) are Haiku raw key codes.
 
 Qt's Haiku platform plugin does not pass raw key codes through `QKeyEvent::nativeVirtualKey()`, so when you
@@ -183,20 +199,135 @@ channels, host byte order. Buffers are timestamped on arrival.
 (as YUY2, partial range). Haiku's `usb_webcam` add-on produces `B_RGB32`. "Deactivate when not showing"
 disconnects the device while the source isn't visible.
 
-There is no desktop audio capture: the system mixer has a single output, which is connected to the sound
-card.
+The frontend uses `haiku_audio_input_capture` for the global Mic/Aux devices in *Settings → Audio* and
+`haiku_desktop_audio_capture` (section 8) for the Desktop Audio devices (`frontend/OBSApp.cpp`).
 
-## 8. haiku-capture: screen capture
+## 8. Desktop audio capture
 
-`plugins/haiku-capture/screen-capture.cpp`. A thread calls `BScreen::ReadBitmap()` into a `B_RGB32` bitmap
-at the configured rate (1–60 fps, default 30) and outputs it as an async BGRX source, so the app_server copy
-never blocks rendering. It captures the main screen with the cursor optional. The source only runs while it
-is shown.
+Haiku has no loopback device: the system mixer has one output, connected to the sound card's input. Capturing what
+is played therefore means getting into that connection.
+
+```
+before:  system mixer ──────────────────────────────► sound card
+after:   system mixer ──► TapNode ──► sound card
+                            │ copy
+                            ▼
+                 area "obs-studio desktop audio tap" ──► Desktop Audio source(s) in OBS
+```
+
+**Helper process** `obs-haiku-audio-tap` (`plugins/haiku-media/audio-tap/`). It is a separate program so that a fault
+in the real-time media path cannot take OBS down, and so the original routing is restored even when OBS crashes:
+
+1. Creates the cloneable area (`audio-tap-shm.h`: header + 1 MiB ring). The area name doubles as a single-instance
+   lock.
+2. Saves the mixer's connected output (`GetConnectedOutputsFor`), registers `TapNode`, slaves it to the mixer's
+   time source, disconnects mixer → card, connects tap → card (with the format the mixer and card were already
+   using), then mixer → tap, and starts the node. On any failure the original connection is restored.
+3. `TapNode` (`tap-node.cpp`, structured after Haiku's MIT-licensed Equalizer add-on) is a `BBufferConsumer` +
+   `BBufferProducer` + `BMediaEventLooper`. Each buffer is `memcpy`'d into the ring and forwarded unchanged with
+   `SendBuffer`; `SetBufferGroup` passes the card's buffers upstream so the mixer writes straight into them. What
+   you hear is not modified.
+4. A watchdog quits when no reader has written a heartbeat for 10 s. Quitting, `SIGINT`/`SIGTERM`/`SIGHUP` and the
+   last OBS source going away all restore mixer → card. If the helper was killed with `SIGKILL`, the next start (or
+   `obs-haiku-audio-tap --repair`) reconnects the mixer's free output to the card's free input.
+
+**OBS source** "Desktop Audio (Media Kit)" (`plugins/haiku-media/desktop-audio.cpp`). A reader thread finds the area
+(starting the helper with `posix_spawn` if needed), clones it, and every 10 ms converts new ring data to
+`obs_source_audio` in the mixer's format (float/int/short/8-bit, 1–8 channels). It detaches and reconnects if the
+helper exits or dies, skips ahead if it falls more than half a ring behind, and stops the helper when the last
+desktop audio source is destroyed. The source has `OBS_SOURCE_DO_NOT_SELF_MONITOR`: monitoring plays into the very
+mixer the tap captures, so monitoring Desktop Audio would feed back into itself.
+
+Helpers are marked as background apps (`B_BACKGROUND_APP` via `BAppFileInfo`, set on first use) so they don't show
+in the Deskbar.
+
+## 9. haiku-capture: screen and window capture
+
+**Screen capture** (`screen-capture.cpp`). A thread calls `BScreen::ReadBitmap()` into a `B_RGB32` bitmap at the
+configured rate (1–60 fps, default 30) and outputs it as an async BGRX source, so the app_server copy never blocks
+rendering. It captures the main screen with the cursor optional. The source only runs while it is shown.
+
+**Window capture** (`window-capture.cpp`). The app_server composes windows straight into the frame buffer and keeps
+no per-window backing store another team could read, so isolated window capture (like PipeWire or
+`CGWindowListCreateImage`) is not possible on Haiku. The source is therefore a clearly labelled screen-region
+capture that follows one window:
+
+- Windows are listed with the private window-list API Deskbar and the Switcher use (`get_token_list()`,
+  `get_window_info()`, `BPrivate::get_window_order()`; declarations copied in `haiku-window-info.h`). OBS's own
+  windows are skipped.
+- The selected window is remembered as "application name + title" and found again after restarts.
+- Every frame, the window's current frame (optionally with border and tab) is read from the screen. Moving and
+  resizing are followed; the source pauses while the window is hidden, minimized or on another workspace, and logs
+  when other windows cover it (their pixels are captured too).
 
 `BScreen` needs a connection to the app_server, which exists because Qt's Haiku plugin creates a
 `BApplication`.
 
-## 9. Other plugins
+## 10. Browser source and docks
+
+CEF (Chromium) has not been ported to Haiku, and obs-browser is built on it. The Haiku port replaces it with
+`plugins/haiku-browser/`, using HaikuWebKit, the WebKit port behind WebPositive.
+
+```
+OBS process                                               obs-haiku-browser (one per page)
+┌──────────────────────────────┐   BMessage: config,     ┌────────────────────────────────────┐
+│ browser_source / dock widget │   input, JS, reload ──► │ BApplication (WebCore main thread) │
+│   HaikuBrowserClient         │                         │ BWebWindow parked off-screen       │
+│   area "obs browser <pid>.n" │ ◄── frames (seqlock) ── │   BWebView → offscreen BBitmap     │
+└──────────────────────────────┘                         │ pump thread copies at source fps   │
+                                                         └────────────────────────────────────┘
+```
+
+- **Module identity.** The module is built under the name `obs-browser` and registers `browser_source` with
+  obs-browser's settings keys (`url`, `is_local_file`, `local_file`, `width`, `height`, `fps_custom`, `fps`, `css`,
+  `shutdown`, `restart_when_active`, `reroute_audio`). Scene collections move between platforms unchanged, and the
+  frontend finds the dock implementation through `obs_get_module("obs-browser")` → `obs_browser_create_qcef()`
+  exactly as with CEF.
+- **One helper per page** (`helper/browser-helper.cpp`): a hung or crashing page only affects its own process.
+  `HaikuBrowserClient` restarts it with backoff, and restarts it if its heartbeat stops for 10 s. The helper quits
+  when OBS's heartbeat stops for 5 s.
+- **Rendering.** HaikuWebKit renders every page into the `BWebView`'s offscreen bitmap (it is built without
+  accelerated compositing, so that bitmap is the complete page). The helper reads it with
+  `WebCore::DumpRenderTreeClient::getOffscreen()`, the exported accessor HaikuWebKit's test runner uses, and copies it
+  into the shared area under a sequence lock. The window must stay *shown*: hiding a `BWebView` marks the page
+  invisible and WebCore stops its timers. It is borderless, avoids focus and sits at (-30000, -30000).
+- **Header constraints.** `haikuwebkit_devel` installs `WebFrame.h`, but that header includes WebCore internals that
+  aren't shipped, so it can't be used outside WebKit (WebPositive doesn't use it either). `helper/webkit-abi.h`
+  declares the three exported functions the helper needs (`BWebFrame::SetTransparent`, `BWebFrame::GlobalContext`,
+  `DumpRenderTreeClient::getOffscreen`) with identical signatures, plus the public JavaScriptCore C API.
+- **Transparency.** The frame is made transparent (`BWebFrame::SetTransparent`) and the default CSS sets a
+  transparent background, as with obs-browser. The offscreen bitmap is `B_RGB32`; if a transparent page comes back
+  with alpha 0 everywhere the alpha channel was not written and the frame is shown opaque instead of invisible.
+- **Scripts and CSS** run on the application thread (WebCore's main thread) through `JSEvaluateScript`. Custom CSS is
+  injected as a `<style>` element on load commit and load finish. `window.obsstudio.pluginVersion` and the
+  `obsSourceVisibleChanged`/`obsSourceActiveChanged` events are provided.
+- **Interaction.** Mouse, wheel and keyboard events are posted directly to the `BWebPage` handler (its
+  `MessageReceived` builds WebCore events from `be:view_where`, `buttons`, `bytes`, `key`, …). `BWebView`'s own
+  hooks can't be used: they read the window's current message and, for the wheel, the real pointer position.
+  `BWebPage` inherits `BHandler` privately; the C-style cast in `PageHandler()` is the conversion C++ allows to an
+  inaccessible base. The Haiku frontend passes Haiku raw key codes in `obs_key_event.native_vkey`
+  (`OBSBasicInteraction.cpp`) so navigation keys can be translated to Haiku's control bytes.
+- **Docks** (`browser-panel.cpp`) implement `QCef`/`QCefWidget` from obs-browser's `panel/browser-panel.hpp` (the
+  only file used from that submodule). The widget paints the latest frame and forwards Qt input; title and URL
+  changes come back through the shared area and are emitted as `titleChanged`/`urlChanged`. Cookie managers map to a
+  per-panel WebKit storage directory.
+
+## 11. Bundled dependencies: obs-websocket, SRT, RIST
+
+HaikuPorts doesn't package everything OBS needs. Rather than disable features, the missing libraries are built from
+source when no system copy is found (`cmake/haiku/finders/`):
+
+| Library | Source | Haiku changes |
+| --- | --- | --- |
+| qrcodegen (C++) | `deps/qrcodegen` (Nayuki 1.8.0, MIT) | None |
+| Asio 1.30.2, WebSocket++ 0.8.2 | submodules `deps/asio`, `deps/websocketpp` | None; HaikuPorts' Asio 1.38 dropped `io_service`, which WebSocket++ 0.8.2 uses |
+| libsrt 1.5.4 | submodule `deps/srt`, built by `deps/srt-haiku` | `utilities.h`: Haiku uses the glibc-style `<endian.h>` branch. mbedTLS crypto. |
+| librist 0.2.12 | submodule `deps/librist`, built by `deps/librist-haiku` | `endian-shim.h` as above; multicast joins use `ip_mreq` + `IP_MULTICAST_IF` resolved through `getifaddrs()` instead of Linux's `ip_mreqn` |
+
+Patches are applied to copies in the build tree by `haiku_patch_file()`, which fails the configure step if an expected
+snippet changed, so updating a submodule can't silently drop a fix.
+
+## 12. Other plugins
 
 | Plugin | Haiku changes |
 | --- | --- |
@@ -204,18 +335,40 @@ is shown.
 | text-freetype2 | Uses fontconfig (`find-font-unix.c`) like Linux. |
 | obs-outputs | Links `libnetwork`. |
 | obs-scripting | Links libpython directly like on Linux. |
-| obs-ffmpeg, obs-x264, obs-filters, image-source, obs-transitions, rtmp-services, obs-webrtc, vlc-video | Portable, unchanged. No VA-API/NVENC/QSV on Haiku. |
-| obs-browser, AJA, DeckLink, VST, linux-* | Not built on Haiku. |
+| obs-ffmpeg | The VA-API include block is skipped on Haiku. Otherwise portable. |
+| obs-x264, obs-filters, image-source, obs-transitions, rtmp-services, obs-webrtc, vlc-video, obs-websocket | Portable, unchanged. |
+| obs-browser | Replaced by `plugins/haiku-browser` (section 10). |
+| AJA, DeckLink, NVENC, QSV, VA-API, linux-* | No Haiku drivers/SDKs; not built. |
 
-## 10. Known limitations and ideas
+## 13. Known limitations and ideas
 
-- **Desktop audio capture**: would need a virtual audio node inserted between the mixer and the sound card,
-  or an app_server/media_server hook.
-- **Window capture**: needs the private app_server window list (`get_window_info`) plus a way to grab
-  individual windows. Screen capture plus cropping works in the meantime.
-- **Preview performance**: if `glReadPixels` turns out to be a bottleneck with llvmpipe at high preview
-  resolutions, the readback could be made asynchronous with a PBO ring.
+- **Window capture isolation**: windows in front of the captured one are captured too. True per-window capture
+  would need an app_server extension (e.g. letting a privileged client read a window's drawing), which is outside
+  OBS.
+- **Per-application audio capture**: the tap sees only the final mix. Per-application capture would need a tap per
+  mixer input; the same node could be inserted there, but the mixer's input side has no stable public routing API.
+- **Browser**: no WebGL (HaikuWebKit is built without it), page audio is not routed to the source ("Control audio via
+  OBS" is shown disabled; the sound reaches recordings through Desktop Audio), cookies aren't persisted between
+  helper runs. JavaScript calls that need the frontend (`obsstudio.getCurrentScene`, `setCurrentScene`, …) are not
+  implemented yet; `pluginVersion`, `getStatus`, `getControlLevel` and the visibility/activity events are.
+- **Webcam formats**: the device's current format is used; a resolution/format picker could use the node's
+  `BParameterWeb` or format negotiation.
+- **Preview performance**: if `glReadPixels` is a bottleneck with llvmpipe at high preview resolutions, the readback
+  could be made asynchronous with a PBO ring.
 - **Hardware encoding**: none on Haiku today (x264/FFmpeg software encoders only).
-- **Browser source/docks**: depend on CEF, which hasn't been ported to Haiku.
-- **obs-websocket**: needs `qrcodegencpp` packaged for Haiku.
-- **SRT/RIST output**: needs `libsrt`/`librist` packaged for Haiku.
+
+## 14. Design decisions
+
+Decisions taken during the port, with the reasons, so they can be revisited:
+
+| Decision | Reason |
+| --- | --- |
+| Render every display into its own EGL pbuffer and read it back | Haiku EGL window surfaces belong to BViews driven by their window thread; OBS renders all displays from one graphics thread into Qt widgets. |
+| Desktop audio and browser rendering in helper processes | Crash isolation (WebKit, real-time media path) and guaranteed restoration of the audio routing. Shared memory keeps the per-frame cost at one copy. |
+| Helpers started on demand by the plugins, not by the frontend | No frontend changes; works for any OBS profile and for headless use of libobs. |
+| HaikuWebKit instead of porting CEF | CEF/Chromium is not available for Haiku and porting it is a project of its own; HaikuWebKit ships with every Haiku install. |
+| Keep obs-browser's module name, source id and settings | Scene collections and the frontend's dock code work unchanged. |
+| Window capture as a labelled screen-region capture | No per-window buffers exist in the app_server; this is the closest faithful behavior. |
+| Bundle libraries missing from HaikuPorts, patching copies at configure time | No feature has to be disabled, the submodules stay pristine, and system packages win as soon as they exist. |
+| Haiku modifier convention (Ctrl = Command) | Matches Haiku's Qt plugin, so hotkeys captured in the UI are the ones polled. |
+| Warnings not treated as errors | Haiku headers and GCC produce warnings upstream CI never sees. |

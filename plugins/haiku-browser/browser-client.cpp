@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 
 extern char **environ;
 
@@ -43,7 +44,6 @@ extern char **environ;
 /* the helper must answer within this long after being spawned, or it is considered hung */
 #define HELPER_START_TIMEOUT 15000000LL
 #define HELPER_STALL_TIMEOUT 10000000LL
-#define SEND_TIMEOUT 200000LL
 
 namespace {
 
@@ -99,10 +99,18 @@ HaikuBrowserClient::~HaikuBrowserClient()
 	DestroyArea();
 }
 
+/* Areas are allocated with headroom (at least 1920x1080, rounded up to 64 pixels) so that resizing a source or
+ * a dock rarely needs a new one. */
+static uint32_t area_dimension(uint32_t value, uint32_t minimum)
+{
+	value = std::max(value, minimum);
+	return (value + 63u) & ~63u;
+}
+
 bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
 {
-	width = std::max<uint32_t>(width, 1);
-	height = std::max<uint32_t>(height, 1);
+	width = area_dimension(width, 1920);
+	height = area_dimension(height, 1080);
 
 	char area_name[B_OS_NAME_LENGTH];
 	snprintf(area_name, sizeof(area_name), "obs browser %d.%d", (int)getpid(), area_counter++);
@@ -122,27 +130,18 @@ bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
 	mapped->capacity = obs_browser_area_size(width, height) - OBS_BROWSER_HEADER_SIZE;
 	mapped->client_heartbeat = system_time();
 
-	const area_id old_area = area;
-	const obs_browser_shm *old = shm;
-
-	if (old && ready && HelperAlive()) {
-		/* hand the helper the new area before giving up the old one; its clone keeps the old memory
-		 * alive until it switches */
+	if (shm && helper > 0 && HelperAlive()) {
+		/* the running (or starting) helper still uses the current area: keep it until it has switched */
+		RetireArea();
 		area = id;
 		shm = mapped;
-		BMessage msg(OBS_BROWSER_MSG_ATTACH_AREA);
-		msg.AddInt32("area", id);
-		SendLocked(msg);
+		attach_pending = true;
+		TrySendAttach();
 	} else {
-		/* a helper that is still starting up holds the old area id; start it over on the new one */
-		if (helper > 0)
-			StopHelper();
+		DestroyArea();
 		area = id;
 		shm = mapped;
 	}
-
-	if (old_area >= 0)
-		delete_area(old_area);
 
 	area_width = width;
 	area_height = height;
@@ -150,12 +149,49 @@ bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
 	return true;
 }
 
+void HaikuBrowserClient::RetireArea()
+{
+	/* only one switch can be in flight; an older retired area is no longer used by anyone */
+	if (retired_area >= 0)
+		delete_area(retired_area);
+	retired_area = area;
+	retired_shm = shm;
+	area = -1;
+	shm = nullptr;
+}
+
+bool HaikuBrowserClient::TrySendAttach()
+{
+	if (!attach_pending || !ready)
+		return false;
+	BMessage msg(OBS_BROWSER_MSG_ATTACH_AREA);
+	msg.AddInt32("area", area);
+	if (!SendLocked(msg))
+		return false;
+	/* the helper clones the new area when it handles the message; its clone of the old one keeps that
+	 * memory alive until then, so our handle can go now */
+	attach_pending = false;
+	if (retired_area >= 0)
+		delete_area(retired_area);
+	retired_area = -1;
+	retired_shm = nullptr;
+	return true;
+}
+
+obs_browser_shm *HaikuBrowserClient::HelperShm() const
+{
+	return (attach_pending && retired_shm) ? retired_shm : shm;
+}
+
 void HaikuBrowserClient::DestroyArea()
 {
 	if (area >= 0)
 		delete_area(area);
-	area = -1;
-	shm = nullptr;
+	if (retired_area >= 0)
+		delete_area(retired_area);
+	area = retired_area = -1;
+	shm = retired_shm = nullptr;
+	attach_pending = false;
 	area_width = area_height = 0;
 }
 
@@ -172,6 +208,23 @@ bool HaikuBrowserClient::SpawnHelper()
 		return false;
 	}
 	mark_background_app(path);
+
+	/* A new helper always starts on a single, current area with clean state. A previous helper may have died
+	 * mid-frame (odd seq) or left READY and an old heartbeat behind. */
+	if (retired_area >= 0) {
+		delete_area(retired_area);
+		retired_area = -1;
+		retired_shm = nullptr;
+	}
+	attach_pending = false;
+	shm->seq = 0;
+	shm->frame_count = 0;
+	shm->helper_state = OBS_BROWSER_STATE_STARTING;
+	shm->helper_heartbeat = 0;
+	shm->helper_team = 0;
+	shm->client_heartbeat = system_time();
+	last_frame = -1;
+	__sync_synchronize();
 
 	char area_arg[16];
 	snprintf(area_arg, sizeof(area_arg), "%d", (int)area);
@@ -197,43 +250,55 @@ bool HaikuBrowserClient::SpawnHelper()
 	return true;
 }
 
+/* Never blocks the caller (often the UI or graphics thread): asks the helper to quit and leaves waiting for
+ * it, and killing it if it doesn't, to a short-lived reaper thread. */
 void HaikuBrowserClient::StopHelper()
 {
 	if (helper <= 0)
 		return;
 
-	if (HelperAlive()) {
-		BMessenger messenger(OBS_BROWSER_HELPER_SIGNATURE, helper);
-		if (messenger.IsValid())
-			messenger.SendMessage(B_QUIT_REQUESTED);
+	const pid_t pid = helper;
+	/* a clean quit lets WebKit flush its storage; without a messenger (helper never became ready) SIGTERM
+	 * is fine, the helper owns no system state */
+	BMessage quit(B_QUIT_REQUESTED);
+	if (!messenger.IsValid() || messenger.SendMessage(&quit, (BHandler *)nullptr, 0) != B_OK)
+		kill(pid, SIGTERM);
 
-		/* give WebKit a moment to shut down cleanly, then insist */
-		for (int i = 0; i < 20 && waitpid(helper, nullptr, WNOHANG) == 0; i++)
+	std::thread([pid]() {
+		for (int i = 0; i < 30; i++) {
+			if (waitpid(pid, nullptr, WNOHANG) != 0)
+				return; /* exited (or not our child any more) */
 			snooze(50000);
-		if (kill(helper, 0) == 0) {
-			kill(helper, SIGKILL);
-			waitpid(helper, nullptr, 0);
 		}
-	} else {
-		waitpid(helper, nullptr, WNOHANG);
-	}
+		kill(pid, SIGKILL);
+		waitpid(pid, nullptr, 0);
+	}).detach();
 
 	helper = -1;
 	ready = false;
+	messenger = BMessenger();
 }
 
 bool HaikuBrowserClient::SendLocked(BMessage &message)
 {
-	if (!ready || !HelperAlive())
+	if (!ready || helper <= 0)
 		return false;
-	BMessenger messenger(OBS_BROWSER_HELPER_SIGNATURE, helper);
-	if (!messenger.IsValid())
-		return false;
-	return messenger.SendMessage(&message, (BHandler *)nullptr, SEND_TIMEOUT) == B_OK;
+	if (!messenger.IsValid()) {
+		/* a registrar round trip; done once per helper, not per message */
+		messenger = BMessenger(OBS_BROWSER_HELPER_SIGNATURE, helper);
+		if (!messenger.IsValid())
+			return false;
+	}
+	/* never wait: a busy helper (page loading, long JS) drops input rather than stalling OBS; configuration
+	 * and area switches are retried from Poll() */
+	return messenger.SendMessage(&message, (BHandler *)nullptr, 0) == B_OK;
 }
 
 void HaikuBrowserClient::SendConfigLocked()
 {
+	if (attach_pending && !TrySendAttach())
+		return; /* the helper must be on the new area before it is told the new size */
+
 	BMessage msg(OBS_BROWSER_MSG_CONFIG);
 	msg.AddString("url", config.url.c_str());
 	msg.AddInt32("width", config.width);
@@ -241,8 +306,9 @@ void HaikuBrowserClient::SendConfigLocked()
 	msg.AddInt32("fps", config.fps);
 	msg.AddString("css", config.css.c_str());
 	msg.AddBool("transparent", config.transparent);
-	if (SendLocked(msg))
-		config_dirty = false;
+	if (!SendLocked(msg))
+		return;
+	config_dirty = false;
 
 	if (!startup_script.empty()) {
 		BMessage s(OBS_BROWSER_MSG_STARTUP_SCRIPT);
@@ -263,7 +329,9 @@ void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
 	if ((uint32_t)config.width > area_width || (uint32_t)config.height > area_height || !shm)
 		CreateArea(std::max<uint32_t>(config.width, area_width), std::max<uint32_t>(config.height, area_height));
 
-	if (!stopped && helper <= 0 && shm)
+	if (!shm)
+		return;
+	if (!stopped && helper <= 0)
 		SpawnHelper();
 	else if (ready)
 		SendConfigLocked();
@@ -298,6 +366,8 @@ void HaikuBrowserClient::Poll()
 
 	const bigtime_t now = system_time();
 	shm->client_heartbeat = now;
+	if (retired_shm)
+		retired_shm->client_heartbeat = now;
 
 	if (helper > 0 && !HelperAlive()) {
 		int status = 0;
@@ -305,6 +375,7 @@ void HaikuBrowserClient::Poll()
 		BLOG(LOG_WARNING, "browser helper (team %d) exited unexpectedly (status %d)", (int)helper, status);
 		helper = -1;
 		ready = false;
+		messenger = BMessenger();
 		const bigtime_t backoff = std::min<bigtime_t>(500000LL << std::min(restarts, 5), 10000000LL);
 		next_restart = now + backoff;
 		restarts++;
@@ -316,8 +387,10 @@ void HaikuBrowserClient::Poll()
 		return;
 	}
 
+	obs_browser_shm *state = HelperShm();
+
 	if (!ready) {
-		if (shm->helper_state == OBS_BROWSER_STATE_READY) {
+		if (state->helper_state == OBS_BROWSER_STATE_READY) {
 			ready = true;
 			SendConfigLocked();
 		} else if (now - helper_started > HELPER_START_TIMEOUT) {
@@ -331,13 +404,16 @@ void HaikuBrowserClient::Poll()
 	if (now - helper_started > 30000000LL)
 		restarts = 0;
 
-	if (now - shm->helper_heartbeat > HELPER_STALL_TIMEOUT && shm->helper_heartbeat) {
+	const bigtime_t last_sign_of_life = std::max<bigtime_t>((bigtime_t)state->helper_heartbeat, helper_started);
+	if (now - last_sign_of_life > HELPER_STALL_TIMEOUT) {
 		BLOG(LOG_WARNING, "browser helper stopped responding, restarting it");
 		StopHelper();
 		next_restart = now;
 		return;
 	}
 
+	if (attach_pending)
+		TrySendAttach();
 	if (config_dirty)
 		SendConfigLocked();
 }
