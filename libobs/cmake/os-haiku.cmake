@@ -6,7 +6,9 @@ check_c_source_compiles("${LIBM_TEST_SOURCE}" HAVE_MATH_IN_STD_LIB)
 target_sources(
   libobs
   PRIVATE
-    audio-monitoring/null/null-audio-monitoring.c
+    audio-monitoring/haiku/haiku-output.c
+    audio-monitoring/haiku/haiku-sound-player.cpp
+    audio-monitoring/haiku/haiku-sound-player.h
     obs-haiku-be.cpp
     obs-haiku.c
     obs-haiku.h
@@ -33,10 +35,11 @@ if(CMAKE_C_COMPILER_ID STREQUAL GNU)
   endif()
 endif()
 
-# libroot provides libc, libm, libdl and pthreads; libbe provides the Interface Kit (keyboard/mouse state).
-target_link_libraries(libobs PRIVATE be $<$<NOT:$<BOOL:${HAVE_MATH_IN_STD_LIB}>>:m>)
+# libroot provides libc, libm, libdl and pthreads; libbe provides the Interface Kit (keyboard/mouse state);
+# libmedia provides BSoundPlayer for audio monitoring.
+target_link_libraries(libobs PRIVATE be media $<$<NOT:$<BOOL:${HAVE_MATH_IN_STD_LIB}>>:m>)
 
-target_disable_feature(libobs "PulseAudio audio monitoring (Linux)")
 target_enable_feature(libobs "Haiku platform support")
+target_enable_feature(libobs "Media Kit audio monitoring (Haiku)")
 
 set_target_properties(libobs PROPERTIES OUTPUT_NAME obs)

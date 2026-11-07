@@ -708,7 +708,11 @@ os_inhibit_t *os_inhibit_sleep_create(const char *reason)
 		return info;
 	}
 #endif
+#if !defined(__HAIKU__)
+	/* Haiku's screen saver has no xdg-screensaver/D-Bus interface to poke; without a stop event,
+	 * os_inhibit_sleep_set_active() becomes a no-op instead of failing to spawn every 30 seconds. */
 	os_event_init(&info->stop_event, OS_EVENT_TYPE_AUTO);
+#endif
 	posix_spawnattr_init(&info->attr);
 
 	sigemptyset(&set);

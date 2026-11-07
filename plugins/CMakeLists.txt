@@ -71,6 +71,7 @@ add_core_module(
     WITH_MESSAGE
 )
 add_core_module(haiku-capture PLATFORMS HAIKU)
+add_core_module(haiku-media PLATFORMS HAIKU)
 add_core_module(image-source)
 add_core_module(linux-alsa PLATFORMS LINUX FREEBSD OPENBSD)
 add_core_module(linux-capture PLATFORMS LINUX FREEBSD OPENBSD)
