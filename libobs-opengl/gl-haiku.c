@@ -242,8 +242,9 @@ extern struct gl_windowinfo *gl_windowinfo_create(const struct gs_init_data *inf
 
 	struct gl_windowinfo *wi = bzalloc(sizeof(struct gl_windowinfo));
 	wi->surface = EGL_NO_SURFACE;
-	wi->cx = info->cx;
-	wi->cy = info->cy;
+	/* EGL pbuffers can't be empty; a 0x0 widget gets a 1x1 surface until it is resized */
+	wi->cx = info->cx ? info->cx : 1;
+	wi->cy = info->cy ? info->cy : 1;
 	wi->present = info->window.present;
 	wi->param = info->window.param;
 	return wi;
