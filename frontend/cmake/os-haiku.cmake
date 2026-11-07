@@ -11,8 +11,8 @@ target_compile_definitions(
   PRIVATE OBS_INSTALL_PREFIX="${OBS_INSTALL_PREFIX}" $<$<BOOL:${ENABLE_PORTABLE_CONFIG}>:ENABLE_PORTABLE_CONFIG>
 )
 
-# libbe: BMessage/BString, liblocale: BLocaleRoster (preferred languages), libnetwork: sockets
-target_link_libraries(obs-studio PRIVATE be locale network)
+# libbe: BMessage/BString and BLocaleRoster (the locale kit is part of libbe), libnetwork: sockets
+target_link_libraries(obs-studio PRIVATE be network)
 
 if(TARGET OBS::python)
   find_package(Python REQUIRED COMPONENTS Interpreter Development)
