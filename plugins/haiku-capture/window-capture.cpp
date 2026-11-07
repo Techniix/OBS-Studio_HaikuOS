@@ -205,6 +205,7 @@ struct WindowCapture {
 	std::string window_id;
 	bool decorations = false;
 	bool capture_cursor = true;
+	int capture_method = CAPTURE_TEAR_FREE;
 	int fps = 30;
 	bool settings_changed = true;
 
@@ -256,13 +257,14 @@ void WindowCapture::Run()
 
 	while (active) {
 		std::string id;
-		bool decor, cursor;
+		bool decor, cursor, banded;
 		int rate;
 		{
 			std::lock_guard<std::mutex> lock(settings_mutex);
 			id = window_id;
 			decor = decorations;
 			cursor = capture_cursor;
+			banded = capture_method == CAPTURE_SMOOTH_POINTER;
 			rate = fps > 0 ? fps : 30;
 			if (settings_changed) {
 				have_window = false;
@@ -310,7 +312,7 @@ void WindowCapture::Run()
 					was_covered = covered;
 				}
 
-				const uint64_t took = reader.Read(screen, rect, cursor, pixels, stride);
+				const uint64_t took = reader.Read(screen, rect, cursor, banded, pixels, stride);
 				if (took) {
 					const uint32_t width = (uint32_t)rect.IntegerWidth() + 1;
 					const uint32_t height = (uint32_t)rect.IntegerHeight() + 1;
@@ -347,6 +349,7 @@ void window_capture_update(void *data, obs_data_t *settings)
 	wc->window_id = obs_data_get_string(settings, S_WINDOW);
 	wc->decorations = obs_data_get_bool(settings, S_DECORATIONS);
 	wc->capture_cursor = obs_data_get_bool(settings, S_CAPTURE_CURSOR);
+	wc->capture_method = (int)obs_data_get_int(settings, S_CAPTURE_METHOD);
 	wc->fps = (int)obs_data_get_int(settings, S_FPS);
 	wc->settings_changed = true;
 }
@@ -380,6 +383,7 @@ void window_capture_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_DECORATIONS, false);
 	obs_data_set_default_bool(settings, S_CAPTURE_CURSOR, true);
+	obs_data_set_default_int(settings, S_CAPTURE_METHOD, CAPTURE_TEAR_FREE);
 	obs_data_set_default_int(settings, S_FPS, 30);
 }
 
@@ -434,6 +438,7 @@ obs_properties_t *window_capture_properties(void *data)
 	obs_properties_add_button2(props, "refresh", T_("RefreshWindows"), refresh_windows, wc);
 	obs_properties_add_bool(props, S_DECORATIONS, T_("IncludeDecorations"));
 	obs_properties_add_bool(props, S_CAPTURE_CURSOR, T_("CaptureCursor"));
+	add_capture_method_property(props);
 	obs_property_t *fps = obs_properties_add_int_slider(props, S_FPS, T_("FrameRate"), 1, 60, 1);
 	obs_property_int_set_suffix(fps, " FPS");
 	obs_properties_add_text(props, "note", T_("WindowCaptureNote"), OBS_TEXT_INFO);

@@ -50,6 +50,7 @@ struct ScreenCapture {
 
 	std::mutex settings_mutex;
 	bool capture_cursor = true;
+	int capture_method = CAPTURE_TEAR_FREE;
 	int fps = 30;
 
 	std::atomic_bool active = false;
@@ -99,18 +100,19 @@ void ScreenCapture::Run()
 	uint32_t stride = 0;
 
 	while (active) {
-		bool cursor;
+		bool cursor, banded;
 		int rate;
 		{
 			std::lock_guard<std::mutex> lock(settings_mutex);
 			cursor = capture_cursor;
+			banded = capture_method == CAPTURE_SMOOTH_POINTER;
 			rate = fps;
 		}
 
 		const BRect frame = screen.Frame();
 		const uint64_t timestamp = os_gettime_ns();
 
-		const uint64_t took = reader.Read(screen, frame, cursor, pixels, stride);
+		const uint64_t took = reader.Read(screen, frame, cursor, banded, pixels, stride);
 		if (took) {
 			const uint32_t width = (uint32_t)frame.IntegerWidth() + 1;
 			const uint32_t height = (uint32_t)frame.IntegerHeight() + 1;
@@ -144,6 +146,7 @@ void screen_capture_update(void *data, obs_data_t *settings)
 	std::lock_guard<std::mutex> lock(sc->settings_mutex);
 
 	sc->capture_cursor = obs_data_get_bool(settings, S_CAPTURE_CURSOR);
+	sc->capture_method = (int)obs_data_get_int(settings, S_CAPTURE_METHOD);
 	sc->fps = (int)obs_data_get_int(settings, S_FPS);
 }
 
@@ -175,6 +178,7 @@ void screen_capture_hide(void *data)
 void screen_capture_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_CAPTURE_CURSOR, true);
+	obs_data_set_default_int(settings, S_CAPTURE_METHOD, CAPTURE_TEAR_FREE);
 	obs_data_set_default_int(settings, S_FPS, 30);
 }
 
@@ -183,6 +187,7 @@ obs_properties_t *screen_capture_properties(void *)
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_bool(props, S_CAPTURE_CURSOR, T_("CaptureCursor"));
+	add_capture_method_property(props);
 	obs_property_t *fps = obs_properties_add_int_slider(props, S_FPS, T_("FrameRate"), 1, 60, 1);
 	obs_property_int_set_suffix(fps, " FPS");
 

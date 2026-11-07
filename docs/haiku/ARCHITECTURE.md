@@ -263,6 +263,26 @@ in the Deskbar.
 configured rate (1–60 fps, default 30) and outputs it as an async BGRX source, so the app_server copy never blocks
 rendering. It captures the main screen with the cursor optional. The source only runs while it is shown.
 
+**Reading the screen without freezing the desktop** (`capture-throttle.hpp`, used by both sources).
+`BScreen::ReadBitmap()` runs in the app_server under its exclusive drawing lock. The software cursor is moved
+under the same lock, and reading a frame buffer in video memory is slow (~25–30 ms for 2560×1080 on the
+nvidia-haiku driver), so capturing stops the pointer for the length of each read. Two things limit the impact:
+
+- A duty-cycle throttle keeps reads to at most 25% of wall time and lowers the capture rate (logging it) when
+  the hardware can't keep up.
+- A per-source **Capture method** setting. *Tear-free* (default) reads each frame in one piece: every frame is a
+  consistent snapshot, and the pointer pauses briefly during each read. *Smooth pointer* reads in horizontal
+  bands that hold the lock for ~2 ms each with a 1 ms yield in between: the pointer stays smooth, but something
+  that moves during a read can show a seam in that frame.
+
+Retrace synchronization (`BScreen::WaitForRetrace()`) doesn't help here: the seams come from the app_server
+drawing between bands, not from the monitor's refresh. A complete fix would be in the app_server. It keeps a
+copy of the screen in system memory (it is double-buffered with accelerant drivers), and serving `ReadBitmap()`
+from that copy instead of from video memory would make a full-frame read take a few milliseconds.
+
+With accelerant drivers the app_server composites the software cursor into the frame buffer, so the cursor can
+appear in the capture even with *Capture Cursor* off.
+
 **Window capture** (`window-capture.cpp`). The app_server composes windows straight into the frame buffer and keeps
 no per-window backing store another team could read, so isolated window capture (like PipeWire or
 `CGWindowListCreateImage`) is not possible on Haiku. The source is therefore a clearly labelled screen-region

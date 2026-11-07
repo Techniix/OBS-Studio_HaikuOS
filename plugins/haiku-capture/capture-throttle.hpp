@@ -22,12 +22,17 @@
  * full-screen read can take tens of milliseconds. Capturing at the requested rate regardless would keep the
  * app_server busy almost all the time and freeze the system.
  *
- * Two measures keep the desktop usable:
- *  - BandedScreenReader reads the area in horizontal bands sized so each ReadBitmap() holds the app_server for
- *    only ~2 ms, and yields between bands. The software cursor is moved by the same app_server lock, so a
- *    full-frame read made the pointer stop for the whole copy, in a regular rhythm.
- *  - CaptureThrottle keeps the total time spent reading to at most kMaxDutyCycle of the wall time, lowering the
- *    effective frame rate when the hardware can't keep up, and logs when it does.
+ * The software cursor is moved under the same app_server lock, so every read also stops the pointer. There is
+ * no way to get a consistent snapshot without holding the lock for the whole read, so the user chooses:
+ *
+ *  - CAPTURE_TEAR_FREE (default): one ReadBitmap() per frame. Every frame is a consistent snapshot of the
+ *    screen; the pointer pauses for the duration of each read (a few ms to ~30 ms, depending on the driver).
+ *  - CAPTURE_SMOOTH_POINTER: horizontal bands sized to hold the lock for ~2 ms each, with a short yield between
+ *    them. The pointer stays smooth, but something that moves while a frame is being read can show a seam
+ *    between bands in that one frame.
+ *
+ * In both modes CaptureThrottle keeps the time spent reading to at most kMaxDutyCycle of the wall time, lowering
+ * the effective frame rate when the hardware can't keep up, and logs when it does.
  */
 
 #pragma once
@@ -97,19 +102,40 @@ private:
 	bool warned = false;
 };
 
+enum capture_method {
+	CAPTURE_TEAR_FREE = 0,
+	CAPTURE_SMOOTH_POINTER = 1,
+};
+
+#define S_CAPTURE_METHOD "capture_method"
+
+/* Adds the "Capture method" list (shared by screen and window capture). */
+static inline void add_capture_method_property(obs_properties_t *props)
+{
+	obs_property_t *p = obs_properties_add_list(props, S_CAPTURE_METHOD, obs_module_text("CaptureMethod"),
+						    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("CaptureMethod.TearFree"), CAPTURE_TEAR_FREE);
+	obs_property_list_add_int(p, obs_module_text("CaptureMethod.SmoothPointer"), CAPTURE_SMOOTH_POINTER);
+	obs_property_set_long_description(p, obs_module_text("CaptureMethod.Description"));
+}
+
 class BandedScreenReader {
 public:
-	/* Reads `rect` (screen coordinates, integral) into `frame` as BGRX rows of `stride` bytes. Returns the
-	 * time spent inside the app_server, or 0 on failure. */
-	uint64_t Read(BScreen &screen, BRect rect, bool cursor, std::vector<uint8_t> &frame, uint32_t &stride)
+	/* Reads `rect` (screen coordinates, integral) into `frame` as BGRX rows of `stride` bytes, in one piece
+	 * (tear-free) or in short bands (smooth pointer). Returns the time spent inside the app_server, or 0 on
+	 * failure. */
+	uint64_t Read(BScreen &screen, BRect rect, bool cursor, bool banded, std::vector<uint8_t> &frame,
+		      uint32_t &stride)
 	{
 		const int32 width = rect.IntegerWidth() + 1;
 		const int32 height = rect.IntegerHeight() + 1;
 		if (width <= 0 || height <= 0)
 			return 0;
 
-		if (!band || band->Bounds().IntegerWidth() + 1 != width) {
-			band = std::make_unique<BBitmap>(BRect(0, 0, width - 1, kMaxRows - 1), B_RGB32);
+		/* the app_server copies each read to the bitmap's top-left corner */
+		const int32 capacity = banded ? kMaxRows : height;
+		if (!band || band->Bounds().IntegerWidth() + 1 != width || band->Bounds().IntegerHeight() + 1 < capacity) {
+			band = std::make_unique<BBitmap>(BRect(0, 0, width - 1, capacity - 1), B_RGB32);
 			if (band->InitCheck() != B_OK) {
 				band.reset();
 				return 0;
@@ -124,7 +150,7 @@ public:
 		uint64_t total = 0;
 
 		for (int32 y = 0; y < height;) {
-			const int32 n = std::min(rows, height - y);
+			const int32 n = banded ? std::min(rows, height - y) : height;
 			BRect part(rect.left, rect.top + y, rect.right, rect.top + y + n - 1);
 
 			const uint64_t start = os_gettime_ns();
@@ -139,7 +165,7 @@ public:
 			y += n;
 
 			/* size the next band so one read holds the app_server for about kTargetNs */
-			if (took > 0) {
+			if (banded && took > 0) {
 				const double scaled = (double)n * (double)kTargetNs / (double)took;
 				rows = std::clamp((int32)scaled, kMinRows, kMaxRows);
 			}

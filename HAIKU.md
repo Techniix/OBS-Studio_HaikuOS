@@ -44,7 +44,7 @@ Column meanings:
 | Desktop audio capture | Yes (tap node helper, `obs-haiku-audio-tap`) | clang | – | – | – | Captures the whole system mix (no per-application capture); monitored sources are captured too |
 | Audio monitoring | Yes (`BSoundPlayer`) | clang | – | – | – | "Default" (system mixer) is the only device; ~50–250 ms latency |
 | Webcam / video capture devices | Yes (Media Kit) | clang | – | – | – | Uses the device's current format; no resolution/format picker yet |
-| Screen capture | Yes (`BScreen::ReadBitmap`) | clang | – | – | – | Main screen only |
+| Screen capture | Yes (`BScreen::ReadBitmap`) | GCC | Yes | Partly (recording made) | – | Main screen only; reads pause the pointer briefly (*Tear-free*, default) or may show a seam on fast motion (*Smooth pointer*); capture rate drops automatically on slow frame-buffer reads |
 | Window capture | Yes, as screen-region capture of the tracked window | clang | – | – | – | Not isolated: windows covering it are captured too (app_server keeps no per-window buffers) |
 | Browser source | Yes (HaikuWebKit helper `obs-haiku-browser`) | clang | – | – | – | No WebGL, no per-source audio (page audio goes to Desktop Audio), transparency depends on WebKit's alpha output |
 | Browser docks (custom docks, service integrations) | Yes (QCef interface on HaikuWebKit) | clang | – | – | – | Cookies are kept per helper process in memory, not persisted |
