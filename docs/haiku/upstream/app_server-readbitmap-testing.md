@@ -33,6 +33,7 @@ Note the `hrevNNNNN` number. The examples below use `hrevNNNNN`; replace it with
 mkdir -p ~/haiku-dev && cd ~/haiku-dev
 git clone --depth 1 --branch hrevNNNNN https://review.haiku-os.org/haiku.git
 cd haiku
+git -C ~/OBS-Studio_HaikuOS pull                   # wherever you cloned it; 0002 was added on 2026-11-07
 P=~/OBS-Studio_HaikuOS/docs/haiku/upstream
 git apply --check $P/0001-*.patch && git apply $P/0001-*.patch
 git apply --check $P/0002-*.patch && git apply $P/0002-*.patch
@@ -68,7 +69,8 @@ pkgman install ./objects/haiku/x86_64/packaging/packages/haiku.hpkg
 ```
 
 (Use the path `find` printed.) pkgman shows what it will change: it should be **one package, `haiku`**, being
-replaced. If it wants to change anything else, answer **no** and send me the output. Then reboot.
+replaced. The new one's version ends in `_hrevNNNNN_dirty-1` ("dirty" because the patches are uncommitted), which
+sorts after your installed `_hrevNNNNN-1`. If it wants to change anything else, answer **no** and send me the output. Then reboot.
 
 ## 6. Test
 

@@ -9,7 +9,11 @@ text and log lines are the most useful thing to send back.
 
 ## 0. What was verified before this test
 
-The port has **not** been built on Haiku yet. Without a Haiku machine, it was checked with a harness
+**Status (2026-11-07):** on the maintainer's machine (x86-64, RTX 5070) the port builds, starts and records an MP4
+with Screen Capture, using the OSMesa renderer (`OBS_HAIKU_GL=osmesa`; the nvidia-haiku Zink path hangs on a fence
+wait, a driver issue being fixed there). Desktop audio tap insertion works; the rest of this list is still open.
+
+Before that first build, it was checked with a harness
 (`build-aux/haiku/crosscheck/`), which now also covers the desktop audio helper, the browser helper and the browser
 dock code (HaikuWebKit's installed API headers are part of the harness sysroot):
 

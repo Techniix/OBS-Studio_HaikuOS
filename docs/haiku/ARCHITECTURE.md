@@ -278,13 +278,15 @@ nvidia-haiku driver), so capturing stops the pointer for the length of each read
 Retrace synchronization (`BScreen::WaitForRetrace()`) doesn't help here: the seams come from the app_server
 drawing between bands, not from the monitor's refresh. A complete fix would be in the app_server. It keeps a
 copy of the screen in system memory (it is double-buffered with accelerant drivers), and serving `ReadBitmap()`
-from that copy instead of from video memory would make a full-frame read take a few milliseconds.
+from that copy instead of from video memory would make a full-frame read take a few milliseconds. Patches that do
+this are in `docs/haiku/upstream/` (not yet in Haiku).
 
 With accelerant drivers that use the **software** cursor, the app_server composites it into the frame buffer, so it
 can appear in the capture even with *Capture Cursor* off. With a **hardware** cursor (for example the nvidia-haiku
 driver's `rtx5070-hw-cursor` branch), it isn't in the frame buffer, and `ReadBitmap(drawCursor)` adds it only when
-asked, so the toggle works. The app_server patch in `docs/haiku/upstream/` makes the toggle work with software
-cursors too.
+asked, so the toggle works. The app_server patches in `docs/haiku/upstream/` make the toggle work with software
+cursors too, except where the cursor is over a direct window or a window that is being redrawn (those areas are
+read from the frame buffer).
 
 **Window capture** (`window-capture.cpp`). The app_server composes windows straight into the frame buffer and keeps
 no per-window backing store another team could read, so isolated window capture (like PipeWire or
