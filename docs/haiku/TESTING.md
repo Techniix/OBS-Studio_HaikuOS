@@ -53,9 +53,14 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
 - [ ] The log contains lines like these (exact text varies):
   ```
   Platform: Haiku (haiku)
-  Haiku EGL: eglInitialize failed: ...           (expected with Mesa 22)
-  Haiku GL: using OSMesa (offscreen Mesa) for rendering
-  Haiku GL: llvmpipe (LLVM ..., 256 bits)
+  With the nvidia-haiku driver (Zink):
+    Haiku EGL: version 1.5, vendor: Mesa Project
+    Haiku GL: rendering through EGL (surfaceless)
+    Haiku GL: zink Vulkan 1.x (NVIDIA GeForce RTX 5070 ...)
+  Without it (HaikuPorts Mesa 22):
+    Haiku EGL: eglInitialize failed: ...
+    Haiku GL: rendering through OSMesa
+    Haiku GL: llvmpipe (LLVM ..., 256 bits)
   ---------------------------------
   OBS 33.0.1... (haiku)
   CPU Name: ...
@@ -75,6 +80,8 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
 - [ ] The preview area in the middle shows the canvas (black when there are no sources) and **not** a
       frozen or garbage image.
 - [ ] Resizing the main window resizes the preview without flicker or stretching artifacts.
+
+To test the software path on an NVIDIA machine too, start OBS once with `OBS_HAIKU_GL=osmesa ./obs`.
 
 **If OBS fails to start** with "Failed to initialize video" or similar, look for `Haiku EGL:` /
 `Haiku GL:` lines in the Terminal output (see the troubleshooting table in `BUILDING.md`).

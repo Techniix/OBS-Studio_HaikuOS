@@ -3,6 +3,20 @@ cmake_minimum_required(VERSION 3.28...3.30)
 add_library(libobs-opengl SHARED)
 add_library(OBS::libobs-opengl ALIAS libobs-opengl)
 
+if(OS_HAIKU)
+  # libEGL comes from Mesa (22: mesa_devel, 25+: libglvnd). FindOpenGL's EGL component can't be used: it also
+  # demands GLVND's libOpenGL, which Mesa 22 doesn't have. glad brings its own EGL headers, so only the library
+  # is needed. With Mesa 22 the Haiku EGL driver is disabled at runtime and gl-haiku.c falls back to OSMesa,
+  # which it loads with dlopen().
+  # (With libglvnd installed FindOpenGL defines OpenGL::EGL itself.)
+  find_package(OpenGL REQUIRED)
+  if(NOT TARGET OpenGL::EGL)
+    find_library(HAIKU_EGL_LIBRARY NAMES EGL PATHS /boot/system/develop/lib /boot/system/lib REQUIRED)
+    add_library(OpenGL::EGL UNKNOWN IMPORTED GLOBAL)
+    set_target_properties(OpenGL::EGL PROPERTIES IMPORTED_LOCATION "${HAIKU_EGL_LIBRARY}")
+  endif()
+endif()
+
 if(NOT TARGET OBS::glad)
   add_subdirectory("${CMAKE_SOURCE_DIR}/deps/glad" "${CMAKE_BINARY_DIR}/deps/glad")
 endif()
@@ -17,12 +31,6 @@ if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
     find_package(OpenGL REQUIRED EGL)
     find_package(Wayland REQUIRED)
   endif()
-endif()
-
-if(OS_HAIKU)
-  # EGL headers/library come from Mesa (22: libEGL in mesa_devel, 25+: libglvnd). With Mesa 22 the Haiku EGL
-  # driver is disabled at runtime and gl-haiku.c falls back to OSMesa, which it loads with dlopen().
-  find_package(OpenGL REQUIRED EGL)
 endif()
 
 target_sources(

@@ -111,7 +111,7 @@ the offscreen buffers, chosen at startup (`OBS_HAIKU_GL=egl|osmesa` forces one):
 
 | Backend | Mesa version | How |
 | --- | --- | --- |
-| EGL pbuffers | Mesa 25+ (`mesa_eglvnd` + `libglvnd`, not yet published by HaikuPorts) | One EGL context on `EGL_DEFAULT_DISPLAY`, a pbuffer per swapchain |
+| EGL, surfaceless | Mesa 25+ (`mesa_eglvnd` + `libglvnd`, not yet published by HaikuPorts), or the Zink-on-NVK stack of the nvidia-haiku driver (`quasar` package) | One surfaceless EGL context; each swapchain is a framebuffer object with a color renderbuffer |
 | OSMesa | Mesa 22.0.5 (current HaikuPorts `mesa`) | One OSMesa context; each swapchain is a memory buffer bound with `OSMesaMakeCurrent()` |
 
 Mesa 22.0.5 ships `libEGL`, but HaikuPorts patches its Haiku EGL driver to fail `eglInitialize()` ("Does not
@@ -119,10 +119,18 @@ work"), so EGL is tried first and OSMesa is the fallback. HaikuPorts builds that
 llvmpipe (`swrast` + LLVM) driver, which provides OpenGL 3.3 core and beyond. `libOSMesa` is loaded with
 `dlopen()` (Mesa 25 no longer has it), so one binary works with either Mesa.
 
+EGL pbuffers are deliberately not used: Mesa's Haiku EGL driver reads the size of every surface it makes current from
+the surface's window (`BitmapHook`), and a pbuffer has none. Instead the context is made current without a surface
+and `libobs-opengl/gl-subsystem.c` asks `gl_platform_default_framebuffer()` (a Haiku-only hook) for the framebuffer
+object that stands for "framebuffer 0" of the current swapchain.
+
+Nothing is decided at build time: the same build uses EGL on a machine with a working Mesa EGL (e.g. NVIDIA GPUs with
+nvidia-haiku) and OSMesa everywhere else.
+
 1. One context (desktop OpenGL 3.3 core). A 1×1 surface/buffer is current when no swapchain is.
-2. Each swapchain gets its own pbuffer or buffer the size of the widget. `device_load_swapchain()` makes it
+2. Each swapchain gets its own framebuffer object or OSMesa buffer the size of the widget. `device_load_swapchain()` makes it
    current, so OBS's "render to framebuffer 0" lands in it. `device_resize()` → `gl_update()` reallocates it.
-3. `device_present()` reads it back with `glReadPixels(GL_BGRA)` (from `GL_BACK` for pbuffers, `GL_FRONT` for
+3. `device_present()` reads it back with `glReadPixels(GL_BGRA)` (from the swapchain's framebuffer object, or `GL_FRONT` of
    the single-buffered OSMesa framebuffer), flips it to top-down order and calls
    `gs_window.present(param, pixels, width, height, linesize)`.
 

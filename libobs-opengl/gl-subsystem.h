@@ -666,6 +666,10 @@ extern void gl_update(gs_device_t *device);
 extern void gl_clear_context(gs_device_t *device);
 
 extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adapter);
+#ifdef __HAIKU__
+/* The framebuffer object that stands for "the current swapchain's framebuffer" (0 when that is the default) */
+extern GLuint gl_platform_default_framebuffer(gs_device_t *device);
+#endif
 extern void gl_platform_destroy(struct gl_platform *platform);
 
 extern bool gl_platform_init_swapchain(struct gs_swap_chain *swap);

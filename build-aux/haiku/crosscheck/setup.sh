@@ -104,7 +104,7 @@ done
 
 # Stub libraries: find_library() only needs the files to exist; the harness never links.
 for l in avcodec avformat avutil swscale swresample avdevice avfilter jansson z curl x264 freetype fontconfig \
-	EGL GL OpenGL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel vlc WebKitLegacy JavaScriptCore; do
+	EGL GL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel vlc WebKitLegacy JavaScriptCore; do
 	: > "$L/lib$l.so"
 done
 

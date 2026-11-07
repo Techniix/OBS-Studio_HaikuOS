@@ -785,7 +785,12 @@ static inline struct fbo_info *get_fbo_by_tex(gs_texture_t *tex)
 static bool set_current_fbo(gs_device_t *device, struct fbo_info *fbo)
 {
 	if (device->cur_fbo != fbo) {
+#ifdef __HAIKU__
+		/* swapchains may render into a platform framebuffer object instead of framebuffer 0 */
+		GLuint fbo_obj = fbo ? fbo->fbo : gl_platform_default_framebuffer(device);
+#else
 		GLuint fbo_obj = fbo ? fbo->fbo : 0;
+#endif
 		if (!gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER, fbo_obj))
 			return false;
 
