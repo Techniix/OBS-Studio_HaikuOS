@@ -18,6 +18,7 @@
 !.gersemirc
 !.git-blame-ignore-devs
 !.gitmodules
+!/HAIKU.md
 !.gitignore
 !.mailmap
 !.swift-format

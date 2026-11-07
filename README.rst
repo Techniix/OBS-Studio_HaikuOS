@@ -1,6 +1,11 @@
 OBS Studio <https://obsproject.com>
 ===================================
 
+.. note::
+   This is the **Haiku port** of OBS Studio. See `HAIKU.md <HAIKU.md>`_ for port status and
+   Haiku build instructions. Upstream: https://github.com/obsproject/obs-studio
+
+
 .. image:: https://github.com/obsproject/obs-studio/actions/workflows/push.yaml/badge.svg?branch=master
    :alt: OBS Studio Build Status - GitHub Actions
    :target: https://github.com/obsproject/obs-studio/actions/workflows/push.yaml?query=branch%3Amaster
