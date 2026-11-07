@@ -11,8 +11,8 @@ SRC="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${1:-$SRC/build}"
 shift || true
 
-# Submodules used on Haiku (obs-browser and libdshowcapture aren't needed)
-SUBMODULES=(deps/simde deps/asio deps/websocketpp deps/srt deps/librist plugins/obs-websocket)
+# Submodules used on Haiku (libdshowcapture isn't needed; of obs-browser only the panel interface header is used)
+SUBMODULES=(deps/simde deps/asio deps/websocketpp deps/srt deps/librist plugins/obs-websocket plugins/obs-browser)
 missing=()
 for m in "${SUBMODULES[@]}"; do
 	[ -e "$SRC/$m/.git" ] || missing+=("$m")
@@ -36,6 +36,7 @@ have_header speex/speex_preprocess.h || OPTS+=(-DENABLE_SPEEXDSP=OFF)
 have_header rnnoise.h || OPTS+=(-DENABLE_RNNOISE=OFF)
 have_header rtc/rtc.hpp || OPTS+=(-DENABLE_WEBRTC=OFF)
 have_header vlc/libvlc.h || OPTS+=(-DENABLE_VLC=OFF)
+have_header WebView.h || OPTS+=(-DENABLE_BROWSER=OFF)
 [ ${#OPTS[@]} -gt 0 ] && echo "==> Missing optional dependencies, adding: ${OPTS[*]}"
 
 LOG="$BUILD/haiku-build.log"

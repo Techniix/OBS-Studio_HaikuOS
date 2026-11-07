@@ -27,10 +27,12 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 extern void haiku_register_audio_input(void);
 extern void haiku_register_video_input(void);
+extern void haiku_register_desktop_audio(void);
 
 bool obs_module_load(void)
 {
 	haiku_register_audio_input();
 	haiku_register_video_input();
+	haiku_register_desktop_audio();
 	return true;
 }

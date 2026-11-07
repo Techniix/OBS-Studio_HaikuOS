@@ -1431,6 +1431,10 @@ bool OBSApp::IsMissingFilesCheckDisabled()
 #elif _WIN32
 #define INPUT_AUDIO_SOURCE "wasapi_input_capture"
 #define OUTPUT_AUDIO_SOURCE "wasapi_output_capture"
+#elif defined(__HAIKU__)
+/* plugins/haiku-media */
+#define INPUT_AUDIO_SOURCE "haiku_audio_input_capture"
+#define OUTPUT_AUDIO_SOURCE "haiku_desktop_audio_capture"
 #else
 #define INPUT_AUDIO_SOURCE "pulse_input_capture"
 #define OUTPUT_AUDIO_SOURCE "pulse_output_capture"

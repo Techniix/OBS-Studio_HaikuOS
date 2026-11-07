@@ -157,7 +157,8 @@ std::optional<QWidget *> OBSBasic::createContextBarWidget(obs_source_t *source)
 	} else if (strcmp(id, "wasapi_input_capture") == 0 || strcmp(id, "wasapi_output_capture") == 0 ||
 		   strcmp(id, "coreaudio_input_capture") == 0 || strcmp(id, "coreaudio_output_capture") == 0 ||
 		   strcmp(id, "pulse_input_capture") == 0 || strcmp(id, "pulse_output_capture") == 0 ||
-		   strcmp(id, "alsa_input_capture") == 0) {
+		   strcmp(id, "alsa_input_capture") == 0 || strcmp(id, "haiku_audio_input_capture") == 0 ||
+		   strcmp(id, "haiku_desktop_audio_capture") == 0) {
 		AudioCaptureToolbar *contextBarWidget = new AudioCaptureToolbar(ui->emptySpace, source);
 		contextBarWidget->Init();
 		return contextBarWidget;

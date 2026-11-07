@@ -26,6 +26,10 @@
 
 #include <QInputEvent>
 
+#ifdef __HAIKU__
+#include <utility/platform.hpp>
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN 1
@@ -388,6 +392,11 @@ bool OBSBasicInteraction::HandleKeyEvent(QKeyEvent *event)
 	keyEvent.native_modifiers = event->nativeModifiers();
 	keyEvent.native_scancode = event->nativeScanCode();
 	keyEvent.native_vkey = event->nativeVirtualKey();
+#ifdef __HAIKU__
+	/* The Haiku QPA reports no native key codes; give sources the Haiku raw key code instead */
+	keyEvent.native_vkey = obs_key_to_virtual_key(HaikuObsKeyFromQtKeyEvent(event));
+	keyEvent.native_scancode = keyEvent.native_vkey;
+#endif
 
 	bool keyUp = event->type() == QEvent::KeyRelease;
 

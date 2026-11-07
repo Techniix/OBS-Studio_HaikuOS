@@ -52,6 +52,7 @@ clone speexdsp https://github.com/xiph/speexdsp SpeexDSP-1.2.1 include
 clone rnnoise https://github.com/xiph/rnnoise main include
 clone luajit https://github.com/LuaJIT/LuaJIT v2.1 src
 clone uthash https://github.com/troydhanson/uthash master
+clone haikuwebkit https://github.com/haiku/webkit rebased Source/WebKitLegacy/haiku/API
 cd ..
 
 echo "==> Sysroot"
@@ -96,9 +97,14 @@ mkdir -p "$I/luajit-2.1"
 cp deps/luajit/src/{lua.h,lualib.h,lauxlib.h,luaconf.h,lua.hpp} "$I/luajit-2.1/"
 cp deps/luajit/src/luajit_rolling.h "$I/luajit-2.1/luajit.h"
 
+# HaikuWebKit: the headers haikuwebkit_devel installs (develop/headers)
+for h in WebView.h WebPage.h WebWindow.h WebSettings.h WebViewConstants.h WebKitInfo.h WebDownload.h; do
+	cp "deps/haikuwebkit/Source/WebKitLegacy/haiku/API/$h" "$I/"
+done
+
 # Stub libraries: find_library() only needs the files to exist; the harness never links.
 for l in avcodec avformat avutil swscale swresample avdevice avfilter jansson z curl x264 freetype fontconfig \
-	EGL GL OpenGL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel vlc; do
+	EGL GL OpenGL speexdsp rnnoise luajit-5.1 mbedtls mbedcrypto mbedx509 datachannel vlc WebKitLegacy JavaScriptCore; do
 	: > "$L/lib$l.so"
 done
 

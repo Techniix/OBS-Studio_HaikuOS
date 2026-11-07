@@ -12,6 +12,7 @@ REQUIRED=(
 	freetype_devel fontconfig_devel
 	nlohmann_json libdatachannel_devel
 	vlc_devel
+	haikuwebkit_devel
 )
 
 # Scripting (Lua/Python) and the noise suppression filters
