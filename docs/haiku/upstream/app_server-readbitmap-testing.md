@@ -33,11 +33,12 @@ Note the `hrevNNNNN` number. The examples below use `hrevNNNNN`; replace it with
 mkdir -p ~/haiku-dev && cd ~/haiku-dev
 git clone --depth 1 --branch hrevNNNNN https://review.haiku-os.org/haiku.git
 cd haiku
-git apply --check ~/OBS-Studio_HaikuOS/docs/haiku/upstream/0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch \
-  && git apply ~/OBS-Studio_HaikuOS/docs/haiku/upstream/0001-app_server-serve-ReadBitmap-from-the-back-buffer-whe.patch
+P=~/OBS-Studio_HaikuOS/docs/haiku/upstream
+git apply --check $P/0001-*.patch && git apply $P/0001-*.patch
+git apply --check $P/0002-*.patch && git apply $P/0002-*.patch
 ```
 
-The patch was made against master of 2026-11-06. If `--check` fails, your revision differs in these files; send me
+The patches were made against master of 2026-11-06. If you also test the nvidia-haiku hardware-cursor series, apply its `docs/haiku-upstream/0001`–`0003` instead (its 0001 and 0002 are these same files). If `--check` fails, your revision differs in these files; send me
 the error and the hrev and I'll rebase it.
 
 ## 3. Configure the build (on Haiku, no cross-compiler is needed)

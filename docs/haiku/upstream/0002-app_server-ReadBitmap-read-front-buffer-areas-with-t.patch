@@ -1,0 +1,114 @@
+From f52aad8b3befbc370ba0ebff69ac8d9f7eea7ea4 Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:38:54 -0500
+Subject: [PATCH 2/3] app_server: ReadBitmap(): read front-buffer areas with
+ the cursor
+
+The previous change read the software cursor's rectangle from the back
+buffer even inside the areas whose current content is only in the front
+buffer, using HWInterface::SoftwareCursorFrame(). That is wrong in both
+directions:
+
+ * There, the back buffer is stale (direct windows, BWindowScreen) or
+   half redrawn (windows in an update session), so the capture would
+   get a stale or erased patch the size of the cursor, or of cursor plus
+   drag bitmap.
+ * SoftwareCursorFrame() returned the fCursorAreaBackup rectangle, which
+   _AdoptDragBitmap() only allocates when *not* double buffered, so it
+   was always invalid on the path that used it, and the exclusion never
+   happened anyway.
+
+Read those areas from the front buffer, software cursor included, as
+ReadBitmap() always did, and remove SoftwareCursorFrame(). Outside them
+the back buffer is read, which never contains the software cursor.
+
+Remaining limitation: where a software cursor is over a direct window or
+a window in an update session, a capture with drawCursor = false
+contains it, and one with drawCursor = true contains it twice, as before
+the previous change.
+
+Could be squashed into the previous change.
+
+This change was written by an AI assistant (Claude, Anthropic) at the
+request of a Haiku user and has only been syntax-checked and reviewed,
+not built or run. Haiku's policy does not accept AI-generated
+contributions; it is offered as a description of the problem and one
+possible fix, for a developer to rewrite or discard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8kiTtm6UwGrx2GPsdP
+---
+ src/servers/app/drawing/DrawingEngine.cpp | 12 ++++++------
+ src/servers/app/drawing/HWInterface.cpp   | 17 -----------------
+ src/servers/app/drawing/HWInterface.h     |  4 ----
+ 3 files changed, 6 insertions(+), 27 deletions(-)
+
+diff --git a/src/servers/app/drawing/DrawingEngine.cpp b/src/servers/app/drawing/DrawingEngine.cpp
+index 6233e3f..89c1447 100644
+--- a/src/servers/app/drawing/DrawingEngine.cpp
++++ b/src/servers/app/drawing/DrawingEngine.cpp
+@@ -1423,12 +1423,12 @@ DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds,
+ 		BRegion boundsRegion(bounds);
+ 		front.IntersectWith(&boundsRegion);
+ 
+-		// The software cursor is drawn on the front buffer only, composited
+-		// from the back buffer: where it is, the back buffer has what is on
+-		// screen without the cursor.
+-		BRect cursorFrame = fGraphicsCard->SoftwareCursorFrame();
+-		if (cursorFrame.IsValid())
+-			front.Exclude(cursorFrame);
++		// Outside frontBufferRegion the back buffer never contains the
++		// software cursor, which is only composited onto the front buffer.
++		// Inside it, the front buffer is the only up-to-date copy (the back
++		// buffer is stale under direct windows and half redrawn under
++		// windows in an update session), so it is read with the software
++		// cursor, as before this change.
+ 
+ 		if (result == B_OK) {
+ 			for (int32 i = 0; i < front.CountRects(); i++) {
+diff --git a/src/servers/app/drawing/HWInterface.cpp b/src/servers/app/drawing/HWInterface.cpp
+index 221fcf8..35b431f 100644
+--- a/src/servers/app/drawing/HWInterface.cpp
++++ b/src/servers/app/drawing/HWInterface.cpp
+@@ -483,23 +483,6 @@ HWInterface::HideFloatingOverlays(const BRect& area)
+ }
+ 
+ 
+-BRect
+-HWInterface::SoftwareCursorFrame() const
+-{
+-	BRect frame;
+-	if (!fFloatingOverlaysLock.Lock())
+-		return frame;
+-
+-	if (fCursorAreaBackup.IsSet() && !fCursorAreaBackup->cursor_hidden) {
+-		frame.Set(fCursorAreaBackup->left, fCursorAreaBackup->top,
+-			fCursorAreaBackup->right, fCursorAreaBackup->bottom);
+-	}
+-
+-	fFloatingOverlaysLock.Unlock();
+-	return frame;
+-}
+-
+-
+ bool
+ HWInterface::HideFloatingOverlays()
+ {
+diff --git a/src/servers/app/drawing/HWInterface.h b/src/servers/app/drawing/HWInterface.h
+index 4591192..65992d5 100644
+--- a/src/servers/app/drawing/HWInterface.h
++++ b/src/servers/app/drawing/HWInterface.h
+@@ -169,10 +169,6 @@ public:
+ 			bool				HideFloatingOverlays();
+ 			void				ShowFloatingOverlays();
+ 
+-	// The frame buffer area the software cursor is currently drawn on (it is
+-	// not in the back buffer), or an invalid rect if there is none.
+-			BRect				SoftwareCursorFrame() const;
+-
+ 	// Listener support
+ 			bool				AddListener(HWInterfaceListener* listener);
+ 			void				RemoveListener(HWInterfaceListener* listener);
+-- 
+2.43.0
+
