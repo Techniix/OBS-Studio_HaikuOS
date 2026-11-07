@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <Bitmap.h>
 #include <OS.h>
@@ -92,9 +93,10 @@ void ScreenCapture::Run()
 	/* below the app_server and normal applications; the copy itself is throttled by CaptureThrottle */
 	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
 
-	std::unique_ptr<BBitmap> bitmap;
-	BRect bitmap_frame;
 	CaptureThrottle throttle("Screen capture");
+	BandedScreenReader reader;
+	std::vector<uint8_t> pixels;
+	uint32_t stride = 0;
 
 	while (active) {
 		bool cursor;
@@ -105,37 +107,26 @@ void ScreenCapture::Run()
 			rate = fps;
 		}
 
-		BRect frame = screen.Frame();
-		if (!bitmap || frame != bitmap_frame) {
-			/* B_RGB32 is B,G,R,X in memory, i.e. VIDEO_FORMAT_BGRX */
-			bitmap = std::make_unique<BBitmap>(frame.OffsetToCopy(0, 0), B_RGB32);
-			if (bitmap->InitCheck() != B_OK) {
-				blog(LOG_ERROR, "[haiku-capture] Failed to allocate %dx%d bitmap", frame.IntegerWidth() + 1,
-				     frame.IntegerHeight() + 1);
-				bitmap.reset();
-				os_sleep_ms(1000);
-				continue;
-			}
-			bitmap_frame = frame;
-		}
-
+		const BRect frame = screen.Frame();
 		const uint64_t timestamp = os_gettime_ns();
 
-		throttle.BeginRead();
-		const status_t read = screen.ReadBitmap(bitmap.get(), cursor, &frame);
-		throttle.EndRead((uint64_t)(frame.IntegerWidth() + 1) * (uint64_t)(frame.IntegerHeight() + 1));
+		const uint64_t took = reader.Read(screen, frame, cursor, pixels, stride);
+		if (took) {
+			const uint32_t width = (uint32_t)frame.IntegerWidth() + 1;
+			const uint32_t height = (uint32_t)frame.IntegerHeight() + 1;
+			throttle.Record(took, (uint64_t)width * height);
 
-		if (read == B_OK) {
 			struct obs_source_frame out = {};
-			out.data[0] = (uint8_t *)bitmap->Bits();
-			out.linesize[0] = (uint32_t)bitmap->BytesPerRow();
-			out.width = (uint32_t)frame.IntegerWidth() + 1;
-			out.height = (uint32_t)frame.IntegerHeight() + 1;
+			out.data[0] = pixels.data();
+			out.linesize[0] = stride;
+			out.width = width;
+			out.height = height;
 			out.format = VIDEO_FORMAT_BGRX;
 			out.full_range = true;
 			out.timestamp = timestamp;
-
 			obs_source_output_video(source, &out);
+		} else {
+			os_sleep_ms(100);
 		}
 
 		throttle.Wait(rate);

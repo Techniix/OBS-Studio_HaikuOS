@@ -243,7 +243,9 @@ void WindowCapture::Run()
 		return;
 	}
 
-	std::unique_ptr<BBitmap> bitmap;
+	BandedScreenReader reader;
+	std::vector<uint8_t> pixels;
+	uint32_t stride = 0;
 	WindowEntry window;
 	bool have_window = false;
 	bool was_covered = false;
@@ -296,13 +298,6 @@ void WindowCapture::Run()
 			rect.bottom = floorf(rect.bottom);
 
 			if (rect.IsValid() && rect.Width() >= 1 && rect.Height() >= 1) {
-				const BRect bounds = rect.OffsetToCopy(0, 0);
-				if (!bitmap || bitmap->Bounds() != bounds) {
-					bitmap = std::make_unique<BBitmap>(bounds, B_RGB32);
-					if (bitmap->InitCheck() != B_OK)
-						bitmap.reset();
-				}
-
 				if (now >= next_cover_check) {
 					next_cover_check = now + 500000000ULL;
 					bool covered = is_covered(window.token, rect);
@@ -315,20 +310,17 @@ void WindowCapture::Run()
 					was_covered = covered;
 				}
 
-				BRect read = rect;
-				status_t read_status = B_ERROR;
-				if (bitmap) {
-					throttle.BeginRead();
-					read_status = screen.ReadBitmap(bitmap.get(), cursor, &read);
-					throttle.EndRead((uint64_t)(bounds.IntegerWidth() + 1) *
-							 (uint64_t)(bounds.IntegerHeight() + 1));
-				}
-				if (read_status == B_OK) {
+				const uint64_t took = reader.Read(screen, rect, cursor, pixels, stride);
+				if (took) {
+					const uint32_t width = (uint32_t)rect.IntegerWidth() + 1;
+					const uint32_t height = (uint32_t)rect.IntegerHeight() + 1;
+					throttle.Record(took, (uint64_t)width * height);
+
 					struct obs_source_frame frame = {};
-					frame.data[0] = (uint8_t *)bitmap->Bits();
-					frame.linesize[0] = (uint32_t)bitmap->BytesPerRow();
-					frame.width = (uint32_t)bounds.IntegerWidth() + 1;
-					frame.height = (uint32_t)bounds.IntegerHeight() + 1;
+					frame.data[0] = pixels.data();
+					frame.linesize[0] = stride;
+					frame.width = width;
+					frame.height = height;
 					frame.format = VIDEO_FORMAT_BGRX;
 					frame.full_range = true;
 					frame.timestamp = now;
