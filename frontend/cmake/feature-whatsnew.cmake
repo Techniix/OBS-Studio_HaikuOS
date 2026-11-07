@@ -5,7 +5,7 @@ option(ENABLE_WHATSNEW "Enable WhatsNew dialog" ON)
 if(ENABLE_WHATSNEW AND TARGET OBS::browser-panels)
   if(OS_MACOS)
     include(cmake/feature-macos-update.cmake)
-  elseif(OS_LINUX)
+  elseif(OS_LINUX OR OS_HAIKU)
     find_package(MbedTLS 3...<4 REQUIRED)
     find_package(nlohmann_json 3.11 REQUIRED)
 
