@@ -21,7 +21,17 @@ if(NOT DEFINED OBS_VERSION_OVERRIDE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git
   endif()
 
   if(_obs_version_result EQUAL 0)
-    string(REGEX REPLACE "([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" _obs_version_canonical ${_obs_version})
+    if(_obs_version MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+")
+      string(REGEX REPLACE "([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" _obs_version_canonical ${_obs_version})
+    else()
+      # Clones without release tags (e.g. forks) only get a commit hash from git describe. Fall back to the
+      # upstream release this tree is based on instead of failing.
+      set(_obs_version_canonical 33 0 1)
+      string(REPLACE ";" "." _obs_version_base "${_obs_version_canonical}")
+      set(_obs_version "${_obs_version_base}-g${_obs_version}")
+      unset(_obs_version_base)
+      message(STATUS "No OBS release tag found in git history, using version ${_obs_version}")
+    endif()
   endif()
 elseif(DEFINED OBS_VERSION_OVERRIDE)
   if(OBS_VERSION_OVERRIDE MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+).*")
