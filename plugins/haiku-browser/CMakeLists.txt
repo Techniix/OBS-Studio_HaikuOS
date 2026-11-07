@@ -17,6 +17,15 @@ find_path(HaikuWebKit_INCLUDE_DIR NAMES WebView.h WebPage.h WebWindow.h PATHS /b
 find_library(HaikuWebKit_LIBRARY NAMES WebKitLegacy PATHS /boot/system/develop/lib)
 find_library(JavaScriptCore_LIBRARY NAMES JavaScriptCore PATHS /boot/system/develop/lib)
 
+# HaikuWebKit 1.10's WebView.h/WebPage.h include <UrlContext.h> from Haiku's private network services headers
+# (haiku_devel ships them; WebPositive builds with the same directory)
+find_path(
+  HaikuNetServices_INCLUDE_DIR
+  NAMES UrlContext.h
+  PATHS /boot/system/develop/headers/private/netservices
+  NO_DEFAULT_PATH
+)
+
 if(NOT HaikuWebKit_INCLUDE_DIR OR NOT HaikuWebKit_LIBRARY OR NOT JavaScriptCore_LIBRARY)
   message(
     FATAL_ERROR
@@ -72,6 +81,9 @@ set_target_properties_obs(obs-browser PROPERTIES FOLDER plugins/obs-browser PREF
 add_executable(obs-haiku-browser)
 target_sources(obs-haiku-browser PRIVATE browser-shm.h helper/browser-helper.cpp helper/webkit-abi.h)
 target_include_directories(obs-haiku-browser PRIVATE "${HaikuWebKit_INCLUDE_DIR}")
+if(HaikuNetServices_INCLUDE_DIR)
+  target_include_directories(obs-haiku-browser PRIVATE "${HaikuNetServices_INCLUDE_DIR}")
+endif()
 target_link_libraries(obs-haiku-browser PRIVATE "${HaikuWebKit_LIBRARY}" "${JavaScriptCore_LIBRARY}" be)
 target_compile_features(obs-haiku-browser PRIVATE cxx_std_17)
 set_target_properties_obs(obs-haiku-browser PROPERTIES FOLDER plugins/obs-browser)

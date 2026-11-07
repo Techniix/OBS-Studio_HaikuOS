@@ -52,7 +52,7 @@ clone speexdsp https://github.com/xiph/speexdsp SpeexDSP-1.2.1 include
 clone rnnoise https://github.com/xiph/rnnoise main include
 clone luajit https://github.com/LuaJIT/LuaJIT v2.1 src
 clone uthash https://github.com/troydhanson/uthash master
-clone haikuwebkit https://github.com/haiku/webkit rebased Source/WebKitLegacy/haiku/API
+clone haikuwebkit https://github.com/haiku/haikuwebkit haiku Source/WebKitLegacy/haiku/API
 cd ..
 
 echo "==> Sysroot"
@@ -96,6 +96,10 @@ cp deps/uthash/src/*.h "$I/"
 mkdir -p "$I/luajit-2.1"
 cp deps/luajit/src/{lua.h,lualib.h,lauxlib.h,luaconf.h,lua.hpp} "$I/luajit-2.1/"
 cp deps/luajit/src/luajit_rolling.h "$I/luajit-2.1/luajit.h"
+
+# Haiku's private network services headers (haiku_devel ships them; HaikuWebKit's API headers need UrlContext.h)
+mkdir -p "$I/private/netservices"
+cp haiku/headers/private/netservices/*.h "$I/private/netservices/"
 
 # HaikuWebKit: the headers haikuwebkit_devel installs (develop/headers)
 for h in WebView.h WebPage.h WebWindow.h WebSettings.h WebViewConstants.h WebKitInfo.h WebDownload.h; do
