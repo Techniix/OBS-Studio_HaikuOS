@@ -6,6 +6,7 @@ add_library(OBS::haiku-media ALIAS haiku-media)
 target_sources(
   haiku-media
   PRIVATE
+    audio-channels.hpp
     audio-input.cpp
     audio-tap/audio-tap-shm.h
     desktop-audio.cpp

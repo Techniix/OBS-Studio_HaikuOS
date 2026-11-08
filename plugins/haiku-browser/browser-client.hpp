@@ -101,8 +101,11 @@ private:
 	void DestroyArea();
 	void RetireArea();
 	bool TrySendAttach();
+	bool AttachInFlight() const;
+	bool NeedsBiggerArea() const;
 	obs_browser_shm *HelperShm() const;
 	bool SpawnHelper();
+	void ScheduleRestart(bigtime_t now);
 	void StopHelper();
 	bool HelperAlive() const;
 	bool SendLocked(BMessage &message);
@@ -120,11 +123,18 @@ private:
 	obs_browser_shm *shm = nullptr;
 	uint32_t area_width = 0, area_height = 0;
 
-	/* While a switch to a bigger area hasn't reached the helper, it keeps using the previous one: keep it
-	 * mapped, read the helper's state from it and keep its heartbeat going. */
+	/* false once a helper was started on (or told to attach) the current area: a new helper then gets a
+	 * fresh area, so a previous one that is still shutting down can never write into the same frames */
+	bool area_fresh = false;
+
+	/* Until the helper confirms a switch to a bigger area (it writes its team into the new header), it keeps
+	 * using the previous one: keep that mapped, read the helper's state from it and keep its heartbeat
+	 * going. attach_pending: the switch has not been sent yet. */
 	area_id retired_area = -1;
 	obs_browser_shm *retired_shm = nullptr;
 	bool attach_pending = false;
+	bigtime_t attach_sent = 0;
+	bool resize_deferred = false; /* a bigger area is needed but a switch is still in flight */
 
 	BMessenger messenger;
 
@@ -132,6 +142,7 @@ private:
 	bigtime_t helper_started = 0;
 	bigtime_t next_restart = 0;
 	int restarts = 0;
+	bool spawn_failing = false; /* logged once per streak of failed starts */
 	bool ready = false;
 
 	std::string startup_script;

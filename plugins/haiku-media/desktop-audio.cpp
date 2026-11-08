@@ -50,6 +50,7 @@
 #include <thread>
 #include <vector>
 
+#include "audio-channels.hpp"
 #include "audio-tap/audio-tap-shm.h"
 
 extern char **environ;
@@ -83,8 +84,10 @@ std::string helper_path()
 	return path;
 }
 
-/* Background app (no Deskbar entry). Executables built without resources carry no app flags; they live in a
- * file attribute, so setting them once per installation is enough. */
+/* Background app (no Deskbar entry), multiple launch. Executables built without resources carry no app flags;
+ * they live in a file attribute, so setting them once per installation is enough. Not B_SINGLE_LAUNCH: the
+ * registrar would turn away a helper started while the previous one is still restoring the routing, and
+ * `--repair` while a helper runs; the helper has its own single-instance lock (tap-app.cpp). */
 void mark_background_app(const std::string &path)
 {
 	static bool done = false;
@@ -95,21 +98,34 @@ void mark_background_app(const std::string &path)
 	BAppFileInfo info(&file);
 	if (file.InitCheck() != B_OK || info.InitCheck() != B_OK)
 		return;
+	const uint32 wanted = B_MULTIPLE_LAUNCH | B_BACKGROUND_APP;
+	const uint32 managed = B_LAUNCH_MASK | B_BACKGROUND_APP;
 	uint32 flags = 0;
-	if (info.GetAppFlags(&flags) != B_OK || !(flags & B_BACKGROUND_APP))
-		info.SetAppFlags(B_SINGLE_LAUNCH | B_BACKGROUND_APP);
+	if (info.GetAppFlags(&flags) != B_OK)
+		flags = 0;
+	else if ((flags & managed) == wanted)
+		return;
+	/* also rewrites the B_SINGLE_LAUNCH flags that older builds of this plugin set */
+	info.SetAppFlags((flags & ~managed) | wanted);
+}
+
+/* spawn_mutex held */
+void reap_helper_locked()
+{
+	if (helper_pid > 0 && waitpid(helper_pid, nullptr, WNOHANG) == helper_pid)
+		helper_pid = -1;
 }
 
 void reap_helper()
 {
 	std::lock_guard<std::mutex> lock(spawn_mutex);
-	if (helper_pid > 0 && waitpid(helper_pid, nullptr, WNOHANG) == helper_pid)
-		helper_pid = -1;
+	reap_helper_locked();
 }
 
 bool spawn_helper()
 {
 	std::lock_guard<std::mutex> lock(spawn_mutex);
+	reap_helper_locked(); /* a zombie still passes kill(pid, 0) */
 	if (helper_pid > 0 && kill(helper_pid, 0) == 0)
 		return true; /* still starting up */
 
@@ -125,28 +141,6 @@ bool spawn_helper()
 	helper_pid = pid;
 	blog(LOG_INFO, "[haiku-media] desktop audio: started %s (team %d)", path.c_str(), (int)pid);
 	return true;
-}
-
-speaker_layout speakers_for(uint32_t channels)
-{
-	switch (channels) {
-	case 1:
-		return SPEAKERS_MONO;
-	case 2:
-		return SPEAKERS_STEREO;
-	case 3:
-		return SPEAKERS_2POINT1;
-	case 4:
-		return SPEAKERS_4POINT0;
-	case 5:
-		return SPEAKERS_4POINT1;
-	case 6:
-		return SPEAKERS_5POINT1;
-	case 8:
-		return SPEAKERS_7POINT1;
-	default:
-		return SPEAKERS_UNKNOWN;
-	}
 }
 
 audio_format obs_format_for(uint32_t format)
@@ -166,6 +160,15 @@ audio_format obs_format_for(uint32_t format)
 	}
 }
 
+/* The mixer format as published by the helper, copied out of the shared area in one consistent piece */
+struct TapFormat {
+	float frame_rate;
+	uint32_t channels;
+	uint32_t format;
+	uint32_t byte_order;
+	uint32_t channel_mask;
+};
+
 struct DesktopAudio {
 	obs_source_t *source = nullptr;
 	std::thread thread;
@@ -173,17 +176,30 @@ struct DesktopAudio {
 
 	area_id clone = -1;
 	const obs_tap_shm *shm = nullptr;
-	volatile int64_t *heartbeat = nullptr;
+	int64_t *heartbeat = nullptr;
 	int64_t read_pos = 0;
 	bigtime_t attached_at = 0;
+	bool warned_protocol = false;
+
+	/* cached when format_serial changes; Pump() never re-reads the shared format fields */
 	int32_t format_serial = -1;
 	bool format_ok = false;
 	bool warned_format = false;
+	uint32_t rate = 0;
+	size_t sample_size = 0;
+	size_t frame_size = 0;
+	audio_format obs_format = AUDIO_FORMAT_UNKNOWN;
+	bool signed_8bit = false;
+	AudioChannelMap channel_map;
+
 	std::vector<uint8_t> chunk;
+	std::vector<uint8_t> packed;
 
 	void Run();
 	bool Attach();
 	void Detach();
+	bool ReadFormat(int32_t *serial, TapFormat *fmt) const;
+	void UpdateFormat();
 	void Pump();
 };
 
@@ -202,21 +218,35 @@ bool DesktopAudio::Attach()
 	}
 
 	obs_tap_shm *mapped = static_cast<obs_tap_shm *>(addr);
-	if (mapped->magic != OBS_TAP_MAGIC || mapped->version != OBS_TAP_VERSION ||
-	    mapped->ring_size != OBS_TAP_RING_SIZE) {
-		blog(LOG_WARNING, "[haiku-media] desktop audio: helper protocol mismatch (magic %08x, version %u)",
-		     mapped->magic, mapped->version);
+	/* the helper stores the magic last (release): seeing it means the header is initialized. Areas are at
+	 * least a page, so the header fields can be read before the size is known to be right. */
+	area_info ainfo;
+	const bool size_ok = get_area_info(clone, &ainfo) == B_OK && ainfo.size >= obs_tap_area_size();
+	const uint32_t magic = __atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE);
+	if (magic != OBS_TAP_MAGIC || mapped->version != OBS_TAP_VERSION || mapped->ring_size != OBS_TAP_RING_SIZE ||
+	    !size_ok) {
+		/* magic 0: the helper is still setting up. Otherwise a helper from another build; it is not fed
+		 * heartbeats, so it gives up within OBS_TAP_CLIENT_TIMEOUT and a current one takes over. */
+		if (magic != 0 && !warned_protocol) {
+			blog(LOG_WARNING,
+			     "[haiku-media] desktop audio: helper protocol mismatch (magic %08x, version %u, "
+			     "expected %u); waiting for it to exit",
+			     magic, mapped->version, OBS_TAP_VERSION);
+			warned_protocol = true;
+		}
 		delete_area(clone);
 		clone = -1;
 		return false;
 	}
+	warned_protocol = false;
 
 	shm = mapped;
 	heartbeat = &mapped->client_heartbeat;
-	*heartbeat = system_time();
+	__atomic_store_n(heartbeat, (int64_t)system_time(), __ATOMIC_RELEASE);
 	attached_at = system_time();
-	read_pos = shm->write_pos; /* start with what is played from now on */
+	read_pos = __atomic_load_n(&shm->write_pos, __ATOMIC_ACQUIRE); /* start with what is played from now on */
 	format_serial = -1;
+	format_ok = false;
 	blog(LOG_INFO, "[haiku-media] '%s': attached to the desktop audio tap", obs_source_get_name(source));
 	return true;
 }
@@ -231,39 +261,92 @@ void DesktopAudio::Detach()
 	heartbeat = nullptr;
 }
 
+/* seqlock reader (see audio-tap-shm.h) */
+bool DesktopAudio::ReadFormat(int32_t *serial, TapFormat *fmt) const
+{
+	for (int tries = 0; tries < 64; tries++) {
+		const int32_t s1 = __atomic_load_n(&shm->format_serial, __ATOMIC_ACQUIRE);
+		if (s1 & 1)
+			continue; /* the writer is in the middle of an update; it only takes a few stores */
+		fmt->frame_rate = shm->frame_rate;
+		fmt->channels = shm->channels;
+		fmt->format = shm->format;
+		fmt->byte_order = shm->byte_order;
+		fmt->channel_mask = shm->channel_mask;
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		if (__atomic_load_n(&shm->format_serial, __ATOMIC_RELAXED) == s1) {
+			*serial = s1;
+			return true;
+		}
+	}
+	return false;
+}
+
+void DesktopAudio::UpdateFormat()
+{
+	int32_t serial;
+	TapFormat f;
+	if (!ReadFormat(&serial, &f))
+		return; /* try again on the next poll */
+
+	format_serial = serial;
+	obs_format = obs_format_for(f.format);
+	sample_size = f.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+	signed_8bit = f.format == media_raw_audio_format::B_AUDIO_CHAR;
+	const bool rate_ok = f.frame_rate >= 1.0f && f.frame_rate <= 1000000.0f; /* also false for NaN */
+	rate = rate_ok ? (uint32_t)f.frame_rate : 0;
+	const bool channels_ok = f.channels >= 1 && f.channels <= 8;
+	channel_map = channels_ok ? haiku_audio_channel_map(f.channels, f.channel_mask) : AudioChannelMap();
+	frame_size = sample_size * (channels_ok ? f.channels : 0);
+
+	format_ok = obs_format != AUDIO_FORMAT_UNKNOWN && sample_size > 0 && channels_ok && rate_ok &&
+		    channel_map.Valid() && f.byte_order == B_MEDIA_HOST_ENDIAN;
+
+	/* serial 0 is the zeroed header before the tap's first connection: nothing to complain about yet */
+	if (!format_ok && serial != 0 && !warned_format) {
+		blog(LOG_WARNING,
+		     "[haiku-media] desktop audio: unsupported mixer format (format 0x%x, %u channels, %.0f Hz, "
+		     "byte order %u)",
+		     f.format, f.channels, f.frame_rate, f.byte_order);
+		warned_format = true;
+	}
+	if (format_ok) {
+		warned_format = false;
+		if (channel_map.dropped_mask)
+			blog(LOG_WARNING,
+			     "[haiku-media] desktop audio: channel mask 0x%x has channels OBS has no slot for (0x%x); "
+			     "they are dropped",
+			     f.channel_mask, channel_map.dropped_mask);
+		if (!channel_map.identity)
+			blog(LOG_INFO,
+			     "[haiku-media] desktop audio: %u channels (mask 0x%x) are remapped to an OBS %u-channel "
+			     "layout",
+			     f.channels, f.channel_mask, channel_map.out_channels);
+	}
+
+	/* bytes of the old format are meaningless now */
+	read_pos = __atomic_load_n(&shm->write_pos, __ATOMIC_ACQUIRE);
+}
+
 void DesktopAudio::Pump()
 {
-	*heartbeat = system_time();
+	__atomic_store_n(heartbeat, (int64_t)system_time(), __ATOMIC_RELEASE);
 
-	const int32_t serial = shm->format_serial;
-	if (serial != format_serial) {
-		format_serial = serial;
-		format_ok = obs_format_for(shm->format) != AUDIO_FORMAT_UNKNOWN &&
-			    speakers_for(shm->channels) != SPEAKERS_UNKNOWN && shm->frame_rate > 0.0f &&
-			    shm->byte_order == B_MEDIA_HOST_ENDIAN;
-		if (!format_ok && !warned_format) {
-			blog(LOG_WARNING,
-			     "[haiku-media] desktop audio: unsupported mixer format (format 0x%x, %u channels, %.0f Hz)",
-			     shm->format, shm->channels, shm->frame_rate);
-			warned_format = true;
-		}
-		/* bytes of the old format are meaningless now */
-		read_pos = shm->write_pos;
+	if (__atomic_load_n(&shm->format_serial, __ATOMIC_ACQUIRE) != format_serial) {
+		UpdateFormat();
 		return;
 	}
 	if (!format_ok)
 		return;
 
-	__sync_synchronize();
-	const int64_t write_pos = shm->write_pos;
-	const uint32_t ring = shm->ring_size;
-	const uint32_t channels = shm->channels;
-	const size_t sample_size = shm->format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
-	const size_t frame_size = sample_size * channels;
-	const uint32_t rate = (uint32_t)shm->frame_rate;
+	/* The ring size is checked at Attach(). The writer copies at most OBS_TAP_MAX_WRITE bytes before it
+	 * publishes them, so bytes up to that far beyond write_pos may already be changing. */
+	const int64_t ring = OBS_TAP_RING_SIZE;
+	const int64_t safe = ring - OBS_TAP_MAX_WRITE;
+	const int64_t write_pos = __atomic_load_n(&shm->write_pos, __ATOMIC_ACQUIRE);
 
 	int64_t avail = write_pos - read_pos;
-	if (avail < 0 || avail > (int64_t)ring / 2) {
+	if (avail < 0 || avail > safe) {
 		/* we fell behind (or the helper restarted): skip ahead instead of reading overwritten data */
 		read_pos = write_pos;
 		return;
@@ -280,25 +363,33 @@ void DesktopAudio::Pump()
 	if (first < (size_t)avail)
 		memcpy(chunk.data() + first, shm->ring, (size_t)avail - first);
 
-	/* the writer may have lapped us while copying */
-	__sync_synchronize();
-	if (shm->write_pos - read_pos > (int64_t)ring) {
-		read_pos = shm->write_pos;
+	/* the writer may have lapped us while copying, or the format may have changed under us */
+	const int64_t write_after = __atomic_load_n(&shm->write_pos, __ATOMIC_ACQUIRE);
+	if (write_after - read_pos > safe) {
+		read_pos = write_after;
 		return;
 	}
+	if (__atomic_load_n(&shm->format_serial, __ATOMIC_ACQUIRE) != format_serial)
+		return; /* UpdateFormat() on the next poll drops these bytes */
 	read_pos += avail;
 
-	if (shm->format == media_raw_audio_format::B_AUDIO_CHAR)
+	const uint32_t frames = (uint32_t)(avail / (int64_t)frame_size);
+	const uint8_t *samples = chunk.data();
+	if (!channel_map.identity) {
+		/* Haiku channel order -> OBS layout, converting signed 8-bit on the way */
+		packed.resize((size_t)frames * channel_map.out_channels * sample_size);
+		haiku_repack_channels(chunk.data(), packed.data(), frames, sample_size, channel_map, signed_8bit);
+		samples = packed.data();
+	} else if (signed_8bit) {
 		for (uint8_t &b : chunk)
 			b ^= 0x80;
-
-	const uint32_t frames = (uint32_t)(avail / (int64_t)frame_size);
+	}
 
 	struct obs_source_audio audio = {};
-	audio.data[0] = chunk.data();
+	audio.data[0] = samples;
 	audio.frames = frames;
-	audio.speakers = speakers_for(channels);
-	audio.format = obs_format_for(shm->format);
+	audio.speakers = channel_map.layout;
+	audio.format = obs_format;
 	audio.samples_per_sec = rate;
 	audio.timestamp = os_gettime_ns() - util_mul_div64(frames, 1000000000ULL, rate);
 	obs_source_output_audio(source, &audio);
@@ -336,14 +427,15 @@ void DesktopAudio::Run()
 		}
 
 		/* not (or no longer) inserted; allow a freshly started helper a moment to insert the tap */
-		if (!shm->helper_alive && system_time() - attached_at > 2000000) {
+		const bool alive = __atomic_load_n(&shm->helper_alive, __ATOMIC_ACQUIRE) != 0;
+		if (!alive && system_time() - attached_at > 2000000) {
 			/* the helper is shutting down (or failed to insert the tap) */
 			blog(LOG_INFO, "[haiku-media] '%s': desktop audio tap went away", obs_source_get_name(source));
 			Detach();
 			continue;
 		}
 
-		if (shm->helper_alive)
+		if (alive)
 			spawn_interval = HELPER_START_TIMEOUT_US;
 
 		area_info info;
@@ -410,7 +502,19 @@ void desktop_audio_destroy(void *data)
 				kill(team, SIGTERM);
 			delete_area(c);
 		}
-		reap_helper();
+		/* Reap our helper so it doesn't linger as a zombie, but don't hold up the caller for long: give it a
+		 * moment to restore the routing and exit, otherwise the next source's thread (reap_helper() in
+		 * Run()) or the next spawn_helper() collects it. No detached reaper thread: it could outlive this
+		 * module's code at shutdown. */
+		for (int i = 0; i < 50; i++) {
+			{
+				std::lock_guard<std::mutex> lock(spawn_mutex);
+				reap_helper_locked();
+				if (helper_pid <= 0)
+					break;
+			}
+			snooze(10000);
+		}
 	}
 
 	delete da;

@@ -50,6 +50,7 @@ struct audio_monitor {
 	struct obs_haiku_sound_player *player;
 
 	pthread_mutex_t mutex;
+	bool mutex_initialized;
 	struct deque data;
 	audio_resampler_t *resampler;
 
@@ -177,6 +178,7 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 		blog(LOG_WARNING, "%s: Failed to init mutex", __FUNCTION__);
 		return false;
 	}
+	monitor->mutex_initialized = true;
 
 	const char *id = obs->audio.monitoring_device_id;
 	if (!id || !*id)
@@ -229,7 +231,10 @@ static void audio_monitor_free(struct audio_monitor *monitor)
 
 	audio_resampler_destroy(monitor->resampler);
 	deque_free(&monitor->data);
-	pthread_mutex_destroy(&monitor->mutex);
+	/* audio_monitor_init can fail before the mutex exists (also on the audio_monitor_reset path) */
+	if (monitor->mutex_initialized)
+		pthread_mutex_destroy(&monitor->mutex);
+	monitor->mutex_initialized = false;
 }
 
 static void audio_monitor_init_final(struct audio_monitor *monitor)

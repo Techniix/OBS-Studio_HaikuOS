@@ -13,31 +13,65 @@ shift || true
 
 # Submodules used on Haiku (libdshowcapture isn't needed; of obs-browser only the panel interface header is used)
 SUBMODULES=(deps/simde deps/asio deps/websocketpp deps/srt deps/librist plugins/obs-websocket plugins/obs-browser)
-missing=()
-for m in "${SUBMODULES[@]}"; do
-	[ -e "$SRC/$m/.git" ] || missing+=("$m")
-done
-if [ ${#missing[@]} -gt 0 ]; then
-	echo "==> Fetching submodules: ${missing[*]}"
-	git -C "$SRC" submodule update --init --recursive "${missing[@]}" || exit 1
+if [ -e "$SRC/.git" ]; then
+	# Always update: after a pull that moves a submodule pin, an existing checkout would otherwise stay on the old commit
+	echo "==> Updating submodules: ${SUBMODULES[*]}"
+	git -C "$SRC" submodule update --init --recursive "${SUBMODULES[@]}" || exit 1
+else
+	missing=()
+	for m in "${SUBMODULES[@]}"; do
+		[ -e "$SRC/$m/.git" ] || missing+=("$m")
+	done
+	[ ${#missing[@]} -gt 0 ] && echo "!! Not a git checkout, cannot fetch submodules: ${missing[*]}"
 fi
 
-# Turn off features whose dependencies are missing instead of failing the configure step.
+# Turn off features whose dependencies are missing instead of failing the configure step. Features whose
+# dependencies are present are turned on explicitly, so a feature switched off by an earlier run (the value stays
+# in the CMake cache) comes back once its dependency is installed.
 OPTS=()
+DISABLED=()
+HEADER_DIRS=(/boot/system/develop/headers /boot/system/non-packaged/develop/headers
+	/boot/home/config/non-packaged/develop/headers)
+# have_header <path relative to the headers directory, may contain glob patterns>
 have_header() {
-	for d in /boot/system/develop/headers /boot/system/non-packaged/develop/headers \
-		/boot/home/config/non-packaged/develop/headers; do
-		[ -e "$d/$1" ] && return 0
+	local d f
+	for d in "${HEADER_DIRS[@]}"; do
+		for f in "$d"/$1; do
+			[ -e "$f" ] && return 0
+		done
 	done
 	return 1
 }
-command -v swig >/dev/null 2>&1 || OPTS+=(-DENABLE_SCRIPTING=OFF)
-have_header speex/speex_preprocess.h || OPTS+=(-DENABLE_SPEEXDSP=OFF)
-have_header rnnoise.h || OPTS+=(-DENABLE_RNNOISE=OFF)
-have_header rtc/rtc.hpp || OPTS+=(-DENABLE_WEBRTC=OFF)
-have_header vlc/libvlc.h || OPTS+=(-DENABLE_VLC=OFF)
-have_header WebView.h || OPTS+=(-DENABLE_BROWSER=OFF)
-[ ${#OPTS[@]} -gt 0 ] && echo "==> Missing optional dependencies, adding: ${OPTS[*]}"
+# feature <option> <condition...>: -D<option>=ON if the condition succeeds, OFF otherwise
+feature() {
+	local opt="$1"
+	shift
+	if "$@"; then
+		OPTS+=("-D$opt=ON")
+	else
+		OPTS+=("-D$opt=OFF")
+		DISABLED+=("$opt")
+	fi
+}
+have_luajit() { have_header 'luajit*/luajit.h' || have_header luajit.h; }
+have_python() { command -v python3 >/dev/null 2>&1 && have_header 'python3*/Python.h'; }
+have_scripting() {
+	command -v swig >/dev/null 2>&1 || return 1
+	have_luajit || have_python
+}
+
+feature ENABLE_SCRIPTING have_scripting
+feature ENABLE_SCRIPTING_LUA have_luajit
+feature ENABLE_SCRIPTING_PYTHON have_python
+feature ENABLE_SPEEXDSP have_header speex/speex_preprocess.h
+# RNNoise needs no package: without rnnoise_devel the bundled copy (plugins/obs-filters/rnnoise) is used.
+# Passed explicitly to undo the OFF that older versions of this script stored in the cache.
+OPTS+=(-DENABLE_RNNOISE=ON)
+feature ENABLE_WEBRTC have_header rtc/rtc.hpp
+feature ENABLE_VLC have_header vlc/libvlc.h
+feature ENABLE_BROWSER have_header WebView.h
+feature ENABLE_LIBFDK have_header fdk-aac/aacenc_lib.h
+[ ${#DISABLED[@]} -gt 0 ] && echo "==> Missing optional dependencies, turning off: ${DISABLED[*]}"
 
 LOG="$BUILD/haiku-build.log"
 mkdir -p "$BUILD"

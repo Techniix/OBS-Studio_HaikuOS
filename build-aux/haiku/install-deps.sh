@@ -12,14 +12,15 @@ REQUIRED=(
 	mesa_devel mesa_swpipe
 	freetype_devel fontconfig_devel
 	nlohmann_json libdatachannel_devel
-	vlc_devel
-	haikuwebkit_devel
 )
 
-# Scripting (Lua/Python) and the noise suppression filters
+# Scripting (Lua/Python), the noise suppression filters, the VLC video source and the browser source/docks
+# (build.sh turns off whatever is missing)
 RECOMMENDED=(
 	luajit_devel swig python3.12
 	speexdsp_devel rnnoise_devel
+	vlc_devel
+	haikuwebkit_devel
 )
 
 # FDK AAC encoder (Asio, WebSocket++, qrcodegen, SRT and RIST are bundled in deps/)

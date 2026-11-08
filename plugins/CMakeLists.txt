@@ -25,6 +25,10 @@ macro(check_obs_browser)
   if(OS_HAIKU)
     # No CEF on Haiku: HaikuWebKit-based replacement that provides the same source id and panel interface
     add_subdirectory(haiku-browser)
+    # add_core_module() isn't used here, so register the module for libobs/obs-core-modules.c explicitly
+    if(TARGET obs-browser)
+      target_enable(obs-browser)
+    endif()
   elseif((OS_WINDOWS AND CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)") OR OS_MACOS OR OS_LINUX)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/obs-browser/CMakeLists.txt")
       message(FATAL_ERROR "Required submodule 'obs-browser' not available.")

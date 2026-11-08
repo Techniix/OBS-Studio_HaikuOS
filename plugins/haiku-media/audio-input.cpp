@@ -17,6 +17,7 @@
 
 /* Audio input capture (microphones, line in) through the Media Kit. */
 
+#include "audio-channels.hpp"
 #include "media-device.hpp"
 
 #include <util/platform.h>
@@ -40,31 +41,14 @@ struct AudioInput {
 	std::vector<uint8_t> convert_buffer;
 	std::atomic_bool warned_format = false;
 
+	/* channel map for the last (channel count, mask) seen; only touched by the recorder thread */
+	uint32_t map_channels = 0;
+	uint32_t map_mask = 0;
+	AudioChannelMap channel_map;
+
 	void Open();
 	void OnBuffer(const void *data, size_t size, const media_format &format);
 };
-
-speaker_layout speakers_for_channels(uint32_t channels)
-{
-	switch (channels) {
-	case 1:
-		return SPEAKERS_MONO;
-	case 2:
-		return SPEAKERS_STEREO;
-	case 3:
-		return SPEAKERS_2POINT1;
-	case 4:
-		return SPEAKERS_4POINT0;
-	case 5:
-		return SPEAKERS_4POINT1;
-	case 6:
-		return SPEAKERS_5POINT1;
-	case 8:
-		return SPEAKERS_7POINT1;
-	default:
-		return SPEAKERS_UNKNOWN;
-	}
-}
 
 void AudioInput::Open()
 {
@@ -85,9 +69,27 @@ void AudioInput::Open()
 
 void AudioInput::OnBuffer(const void *data, size_t size, const media_format &format)
 {
-	const media_raw_audio_format &raw = format.u.raw_audio;
+	const media_multi_audio_format &raw = format.u.raw_audio;
 	const uint32_t channels = raw.channel_count;
-	const speaker_layout speakers = speakers_for_channels(channels);
+	if (channels != map_channels || raw.channel_mask != map_mask || !channel_map.in_channels) {
+		/* Media Kit channel order is channel_mask bit order; build the map to OBS's layout once per format */
+		map_channels = channels;
+		map_mask = raw.channel_mask;
+		channel_map = channels >= 1 && channels <= 8 ? haiku_audio_channel_map(channels, raw.channel_mask)
+							     : AudioChannelMap();
+		channel_map.in_channels = channels;
+		if (channel_map.Valid() && !channel_map.identity)
+			blog(LOG_INFO,
+			     "[haiku-media] '%s': %u channels (mask 0x%x) are remapped to an OBS %u-channel "
+			     "layout",
+			     obs_source_get_name(source), channels, raw.channel_mask, channel_map.out_channels);
+		if (channel_map.dropped_mask)
+			blog(LOG_WARNING,
+			     "[haiku-media] '%s': channel mask 0x%x has channels OBS has no slot for (0x%x); "
+			     "they are dropped",
+			     obs_source_get_name(source), raw.channel_mask, channel_map.dropped_mask);
+	}
+	const speaker_layout speakers = channel_map.layout;
 	const size_t sample_size = raw.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
 
 	audio_format obs_format = AUDIO_FORMAT_UNKNOWN;
@@ -125,11 +127,18 @@ void AudioInput::OnBuffer(const void *data, size_t size, const media_format &for
 		return;
 
 	const uint8_t *samples = static_cast<const uint8_t *>(data);
+	const bool signed_8bit = raw.format == media_raw_audio_format::B_AUDIO_CHAR;
 
-	if (raw.format == media_raw_audio_format::B_AUDIO_CHAR) {
+	if (!channel_map.identity) {
+		/* Haiku channel order -> OBS layout, converting signed 8-bit on the way */
+		convert_buffer.resize((size_t)frames * channel_map.out_channels * sample_size);
+		haiku_repack_channels(samples, convert_buffer.data(), frames, sample_size, channel_map, signed_8bit);
+		samples = convert_buffer.data();
+	} else if (signed_8bit) {
 		/* signed 8-bit -> unsigned 8-bit */
-		convert_buffer.resize(size);
-		for (size_t i = 0; i < size; i++)
+		const size_t bytes = (size_t)frames * frame_size;
+		convert_buffer.resize(bytes);
+		for (size_t i = 0; i < bytes; i++)
 			convert_buffer[i] = samples[i] ^ 0x80;
 		samples = convert_buffer.data();
 	}

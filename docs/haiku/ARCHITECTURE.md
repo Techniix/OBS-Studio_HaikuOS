@@ -209,7 +209,8 @@ Haiku routes all application audio through the system mixer, so "Default" is the
   stays silent/black; re-saving the source properties retries.
 
 **Audio Input Capture** (`haiku_audio_input_capture`): float, 32-bit, 16-bit and 8-bit PCM, 1–8
-channels, host byte order. Buffers are timestamped on arrival.
+channels, host byte order. Channels are mapped to an OBS speaker layout from the stream's `channel_mask`
+(see Desktop Audio below). Buffers are timestamped on arrival.
 
 **Video Capture Device** (`haiku_video_input_capture`): `B_RGB32`, `B_RGBA32`, `B_RGB24` and `B_YCbCr422`
 (as YUY2, partial range). Haiku's `usb_webcam` add-on produces `B_RGB32`. "Deactivate when not showing"
@@ -234,32 +235,47 @@ after:   system mixer ──► TapNode ──► sound card
 **Helper process** `obs-haiku-audio-tap` (`plugins/haiku-media/audio-tap/`). It is a separate program so that a fault
 in the real-time media path cannot take OBS down, and so the original routing is restored even when OBS crashes:
 
-1. Creates the cloneable area (`audio-tap-shm.h`: header + 1 MiB ring). The area name doubles as a single-instance
-   lock.
+1. Takes a single-instance `flock()` on `/tmp/obs-haiku-audio-tap.lock` (waiting up to 5 s, so a helper started
+   while the previous one is still restoring the routing just runs after it), then creates the cloneable area
+   (`audio-tap-shm.h`: header + 4 MiB ring; the header carries a protocol version, so a reader rejects a helper
+   from another build). The mixer format, including its `channel_mask`, is published seqlock-style; positions and
+   serials are accessed with acquire/release atomics on both sides.
 2. Saves the mixer's connected output (`GetConnectedOutputsFor`), registers `TapNode`, slaves it to the mixer's
    time source, disconnects mixer → card, connects tap → card (with the format the mixer and card were already
-   using), then mixer → tap, and starts the node. On any failure the original connection is restored. The helper
+   using), then mixer → tap, and starts the node. On any failure the original connection is restored; this also
+   copes with a `Disconnect()` that reported an error after only one side let go (the link is checked from both
+   ends and re-made or left alone as needed). The helper
    keeps its reference to the mixer's time source object until the node is deleted: `SetTimeSourceFor()` only
    posts a message, and dropping the reference at once could let libmedia delete the object just as the node's
    control thread picked it up (a use-after-free in `BTimeSource::GetTime()`, seen on real hardware). The node's
    control thread is also stopped explicitly before its last reference is released.
 3. `TapNode` (`tap-node.cpp`, structured after Haiku's MIT-licensed Equalizer add-on) is a `BBufferConsumer` +
    `BBufferProducer` + `BMediaEventLooper`. Each buffer is `memcpy`'d into the ring and forwarded unchanged with
-   `SendBuffer`; `SetBufferGroup` passes the card's buffers upstream so the mixer writes straight into them. What
+   `SendBuffer` (no copy on the way to the card). If a downstream node offers its own buffers with
+   `SetOutputBuffersFor()`, `SetBufferGroup` passes them on to the mixer; Haiku's multi_audio output does not, so
+   in practice the mixer keeps its own buffers. The real-time path only uses the compile-time ring size and a
+   write counter kept in the node: readers map the area read-write, so nothing read back from it is trusted. What
    you hear is not modified.
-4. A watchdog quits when no reader has written a heartbeat for 10 s. Quitting, `SIGINT`/`SIGTERM`/`SIGHUP` and the
-   last OBS source going away all restore mixer → card. If the helper was killed with `SIGKILL`, the next start (or
-   `obs-haiku-audio-tap --repair`) reconnects the mixer's free output to the card's free input.
+4. A watchdog quits when no reader has written a heartbeat for 10 s, or when the mixer is no longer connected to
+   the tap (rerouted in Media preferences or Cortex); the helper also quits when the media services quit, which
+   is also how a new default audio output takes effect (the Media Kit never sends `B_MEDIA_DEFAULT_CHANGED`).
+   Quitting, `SIGINT`/`SIGTERM`/`SIGHUP` and the last OBS source going away all restore mixer → card. If the
+   helper was killed with `SIGKILL`, the next start (or `obs-haiku-audio-tap --repair`, which does nothing while
+   a helper holds the lock) reconnects the mixer's free output to the card's free input.
 
 **OBS source** "Desktop Audio (Media Kit)" (`plugins/haiku-media/desktop-audio.cpp`). A reader thread finds the area
 (starting the helper with `posix_spawn` if needed), clones it, and every 10 ms converts new ring data to
-`obs_source_audio` in the mixer's format (float/int/short/8-bit, 1–8 channels). It detaches and reconnects if the
-helper exits or dies, skips ahead if it falls more than half a ring behind, and stops the helper when the last
-desktop audio source is destroyed. The source has `OBS_SOURCE_DO_NOT_SELF_MONITOR`: monitoring plays into the very
+`obs_source_audio` in the mixer's format (float/int/short/8-bit, 1–8 channels). The format is cached when its
+serial changes and validated before use. Haiku interleaves channels in `channel_mask` bit order, which matches
+OBS for the usual 1, 2, 6 and 8 channels; other layouts (e.g. the mixer's 3 = L R C, 4 = L R RL RR,
+5 = L R C RL RR) are repacked into the smallest OBS layout that has a slot for each channel, with silence in the
+rest (`audio-channels.hpp`, also used by Audio Input Capture). It detaches and reconnects if the helper exits or
+dies, skips ahead if it falls more than half a ring behind (the most the helper can be copying unpublished), and
+stops and reaps the helper when the last desktop audio source is destroyed. The source has `OBS_SOURCE_DO_NOT_SELF_MONITOR`: monitoring plays into the very
 mixer the tap captures, so monitoring Desktop Audio would feed back into itself.
 
 Helpers are marked as background apps (`B_BACKGROUND_APP` via `BAppFileInfo`, set on first use) so they don't show
-in the Deskbar.
+in the Deskbar, with `B_MULTIPLE_LAUNCH`: the helper's own lock, not the registrar, keeps it single-instance.
 
 ## 9. haiku-capture: screen and window capture
 

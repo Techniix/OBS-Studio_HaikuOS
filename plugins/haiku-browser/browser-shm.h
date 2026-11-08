@@ -68,7 +68,7 @@ struct obs_browser_shm {
 	volatile int64_t client_heartbeat; /* system_time() written by OBS */
 	volatile int64_t helper_heartbeat; /* system_time() written by the helper */
 	volatile int32_t helper_state;     /* obs_browser_helper_state */
-	volatile int32_t helper_team;
+	volatile int32_t helper_team;      /* 0 in a new area until the helper has attached to it */
 
 	/* page information for docks (titleChanged/urlChanged); info_serial changes after an update */
 	volatile int32_t info_serial;

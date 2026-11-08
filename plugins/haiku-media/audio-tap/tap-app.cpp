@@ -30,7 +30,13 @@
  *
  *   obs-haiku-audio-tap            insert the tap and serve OBS until no client is left
  *   obs-haiku-audio-tap --repair   reconnect mixer -> sound card if a previous run was killed (-9)
- *                                  and left them disconnected, then exit
+ *                                  and left them disconnected, then exit; does nothing while another
+ *                                  helper is running (that one owns the routing)
+ *
+ * Only one helper may own the tap. The app is launched with B_MULTIPLE_LAUNCH (so a helper started while the
+ * previous one is still restoring the routing is not turned away by the registrar); instead every instance
+ * takes an flock() on OBS_TAP_LOCK_PATH, which the kernel releases when the process dies however it dies.
+ * A starting helper waits a few seconds for the lock, so it simply runs once the previous one is done.
  */
 
 #include "audio-tap-shm.h"
@@ -42,12 +48,18 @@
 #include <OS.h>
 #include <TimeSource.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #define TAP_SIGNATURE "application/x-vnd.obs-studio-audio-tap"
+#define OBS_TAP_LOCK_PATH "/tmp/obs-haiku-audio-tap.lock"
+/* how long a starting helper waits for a previous one to finish restoring the routing */
+#define LOCK_WAIT_US 5000000
 
 enum {
 	MSG_WATCHDOG = 'wdog',
@@ -96,6 +108,55 @@ static status_t connect_mixer_to_output(BMediaRoster *roster, const media_node &
 	return err;
 }
 
+/* Takes the single-instance lock, waiting up to `wait` µs for its holder to exit. Returns the locked fd,
+ * -1 if another helper holds it, or -2 if no lock file could be used (then only the area check applies). */
+static int acquire_instance_lock(bigtime_t wait)
+{
+	int fd = open(OBS_TAP_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		fprintf(stderr, "obs-haiku-audio-tap: cannot open %s: %s\n", OBS_TAP_LOCK_PATH, strerror(errno));
+		return -2;
+	}
+	const bigtime_t deadline = system_time() + wait;
+	for (;;) {
+		if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+			return fd;
+		if (errno != EWOULDBLOCK && errno != EINTR) {
+			fprintf(stderr, "obs-haiku-audio-tap: cannot lock %s: %s\n", OBS_TAP_LOCK_PATH,
+				strerror(errno));
+			close(fd);
+			return -2;
+		}
+		if (system_time() >= deadline) {
+			close(fd);
+			return -1;
+		}
+		snooze(50000);
+	}
+}
+
+/* How each end of the link source -> destination sees it. A failed or half-done Disconnect() can leave one
+ * side connected and the other free. */
+static void link_state(BMediaRoster *roster, const media_node &src_node, const media_source &src,
+		       const media_node &dst_node, const media_destination &dst, bool *src_side, bool *dst_side)
+{
+	*src_side = *dst_side = false;
+
+	media_output outputs[8];
+	int32 count = 0;
+	if (roster->GetConnectedOutputsFor(src_node, outputs, 8, &count) == B_OK)
+		for (int32 i = 0; i < count; i++)
+			if (outputs[i].source == src && outputs[i].destination == dst)
+				*src_side = true;
+
+	media_input inputs[8];
+	count = 0;
+	if (roster->GetConnectedInputsFor(dst_node, inputs, 8, &count) == B_OK)
+		for (int32 i = 0; i < count; i++)
+			if (inputs[i].destination == dst && inputs[i].source == src)
+				*dst_side = true;
+}
+
 static bool port_is_dead(port_id port)
 {
 	port_info info;
@@ -138,7 +199,16 @@ public:
 	void ReadyToRun() override
 	{
 		if (repair_only) {
-			Repair();
+			/* Repair() only frees endpoints left connected to dead ports and joins free ones, so it can't
+			 * break a live tap's links, but it could race a helper that is between disconnecting mixer ->
+			 * card and connecting the tap. A running helper repairs on its own start anyway. */
+			lock_fd = acquire_instance_lock(0);
+			if (lock_fd == -1 || find_area(OBS_TAP_AREA_NAME) >= 0)
+				fprintf(stderr,
+					"obs-haiku-audio-tap: a desktop audio tap is running; nothing to repair\n");
+			else
+				Repair();
+			ReleaseLock();
 			exit_code = 0;
 			PostMessage(B_QUIT_REQUESTED);
 			return;
@@ -153,8 +223,13 @@ public:
 			return;
 		}
 
-		/* media services restarting or the default output changing invalidate the routing we inserted
-		 * into; quit (OBS starts a new helper, which inserts the tap into the new routing) */
+		/* Media services restarting invalidates the routing we inserted into; quit (OBS starts a new helper,
+		 * which inserts the tap into the new routing). A new default audio output only takes effect when
+		 * Media preferences restarts the media services, which B_MEDIA_SERVER_QUIT covers; any other
+		 * rerouting of the mixer output disconnects our input, which the watchdog notices
+		 * (InputConnected()). B_MEDIA_DEFAULT_CHANGED is accepted by StartWatching() but the Media Kit never
+		 * sends it (Notifications.cpp: "TODO: missing: B_MEDIA_DEFAULT_CHANGED"); we watch it only in case a
+		 * future Haiku does. */
 		roster->StartWatching(BMessenger(this), B_MEDIA_SERVER_QUIT);
 		roster->StartWatching(BMessenger(this), B_MEDIA_DEFAULT_CHANGED);
 
@@ -171,7 +246,8 @@ public:
 				PostMessage(B_QUIT_REQUESTED);
 				return;
 			}
-			if (system_time() - shm->client_heartbeat > OBS_TAP_CLIENT_TIMEOUT) {
+			if (system_time() - __atomic_load_n(&shm->client_heartbeat, __ATOMIC_ACQUIRE) >
+			    OBS_TAP_CLIENT_TIMEOUT) {
 				fprintf(stderr, "obs-haiku-audio-tap: no client, exiting\n");
 				PostMessage(B_QUIT_REQUESTED);
 			} else if (tap && !tap->InputConnected()) {
@@ -188,6 +264,7 @@ public:
 			return;
 		}
 		if (msg->what == B_MEDIA_DEFAULT_CHANGED) {
+			/* not sent by current Haiku (see ReadyToRun()) */
 			fprintf(stderr, "obs-haiku-audio-tap: default audio output changed, exiting\n");
 			PostMessage(B_QUIT_REQUESTED);
 			return;
@@ -213,7 +290,11 @@ private:
 		if (!roster)
 			return err;
 
-		/* single instance: the area name is the lock */
+		/* single instance: the flock() is the lock (atomic, released on any exit); the area name check
+		 * also turns away a helper from an older build that predates the lock */
+		lock_fd = acquire_instance_lock(LOCK_WAIT_US);
+		if (lock_fd == -1)
+			return B_BUSY;
 		if (find_area(OBS_TAP_AREA_NAME) >= 0)
 			return B_BUSY;
 
@@ -225,11 +306,13 @@ private:
 
 		shm = (obs_tap_shm *)addr;
 		memset(shm, 0, sizeof(*shm));
-		shm->magic = OBS_TAP_MAGIC;
 		shm->version = OBS_TAP_VERSION;
 		shm->ring_size = OBS_TAP_RING_SIZE;
 		shm->helper_team = (int32_t)getpid();
-		shm->client_heartbeat = system_time(); /* grace period for the client to attach */
+		/* grace period for the client to attach */
+		__atomic_store_n(&shm->client_heartbeat, (int64_t)system_time(), __ATOMIC_RELAXED);
+		/* last, with release: a reader that sees the magic sees the rest of the header */
+		__atomic_store_n(&shm->magic, OBS_TAP_MAGIC, __ATOMIC_RELEASE);
 
 		if ((err = roster->GetAudioMixer(&mixer)) != B_OK)
 			return err;
@@ -270,11 +353,13 @@ private:
 		if (clock)
 			roster->SetTimeSourceFor(tap->Node().node, clock->ID());
 
-		/* from here on the original connection is broken until Remove() or the reconnect below */
-		if ((err = roster->Disconnect(mixer.node, orig_out.source, orig_dest_node, orig_out.destination)) !=
-		    B_OK)
-			return err;
+		/* From here on the original connection is broken until Remove() or the reconnect below. Disconnect()
+		 * returns an error if either end refused, even when the other end did disconnect, so mark the link
+		 * as touched first: Remove() then checks what state it is really in and restores it. */
+		err = roster->Disconnect(mixer.node, orig_out.source, orig_dest_node, orig_out.destination);
 		disconnected = true;
+		if (err != B_OK)
+			return err;
 
 		media_input tap_in;
 		count = 0;
@@ -308,16 +393,18 @@ private:
 		if (err != B_OK)
 			return err;
 
-		shm->helper_alive = 1;
+		__atomic_store_n(&shm->helper_alive, 1, __ATOMIC_RELEASE);
 		return B_OK;
 	}
 
 	void Remove()
 	{
 		if (shm)
-			shm->helper_alive = 0;
-		if (!roster)
+			__atomic_store_n(&shm->helper_alive, 0, __ATOMIC_RELEASE);
+		if (!roster) {
+			ReleaseLock();
 			return;
+		}
 
 		if (media_server_gone) {
 			/* nothing to restore: the nodes are gone with the server; just drop our references */
@@ -333,6 +420,7 @@ private:
 				area = -1;
 				shm = nullptr;
 			}
+			ReleaseLock();
 			return;
 		}
 
@@ -347,14 +435,7 @@ private:
 		}
 
 		if (disconnected) {
-			media_format fmt = orig_format;
-			media_output o;
-			media_input i;
-			status_t err = roster->Connect(orig_out.source, orig_out.destination, &fmt, &o, &i);
-			if (err != B_OK) {
-				log_status("restoring the original mixer connection failed, retrying", err);
-				Repair();
-			}
+			RestoreOriginalLink();
 			disconnected = false;
 		}
 
@@ -378,6 +459,46 @@ private:
 			area = -1;
 			shm = nullptr;
 		}
+		/* last: a helper waiting for the lock starts once the routing is back to normal */
+		ReleaseLock();
+	}
+
+	/* Reconnects mixer -> original destination. Copes with a Disconnect() in Insert() that failed: the link
+	 * may still be fully up (nothing to do), half up (clear the stale side first) or down. */
+	void RestoreOriginalLink()
+	{
+		media_node dest;
+		bool src_side = false, dst_side = false;
+		const bool have_dest = roster->GetNodeFor(orig_dest_node, &dest) == B_OK;
+		if (have_dest)
+			link_state(roster, mixer, orig_out.source, dest, orig_out.destination, &src_side, &dst_side);
+
+		if (src_side && dst_side) {
+			fprintf(stderr, "obs-haiku-audio-tap: original mixer connection is still up\n");
+		} else {
+			if (src_side || dst_side) {
+				fprintf(stderr, "obs-haiku-audio-tap: clearing a half-disconnected mixer connection\n");
+				roster->Disconnect(mixer.node, orig_out.source, orig_dest_node, orig_out.destination);
+			}
+			media_format fmt = orig_format;
+			media_output o;
+			media_input i;
+			status_t err = roster->Connect(orig_out.source, orig_out.destination, &fmt, &o, &i);
+			if (err != B_OK) {
+				log_status("restoring the original mixer connection failed, retrying", err);
+				Repair();
+			}
+		}
+		if (have_dest)
+			roster->ReleaseNode(dest);
+	}
+
+	void ReleaseLock()
+	{
+		if (lock_fd >= 0) {
+			close(lock_fd); /* drops the flock */
+			lock_fd = -1;
+		}
 	}
 
 	void ReleaseClock()
@@ -397,8 +518,13 @@ private:
 			return;
 		}
 		media_node m, c;
-		if (r->GetAudioMixer(&m) != B_OK || r->GetAudioOutput(&c) != B_OK) {
-			fprintf(stderr, "obs-haiku-audio-tap: no system mixer or audio output\n");
+		if (r->GetAudioMixer(&m) != B_OK) {
+			fprintf(stderr, "obs-haiku-audio-tap: no system mixer\n");
+			return;
+		}
+		if (r->GetAudioOutput(&c) != B_OK) {
+			fprintf(stderr, "obs-haiku-audio-tap: no audio output\n");
+			r->ReleaseNode(m);
 			return;
 		}
 		break_dead_links(r, m, c);
@@ -416,6 +542,7 @@ private:
 	int exit_code = 0;
 	BMediaRoster *roster = nullptr;
 	BMessageRunner *watchdog = nullptr;
+	int lock_fd = -1;
 
 	area_id area = -1;
 	obs_tap_shm *shm = nullptr;

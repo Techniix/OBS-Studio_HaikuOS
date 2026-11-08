@@ -10,8 +10,11 @@
 #include <QWindow>
 #ifdef __HAIKU__
 #include <QPainter>
+#include <QRegion>
 
+#include <cstddef>
 #include <cstring>
+#include <utility>
 #endif
 #ifdef ENABLE_WAYLAND
 #include <QApplication>
@@ -75,30 +78,43 @@ static bool QTToGSWindow(QWindow *window, gs_window &gswindow)
 OBSQTDisplay::OBSQTDisplay(QWidget *parent, Qt::WindowFlags flags) : QWidget(parent, flags)
 {
 	/* On Haiku every native QWindow is a separate BWindow, so embedded displays stay alien widgets
-	 * and paint the frames libobs hands back. Top-level displays (projectors) still get a QWindow so
-	 * windowHandle() is valid for callers. */
+	 * and paint the frames libobs hands back. Displays explicitly created as windows (projectors pass
+	 * Qt::Window) get a QWindow right away so windowHandle() is valid in their constructor. This is
+	 * decided from the requested flags, not isWindow(): a display constructed without a parent (the
+	 * Studio Mode program view) is a window only until it is put into a layout, and WA_NativeWindow
+	 * would stick and make it a native child QWindow. */
 	setAttribute(Qt::WA_StaticContents);
 	setAttribute(Qt::WA_NoSystemBackground);
 	setAttribute(Qt::WA_OpaquePaintEvent);
-	if (isWindow())
+	if (flags & Qt::Window)
 		setAttribute(Qt::WA_NativeWindow);
 }
 
-void OBSQTDisplay::HaikuPresent(void *param, const uint8_t *bgra, uint32_t width, uint32_t height,
-				uint32_t linesize)
+void OBSQTDisplay::HaikuPresent(void *param, const uint8_t *top_row, uint32_t width, uint32_t height,
+				int32_t stride)
 {
 	OBSQTDisplay *self = static_cast<OBSQTDisplay *>(param);
+	QImage &back = self->backFrame;
+
+	/* Reallocate only on size changes. bits() detaches (copies) only in the rare case that the UI
+	 * thread is still painting this buffer from before the last swap. */
+	if (back.width() != (int)width || back.height() != (int)height)
+		back = QImage((int)width, (int)height, QImage::Format_RGB32);
+	uchar *dst = back.bits();
+	if (!dst)
+		return;
+
+	/* gl-haiku.c passes its bottom-up readback with top_row pointing at the top row and a negative
+	 * stride, so this copy also flips the image. BGRA bytes == QImage::Format_RGB32 on little-endian. */
+	const ptrdiff_t src_stride = stride;
+	const ptrdiff_t dst_stride = back.bytesPerLine();
+	const size_t row = (size_t)width * 4;
+	for (uint32_t y = 0; y < height; y++)
+		memcpy(dst + (ptrdiff_t)y * dst_stride, top_row + (ptrdiff_t)y * src_stride, row);
 
 	{
 		std::lock_guard<std::mutex> lock(self->frameMutex);
-
-		if (self->frame.width() != (int)width || self->frame.height() != (int)height)
-			self->frame = QImage((int)width, (int)height, QImage::Format_RGB32);
-
-		/* BGRA bytes == QImage::Format_RGB32 on little-endian */
-		const size_t row = (size_t)width * 4;
-		for (uint32_t y = 0; y < height; y++)
-			memcpy(self->frame.scanLine((int)y), bgra + (size_t)y * linesize, row);
+		std::swap(self->frontFrame, self->backFrame);
 	}
 
 	/* Called on the graphics thread: coalesce repaints onto the UI thread. */
@@ -129,6 +145,14 @@ void OBSQTDisplay::hideEvent(QHideEvent *event)
 {
 	QWidget::hideEvent(event);
 	display = nullptr;
+
+	/* Destroying the display waits for the graphics thread to finish with it, so no present is in
+	 * flight now. Drop the stale frame so a later show starts from the background colour. */
+	{
+		std::lock_guard<std::mutex> lock(frameMutex);
+		frontFrame = QImage();
+	}
+	backFrame = QImage();
 }
 #else
 OBSQTDisplay::OBSQTDisplay(QWidget *parent, Qt::WindowFlags flags) : QWidget(parent, flags)
@@ -239,16 +263,30 @@ void OBSQTDisplay::paintEvent(QPaintEvent *event)
 #ifdef __HAIKU__
 	UNUSED_PARAMETER(event);
 
-	QPainter painter(this);
-	std::lock_guard<std::mutex> lock(frameMutex);
+	QImage image;
+	{
+		/* shallow copy; the graphics thread swaps buffers rather than writing into this one */
+		std::lock_guard<std::mutex> lock(frameMutex);
+		image = frontFrame;
+	}
 
-	if (frame.isNull()) {
-		painter.fillRect(rect(), GetDisplayBackgroundColor());
+	QPainter painter(this);
+	const QColor background = GetDisplayBackgroundColor();
+
+	if (image.isNull()) {
+		painter.fillRect(rect(), background);
 		return;
 	}
 
-	frame.setDevicePixelRatio(devicePixelRatioF());
-	painter.drawImage(QPoint(0, 0), frame);
+	/* The frame has the widget's size in device pixels as of the last present; after growing (until
+	 * the next frame arrives) the rest would show garbage with WA_OpaquePaintEvent, so fill it. */
+	const qreal dpr = devicePixelRatioF();
+	const QRectF target(0.0, 0.0, image.width() / dpr, image.height() / dpr);
+	painter.drawImage(target, image);
+
+	const QRegion uncovered = QRegion(rect()).subtracted(QRegion(target.toAlignedRect()));
+	for (const QRect &r : uncovered)
+		painter.fillRect(r, background);
 #else
 	QWidget::paintEvent(event);
 #endif

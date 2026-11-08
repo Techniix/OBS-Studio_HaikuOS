@@ -51,6 +51,10 @@
 #define S_SHUTDOWN "shutdown"
 #define S_RESTART_ACTIVE "restart_when_active"
 #define S_REROUTE_AUDIO "reroute_audio"
+#define S_CONTROL_LEVEL "webpage_control_level"
+
+/* obs-browser's ControlLevel::ReadObs, its default; the level window.obsstudio reports on Haiku */
+#define CONTROL_LEVEL_READ_OBS 1
 
 /* the obs-browser default */
 #define DEFAULT_CSS "body { background-color: rgba(0, 0, 0, 0); margin: 0px auto; overflow: hidden; }"
@@ -61,8 +65,8 @@ struct BrowserSource {
 	obs_source_t *source = nullptr;
 	std::unique_ptr<HaikuBrowserClient> client;
 	HaikuBrowserConfig config;
-	bool shutdown_when_hidden = false;
-	bool restart_when_active = false;
+	std::atomic_bool shutdown_when_hidden{false};
+	std::atomic_bool restart_when_active{false};
 	std::atomic_bool showing{false};
 
 	std::thread thread;
@@ -97,6 +101,8 @@ void BrowserSource::Run()
 	while (!stop) {
 		client->Poll();
 
+		/* false unless the helper published a new frame (frame_count changed): OBS keeps showing the last
+		 * one, so a page that did not repaint costs no copy and no upload */
 		if (client->ReadFrame(frame)) {
 			struct obs_source_frame out = {};
 			out.data[0] = frame.pixels.data();
@@ -147,14 +153,22 @@ void browser_update(void *data, obs_data_t *settings)
 	cfg.css = obs_data_get_string(settings, S_CSS);
 	cfg.transparent = true;
 
+	const bool was_shutdown = bs->shutdown_when_hidden;
 	bs->shutdown_when_hidden = obs_data_get_bool(settings, S_SHUTDOWN);
 	bs->restart_when_active = obs_data_get_bool(settings, S_RESTART_ACTIVE);
 	bs->fps = cfg.fps;
 	bs->config = cfg;
 
-	if (bs->shutdown_when_hidden && !bs->showing)
-		return; /* configured when it is shown */
+	if (bs->shutdown_when_hidden && !bs->showing) {
+		/* also when the option was just turned on for a hidden source; configured when it is shown */
+		bs->client->Stop();
+		if (!was_shutdown)
+			obs_source_output_video(bs->source, nullptr);
+		return;
+	}
 
+	/* no-op unless it was stopped, e.g. shut down while hidden before the option was turned off */
+	bs->client->Start();
 	bs->client->Configure(cfg);
 }
 
@@ -310,6 +324,19 @@ obs_properties_t *browser_properties(void *data)
 	obs_properties_add_bool(props, S_SHUTDOWN, T_("ShutdownSourceNotVisible"));
 	obs_properties_add_bool(props, S_RESTART_ACTIVE, T_("RefreshBrowserActive"));
 
+	/* Page permissions need the obs-browser JavaScript bridge to the frontend, which the Haiku helper does not
+	 * have: shown disabled so the saved value is kept for other platforms. */
+	p = obs_properties_add_list(props, S_CONTROL_LEVEL, T_("WebpageControlLevel"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.None"), 0);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.ReadObs"), CONTROL_LEVEL_READ_OBS);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.ReadUser"), 2);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.Basic"), 3);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.Advanced"), 4);
+	obs_property_list_add_int(p, T_("WebpageControlLevel.Level.All"), 5);
+	obs_property_set_enabled(p, false);
+	obs_property_set_long_description(p, T_("WebpageControlLevel.Haiku"));
+
 	p = obs_properties_add_bool(props, S_REROUTE_AUDIO, T_("RerouteAudio"));
 	obs_property_set_enabled(p, false);
 	obs_property_set_long_description(p, T_("RerouteAudio.Haiku"));
@@ -327,6 +354,7 @@ void browser_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_FPS_CUSTOM, false);
 	obs_data_set_default_bool(settings, S_SHUTDOWN, false);
 	obs_data_set_default_bool(settings, S_RESTART_ACTIVE, false);
+	obs_data_set_default_int(settings, S_CONTROL_LEVEL, CONTROL_LEVEL_READ_OBS);
 	obs_data_set_default_bool(settings, S_REROUTE_AUDIO, false);
 	obs_data_set_default_string(settings, S_CSS, DEFAULT_CSS);
 }

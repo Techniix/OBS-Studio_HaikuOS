@@ -3,6 +3,9 @@
 # The sources are copied into the build tree and small, verified text patches are applied to the copies.
 # Each patch must match exactly; if an updated submodule no longer contains the expected text, configuring
 # fails loudly instead of silently building unpatched code.
+#
+# The copying happens at configure time, so every source file read is added to CMAKE_CONFIGURE_DEPENDS of the
+# calling directory: changing a bundled source (e.g. a submodule update) re-runs configure and refreshes the copy.
 
 include_guard(GLOBAL)
 
@@ -16,12 +19,17 @@ function(haiku_copy_tree src dst)
   endforeach()
   file(MAKE_DIRECTORY "${dst}")
   file(COPY "${src}/" DESTINATION "${dst}" PATTERN ".git" EXCLUDE ${_args})
+
+  file(GLOB_RECURSE _files LIST_DIRECTORIES FALSE "${src}/*")
+  list(FILTER _files EXCLUDE REGEX "/\\.git(/|$)")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_files})
 endfunction()
 
 # haiku_patch_file(<src_file> <dst_file> <old_1> <new_1> [<old_2> <new_2> ...])
 # Writes <dst_file> as <src_file> with each <old> replaced by <new>. The file is only rewritten when its
 # content changes, so builds stay incremental.
 function(haiku_patch_file src dst)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${src}")
   file(READ "${src}" _content)
   # Use ARGV<n> rather than ARGN: patch text may contain semicolons, which list handling would split.
   math(EXPR _last "${ARGC} - 1")

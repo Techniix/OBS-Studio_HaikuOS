@@ -42,22 +42,25 @@ set(OBS_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
 # Enable find_package targets to become globally available targets
 set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL TRUE)
 
-# Header-only dependencies bundled as submodules (deps/*), used unless the cache variable is set explicitly:
+# Header-only dependencies bundled as submodules (deps/*), used unless the cache variable is set
+# explicitly (an empty or <var>-NOTFOUND value left by a configure run before the submodules were fetched is
+# replaced, hence FORCE):
 # - SIMDe isn't packaged in HaikuPorts.
 # - obs-websocket needs WebSocket++ 0.8.2 with an Asio that still has io_service (removed in Asio 1.33);
 #   HaikuPorts ships Asio 1.38, so a matching pair (Asio 1.30.2 + WebSocket++ 0.8.2) is bundled.
 # qrcodegencpp (also needed by obs-websocket) is handled by cmake/haiku/finders/Findqrcodegencpp.cmake.
-if(NOT DEFINED SIMDe_INCLUDE_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/deps/simde/simde/simde-common.h")
-  set(SIMDe_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/simde" CACHE PATH "Directory containing simde/simde-common.h")
+if((NOT DEFINED SIMDe_INCLUDE_DIR OR NOT SIMDe_INCLUDE_DIR) AND EXISTS "${CMAKE_SOURCE_DIR}/deps/simde/simde/simde-common.h")
+  set(SIMDe_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/simde" CACHE PATH "Directory containing simde/simde-common.h" FORCE)
 endif()
-if(NOT DEFINED Asio_INCLUDE_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/deps/asio/asio/include/asio.hpp")
-  set(Asio_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/asio/asio/include" CACHE PATH "Directory containing asio.hpp")
+if((NOT DEFINED Asio_INCLUDE_DIR OR NOT Asio_INCLUDE_DIR) AND EXISTS "${CMAKE_SOURCE_DIR}/deps/asio/asio/include/asio.hpp")
+  set(Asio_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/asio/asio/include" CACHE PATH "Directory containing asio.hpp" FORCE)
 endif()
-if(NOT DEFINED Websocketpp_INCLUDE_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/deps/websocketpp/websocketpp/client.hpp")
+if((NOT DEFINED Websocketpp_INCLUDE_DIR OR NOT Websocketpp_INCLUDE_DIR) AND EXISTS "${CMAKE_SOURCE_DIR}/deps/websocketpp/websocketpp/client.hpp")
   set(
     Websocketpp_INCLUDE_DIR
     "${CMAKE_SOURCE_DIR}/deps/websocketpp"
     CACHE PATH
     "Directory containing websocketpp/client.hpp"
+    FORCE
   )
 endif()

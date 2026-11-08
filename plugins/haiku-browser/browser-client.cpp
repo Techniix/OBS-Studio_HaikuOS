@@ -131,16 +131,30 @@ bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
 	mapped->client_heartbeat = system_time();
 
 	if (shm && helper > 0 && HelperAlive()) {
-		/* the running (or starting) helper still uses the current area: keep it until it has switched */
-		RetireArea();
+		/* The running (or starting) helper keeps using its area until it has switched. Seed the new header
+		 * with its state and a heartbeat so that nothing reading it before the switch sees a dead helper;
+		 * helper_team stays 0 until the helper has attached (that is how the switch is confirmed). */
+		const obs_browser_shm *state = HelperShm();
+		mapped->helper_state = state->helper_state;
+		mapped->helper_heartbeat = system_time();
+		if (attach_pending) {
+			/* the current area was never handed to the helper: replace it, keep the one it uses */
+			delete_area(area);
+			area = -1;
+			shm = nullptr;
+		} else {
+			RetireArea();
+		}
 		area = id;
 		shm = mapped;
+		area_fresh = false;
 		attach_pending = true;
 		TrySendAttach();
 	} else {
 		DestroyArea();
 		area = id;
 		shm = mapped;
+		area_fresh = true;
 	}
 
 	area_width = width;
@@ -149,9 +163,10 @@ bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
 	return true;
 }
 
+/* Only called while no switch is in flight (see AttachInFlight()), so there is no older retired area that the
+ * helper might still be using. */
 void HaikuBrowserClient::RetireArea()
 {
-	/* only one switch can be in flight; an older retired area is no longer used by anyone */
 	if (retired_area >= 0)
 		delete_area(retired_area);
 	retired_area = area;
@@ -168,19 +183,25 @@ bool HaikuBrowserClient::TrySendAttach()
 	msg.AddInt32("area", area);
 	if (!SendLocked(msg))
 		return false;
-	/* the helper clones the new area when it handles the message; its clone of the old one keeps that
-	 * memory alive until then, so our handle can go now */
+	/* the retired area stays the helper's until it confirms the switch in the new header (Poll()) */
 	attach_pending = false;
-	if (retired_area >= 0)
-		delete_area(retired_area);
-	retired_area = -1;
-	retired_shm = nullptr;
+	attach_sent = system_time();
 	return true;
+}
+
+bool HaikuBrowserClient::AttachInFlight() const
+{
+	return retired_shm && !attach_pending;
+}
+
+bool HaikuBrowserClient::NeedsBiggerArea() const
+{
+	return !shm || (uint32_t)config.width > area_width || (uint32_t)config.height > area_height;
 }
 
 obs_browser_shm *HaikuBrowserClient::HelperShm() const
 {
-	return (attach_pending && retired_shm) ? retired_shm : shm;
+	return retired_shm ? retired_shm : shm;
 }
 
 void HaikuBrowserClient::DestroyArea()
@@ -192,6 +213,8 @@ void HaikuBrowserClient::DestroyArea()
 	area = retired_area = -1;
 	shm = retired_shm = nullptr;
 	attach_pending = false;
+	resize_deferred = false;
+	area_fresh = false;
 	area_width = area_height = 0;
 }
 
@@ -204,13 +227,24 @@ bool HaikuBrowserClient::SpawnHelper()
 {
 	const std::string path = helper_path();
 	if (access(path.c_str(), X_OK) != 0) {
-		BLOG(LOG_ERROR, "helper %s is missing; browser sources cannot render", path.c_str());
+		if (!spawn_failing)
+			BLOG(LOG_ERROR, "helper %s is missing; browser sources cannot render", path.c_str());
+		spawn_failing = true;
+		ScheduleRestart(system_time());
 		return false;
 	}
 	mark_background_app(path);
 
-	/* A new helper always starts on a single, current area with clean state. A previous helper may have died
-	 * mid-frame (odd seq) or left READY and an old heartbeat behind. */
+	/* A new helper always starts on an area no earlier helper was given: one that was just stopped (or
+	 * killed after a stall) can keep running for a moment, and two writers would break the sequence lock.
+	 * Dropping our handles to the old areas is safe; a helper still running keeps its own clone. */
+	if (!area_fresh &&
+	    !CreateArea(std::max<uint32_t>(config.width, area_width), std::max<uint32_t>(config.height, area_height))) {
+		ScheduleRestart(system_time());
+		return false;
+	}
+
+	/* ...with clean state and a single area */
 	if (retired_area >= 0) {
 		delete_area(retired_area);
 		retired_area = -1;
@@ -238,16 +272,28 @@ bool HaikuBrowserClient::SpawnHelper()
 	pid_t pid = -1;
 	const int err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
 	if (err != 0) {
-		BLOG(LOG_ERROR, "could not start %s: %s", path.c_str(), strerror(err));
+		if (!spawn_failing)
+			BLOG(LOG_ERROR, "could not start %s: %s", path.c_str(), strerror(err));
+		spawn_failing = true;
+		ScheduleRestart(system_time());
 		return false;
 	}
 
+	spawn_failing = false;
+	area_fresh = false;
 	helper = pid;
 	helper_started = system_time();
 	ready = false;
 	config_dirty = true;
 	BLOG(LOG_INFO, "started browser helper (team %d)", (int)pid);
 	return true;
+}
+
+void HaikuBrowserClient::ScheduleRestart(bigtime_t now)
+{
+	const bigtime_t backoff = std::min<bigtime_t>(500000LL << std::min(restarts, 5), 10000000LL);
+	next_restart = now + backoff;
+	restarts++;
 }
 
 /* Never blocks the caller (often the UI or graphics thread): asks the helper to quit and leaves waiting for
@@ -296,6 +342,8 @@ bool HaikuBrowserClient::SendLocked(BMessage &message)
 
 void HaikuBrowserClient::SendConfigLocked()
 {
+	if (resize_deferred)
+		return; /* the new size is sent once the area that fits it exists */
 	if (attach_pending && !TrySendAttach())
 		return; /* the helper must be on the new area before it is told the new size */
 
@@ -326,8 +374,14 @@ void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
 	config.fps = std::clamp(config.fps, 1, 120);
 	config_dirty = true;
 
-	if ((uint32_t)config.width > area_width || (uint32_t)config.height > area_height || !shm)
-		CreateArea(std::max<uint32_t>(config.width, area_width), std::max<uint32_t>(config.height, area_height));
+	if (NeedsBiggerArea()) {
+		/* one switch at a time: while one is unconfirmed, Poll() makes the bigger area after it */
+		if (AttachInFlight())
+			resize_deferred = true;
+		else
+			CreateArea(std::max<uint32_t>(config.width, area_width),
+				   std::max<uint32_t>(config.height, area_height));
+	}
 
 	if (!shm)
 		return;
@@ -347,6 +401,8 @@ void HaikuBrowserClient::Stop()
 void HaikuBrowserClient::Start()
 {
 	std::lock_guard<std::mutex> lock(mutex);
+	if (!stopped)
+		return; /* keep a running restart backoff */
 	stopped = false;
 	restarts = 0;
 	next_restart = 0;
@@ -376,9 +432,7 @@ void HaikuBrowserClient::Poll()
 		helper = -1;
 		ready = false;
 		messenger = BMessenger();
-		const bigtime_t backoff = std::min<bigtime_t>(500000LL << std::min(restarts, 5), 10000000LL);
-		next_restart = now + backoff;
-		restarts++;
+		ScheduleRestart(now);
 	}
 
 	if (helper <= 0) {
@@ -404,6 +458,22 @@ void HaikuBrowserClient::Poll()
 	if (now - helper_started > 30000000LL)
 		restarts = 0;
 
+	if (AttachInFlight()) {
+		if (shm->helper_team != 0) {
+			/* the helper has switched to the current area; its clone of the old one lives as long as
+			 * it needs it */
+			delete_area(retired_area);
+			retired_area = -1;
+			retired_shm = nullptr;
+			state = shm;
+		} else if (now - attach_sent > HELPER_STALL_TIMEOUT) {
+			BLOG(LOG_WARNING, "browser helper did not switch to the new frame area, restarting it");
+			StopHelper();
+			next_restart = now;
+			return;
+		}
+	}
+
 	const bigtime_t last_sign_of_life = std::max<bigtime_t>((bigtime_t)state->helper_heartbeat, helper_started);
 	if (now - last_sign_of_life > HELPER_STALL_TIMEOUT) {
 		BLOG(LOG_WARNING, "browser helper stopped responding, restarting it");
@@ -412,6 +482,12 @@ void HaikuBrowserClient::Poll()
 		return;
 	}
 
+	if (resize_deferred && !AttachInFlight()) {
+		resize_deferred = false;
+		if (NeedsBiggerArea())
+			CreateArea(std::max<uint32_t>(config.width, area_width),
+				   std::max<uint32_t>(config.height, area_height));
+	}
 	if (attach_pending)
 		TrySendAttach();
 	if (config_dirty)

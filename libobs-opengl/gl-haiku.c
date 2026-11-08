@@ -36,7 +36,9 @@
  *    whether or not it exists (Mesa 25 removed OSMesa).
  *
  * Readback costs one glReadPixels per displayed frame, which is acceptable for preview/projector sizes and
- * keeps the renderer independent of any toolkit.
+ * keeps the renderer independent of any toolkit. The rows are handed over bottom-up as GL returns them, with
+ * the pointer at the top row and a negative stride, so the consumer's copy into its own image does the vertical
+ * flip.
  */
 
 #include <dlfcn.h>
@@ -102,11 +104,13 @@ struct gl_windowinfo {
 	GLuint fbo;
 	GLuint color;
 	uint32_t fbo_cx, fbo_cy;
+	/* size at which the framebuffer object was last found incomplete; not retried until the size changes */
+	uint32_t fbo_failed_cx, fbo_failed_cy;
 
 	/* OSMesa backend: the swapchain's color buffer (cx * cy * 4) */
 	uint8_t *osmesa_buffer;
 
-	void (*present)(void *param, const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t linesize);
+	void (*present)(void *param, const uint8_t *top_row, uint32_t width, uint32_t height, int32_t stride);
 	void *param;
 
 	uint8_t *readback;
@@ -257,6 +261,8 @@ static bool egl_swapchain_fbo(struct gl_windowinfo *wi)
 {
 	if (wi->fbo && wi->fbo_cx == wi->cx && wi->fbo_cy == wi->cy)
 		return true;
+	if (wi->fbo && wi->fbo_failed_cx == wi->cx && wi->fbo_failed_cy == wi->cy)
+		return false;
 
 	if (!wi->fbo) {
 		glGenFramebuffers(1, &wi->fbo);
@@ -278,11 +284,16 @@ static bool egl_swapchain_fbo(struct gl_windowinfo *wi)
 
 	if (status != GL_FRAMEBUFFER_COMPLETE) {
 		blog(LOG_ERROR, "Haiku GL: swapchain framebuffer %ux%u incomplete (0x%x)", wi->cx, wi->cy, status);
+		/* the renderbuffer storage no longer matches fbo_cx/fbo_cy either */
+		wi->fbo_cx = wi->fbo_cy = 0;
+		wi->fbo_failed_cx = wi->cx;
+		wi->fbo_failed_cy = wi->cy;
 		return false;
 	}
 
 	wi->fbo_cx = wi->cx;
 	wi->fbo_cy = wi->cy;
+	wi->fbo_failed_cx = wi->fbo_failed_cy = 0;
 	return true;
 }
 
@@ -294,6 +305,7 @@ static void egl_swapchain_free(struct gl_windowinfo *wi)
 		glDeleteRenderbuffers(1, &wi->color);
 	wi->fbo = wi->color = 0;
 	wi->fbo_cx = wi->fbo_cy = 0;
+	wi->fbo_failed_cx = wi->fbo_failed_cy = 0;
 }
 
 /* ---------------------------------------------------------------------------------------------------------- */
@@ -448,35 +460,13 @@ extern void gl_windowinfo_destroy(struct gl_windowinfo *wi)
 	bfree(wi);
 }
 
-extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adapter)
+/* Makes the freshly created context current and loads the GL entry points through it. */
+static bool load_gl(gs_device_t *device)
 {
-	UNUSED_PARAMETER(adapter);
-
-	struct gl_platform *plat = bzalloc(sizeof(struct gl_platform));
-	plat->display = EGL_NO_DISPLAY;
-	plat->context = EGL_NO_CONTEXT;
-
-	const char *forced = getenv("OBS_HAIKU_GL");
-	const bool want_egl = !forced || strcmp(forced, "osmesa") != 0;
-	const bool want_osmesa = !forced || strcmp(forced, "egl") != 0;
-
-	bool created = want_egl && egl_context_create(plat);
-	if (!created && want_osmesa) {
-		if (want_egl)
-			blog(LOG_INFO, "Haiku GL: no usable EGL (normal with HaikuPorts' Mesa 22), using OSMesa");
-		created = osmesa_context_create(plat);
-	}
-	if (!created) {
-		blog(LOG_ERROR, "Haiku GL: no OpenGL backend available. Install Mesa: 'pkgman install mesa'");
-		bfree(plat);
-		return NULL;
-	}
-
-	blog(LOG_INFO, "Haiku GL: rendering through %s", plat->use_osmesa ? "OSMesa" : "EGL (surfaceless)");
-	device->plat = plat;
+	struct gl_platform *plat = device->plat;
 
 	if (!make_current(device))
-		goto fail;
+		return false;
 
 	if (plat->use_osmesa) {
 		/* OSMesaGetProcAddress resolves every GL entry point through Mesa's dispatch table */
@@ -488,21 +478,60 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 	}
 	if (!GLAD_GL_VERSION_3_3 && !gladLoadGL()) {
 		blog(LOG_ERROR, "Haiku GL: failed to load OpenGL entry points");
-		goto fail;
+		return false;
 	}
 
 	if (!GLAD_GL_VERSION_3_3) {
 		blog(LOG_ERROR, "Haiku GL: OpenGL 3.3 is required, got %d.%d", GLVersion.major, GLVersion.minor);
-		goto fail;
+		return false;
+	}
+	return true;
+}
+
+extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adapter)
+{
+	UNUSED_PARAMETER(adapter);
+
+	struct gl_platform *plat = bzalloc(sizeof(struct gl_platform));
+	plat->display = EGL_NO_DISPLAY;
+	plat->context = EGL_NO_CONTEXT;
+	device->plat = plat;
+
+	const char *forced = getenv("OBS_HAIKU_GL");
+	const bool want_egl = !forced || strcmp(forced, "osmesa") != 0;
+	const bool want_osmesa = !forced || strcmp(forced, "egl") != 0;
+
+	bool created = false;
+	if (want_egl && egl_context_create(plat)) {
+		created = load_gl(device);
+		if (!created) {
+			/* a context that cannot be made current or is below 3.3 is as good as none */
+			egl_context_destroy(plat);
+			if (want_osmesa)
+				blog(LOG_INFO, "Haiku GL: EGL context unusable, falling back to OSMesa");
+		}
+	} else if (want_egl && want_osmesa) {
+		blog(LOG_INFO, "Haiku GL: no usable EGL (normal with HaikuPorts' Mesa 22), using OSMesa");
 	}
 
+	if (!created && want_osmesa && osmesa_context_create(plat)) {
+		created = load_gl(device);
+		if (!created) {
+			osmesa_context_destroy(plat);
+			plat->use_osmesa = false;
+		}
+	}
+
+	if (!created) {
+		blog(LOG_ERROR, "Haiku GL: no OpenGL backend available. Install Mesa: 'pkgman install mesa'");
+		bfree(plat);
+		device->plat = NULL;
+		return NULL;
+	}
+
+	blog(LOG_INFO, "Haiku GL: rendering through %s", plat->use_osmesa ? "OSMesa" : "EGL (surfaceless)");
 	blog(LOG_INFO, "Haiku GL: %s", (const char *)glGetString(GL_RENDERER));
 	return plat;
-
-fail:
-	gl_platform_destroy(plat);
-	device->plat = NULL;
-	return NULL;
 }
 
 extern void gl_platform_destroy(struct gl_platform *plat)
@@ -609,6 +638,8 @@ extern void gl_update(gs_device_t *device)
 	if (wi->cx == cx && wi->cy == cy)
 		return;
 
+	const uint32_t old_cx = wi->cx;
+	const uint32_t old_cy = wi->cy;
 	wi->cx = cx;
 	wi->cy = cy;
 
@@ -618,10 +649,18 @@ extern void gl_update(gs_device_t *device)
 		return;
 	}
 
-	/* OSMesa: the old buffer is current; bind the new one before freeing the old one */
+	/* OSMesa: the old buffer is current; bind the new one before freeing the old one, and keep the old one
+	 * (and its size) if the new one cannot be bound. */
 	uint8_t *old = wi->osmesa_buffer;
 	wi->osmesa_buffer = bzalloc((size_t)cx * cy * 4);
-	make_current(device);
+	if (!make_current(device)) {
+		bfree(wi->osmesa_buffer);
+		wi->osmesa_buffer = old;
+		wi->cx = old_cx;
+		wi->cy = old_cy;
+		make_current(device);
+		return;
+	}
 	bfree(old);
 }
 
@@ -659,16 +698,16 @@ extern void device_present(gs_device_t *device)
 	const uint32_t linesize = cx * 4;
 	const size_t size = (size_t)linesize * cy;
 
-	if (wi->readback_size < size * 2) {
+	if (wi->readback_size < size) {
 		bfree(wi->readback);
-		wi->readback = bmalloc(size * 2);
-		wi->readback_size = size * 2;
+		wi->readback = bmalloc(size);
+		wi->readback_size = size;
 	}
 
-	GLint prev_read_fbo = 0, prev_pack_buffer = 0;
-	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
-	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack_buffer);
-
+	/* No glGetIntegerv round trips for the previous bindings: nothing in the GL subsystem relies on them
+	 * persisting. Everything that reads binds its own GL_READ_FRAMEBUFFER (saving and restoring around it),
+	 * and pixel pack buffers are only bound during a stage surface operation and reset to 0 after it. So
+	 * both are simply left at 0 here. */
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	if (osmesa_backend) {
@@ -680,20 +719,18 @@ extern void device_present(gs_device_t *device)
 		glReadBuffer(GL_COLOR_ATTACHMENT0);
 	}
 
-	uint8_t *raw = wi->readback + size;
-	glReadPixels(0, 0, (GLsizei)cx, (GLsizei)cy, GL_BGRA, GL_UNSIGNED_BYTE, raw);
+	glReadPixels(0, 0, (GLsizei)cx, (GLsizei)cy, GL_BGRA, GL_UNSIGNED_BYTE, wi->readback);
 
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
-	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack_buffer);
+	if (!osmesa_backend)
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 
 	if (!gl_success("glReadPixels"))
 		return;
 
-	/* GL rows are bottom-up; views expect top-down. */
-	for (uint32_t y = 0; y < cy; y++)
-		memcpy(wi->readback + (size_t)y * linesize, raw + (size_t)(cy - 1 - y) * linesize, linesize);
-
-	wi->present(wi->param, wi->readback, cx, cy, linesize);
+	/* GL rows are bottom-up. Instead of flipping them here, pass the top row (last in memory) with a
+	 * negative stride; the consumer flips while copying into its own image. */
+	const int32_t stride = -(int32_t)linesize;
+	wi->present(wi->param, wi->readback + (size_t)(cy - 1) * linesize, cx, cy, stride);
 }
 
 extern bool device_is_monitor_hdr(gs_device_t *device, void *monitor)

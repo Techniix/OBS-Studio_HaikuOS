@@ -338,16 +338,20 @@ static const struct haiku_key_map key_alt_codes[] = {
 #define KEY_MAP_COUNT (sizeof(key_map) / sizeof(key_map[0]))
 #define KEY_ALT_COUNT (sizeof(key_alt_codes) / sizeof(key_alt_codes[0]))
 
-/* Polling the app_server is a round trip, so cache the key/mouse state briefly: the hotkey thread
- * queries every registered key once per tick. */
+/* Key state is an input_server round trip and mouse state an app_server round trip, so cache each
+ * briefly: the hotkey thread queries the modifiers and every bound key once per tick. The two caches
+ * are independent so the mouse is only polled when a mouse button binding is actually queried. */
 #define KEY_STATE_CACHE_NS 4000000ULL
 
 struct obs_hotkeys_platform {
 	pthread_mutex_t mutex;
-	uint64_t last_poll;
+	uint64_t keys_polled;
+	uint64_t mouse_polled;
 	uint8_t key_states[OBS_HAIKU_KEY_STATE_BYTES];
 	uint32_t modifiers;
 	uint32_t mouse_buttons;
+	bool keys_valid;
+	bool mouse_valid;
 	bool have_keys;
 	bool have_mouse;
 };
@@ -382,15 +386,31 @@ static inline bool key_state_bit(const uint8_t *states, uint8_t code)
 	return (states[code >> 3] & (1 << (7 - (code & 7)))) != 0;
 }
 
-static void poll_state(obs_hotkeys_platform_t *plat)
+static inline bool cache_fresh(bool valid, uint64_t polled, uint64_t now)
+{
+	return valid && now - polled < KEY_STATE_CACHE_NS;
+}
+
+static void poll_keys(obs_hotkeys_platform_t *plat)
 {
 	uint64_t now = os_gettime_ns();
-	if (plat->last_poll && now - plat->last_poll < KEY_STATE_CACHE_NS)
+	if (cache_fresh(plat->keys_valid, plat->keys_polled, now))
 		return;
 
 	plat->have_keys = obs_haiku_get_key_states(plat->key_states, &plat->modifiers);
+	plat->keys_polled = now;
+	plat->keys_valid = true;
+}
+
+static void poll_mouse(obs_hotkeys_platform_t *plat)
+{
+	uint64_t now = os_gettime_ns();
+	if (cache_fresh(plat->mouse_valid, plat->mouse_polled, now))
+		return;
+
 	plat->have_mouse = obs_haiku_get_mouse_buttons(&plat->mouse_buttons);
-	plat->last_poll = now;
+	plat->mouse_polled = now;
+	plat->mouse_valid = true;
 }
 
 bool obs_hotkeys_platform_init(struct obs_core_hotkeys *hotkeys)
@@ -424,30 +444,35 @@ bool obs_hotkeys_platform_is_pressed(obs_hotkeys_platform_t *plat, obs_key_t key
 		return false;
 
 	pthread_mutex_lock(&plat->mutex);
-	poll_state(plat);
 
 	if (key >= OBS_KEY_MOUSE1 && key <= OBS_KEY_MOUSE29) {
+		poll_mouse(plat);
 		if (plat->have_mouse) {
 			uint32_t bit = 1u << (uint32_t)(key - OBS_KEY_MOUSE1);
 			pressed = (plat->mouse_buttons & bit) != 0;
 		}
-	} else if (plat->have_keys && (key == OBS_KEY_SHIFT || key == OBS_KEY_CONTROL || key == OBS_KEY_ALT ||
-					key == OBS_KEY_META)) {
-		/* Use the modifier mask rather than physical keys so remapped modifiers (Keymap preferences)
-		 * behave the same as in Qt's key events. */
-		uint32_t bit = key == OBS_KEY_SHIFT     ? OBS_HAIKU_SHIFT_KEY
-			       : key == OBS_KEY_CONTROL ? OBS_HAIKU_COMMAND_KEY
-			       : key == OBS_KEY_ALT     ? OBS_HAIKU_CONTROL_KEY
-							: OBS_HAIKU_OPTION_KEY;
-		pressed = (plat->modifiers & bit) != 0;
-	} else if (plat->have_keys) {
-		int code = haiku_code_for_key(key);
-		if (code)
-			pressed = key_state_bit(plat->key_states, (uint8_t)code);
+	} else {
+		poll_keys(plat);
+		if (!plat->have_keys) {
+			/* no key state available */
+		} else if (key == OBS_KEY_SHIFT || key == OBS_KEY_CONTROL || key == OBS_KEY_ALT ||
+			   key == OBS_KEY_META) {
+			/* Use the modifier mask rather than physical keys so remapped modifiers (Keymap
+			 * preferences) behave the same as in Qt's key events. */
+			uint32_t bit = key == OBS_KEY_SHIFT     ? OBS_HAIKU_SHIFT_KEY
+				       : key == OBS_KEY_CONTROL ? OBS_HAIKU_COMMAND_KEY
+				       : key == OBS_KEY_ALT     ? OBS_HAIKU_CONTROL_KEY
+								: OBS_HAIKU_OPTION_KEY;
+			pressed = (plat->modifiers & bit) != 0;
+		} else {
+			int code = haiku_code_for_key(key);
+			if (code)
+				pressed = key_state_bit(plat->key_states, (uint8_t)code);
 
-		for (size_t i = 0; !pressed && i < KEY_ALT_COUNT; i++) {
-			if (key_alt_codes[i].key == key)
-				pressed = key_state_bit(plat->key_states, key_alt_codes[i].code);
+			for (size_t i = 0; !pressed && i < KEY_ALT_COUNT; i++) {
+				if (key_alt_codes[i].key == key)
+					pressed = key_state_bit(plat->key_states, key_alt_codes[i].code);
+			}
 		}
 	}
 

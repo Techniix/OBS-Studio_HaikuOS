@@ -30,7 +30,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <vector>
 
 #include <Bitmap.h>
 #include <OS.h>
@@ -54,6 +53,7 @@ struct ScreenCapture {
 	int fps = 30;
 
 	std::atomic_bool active = false;
+	StopSignal stop;
 	std::thread thread;
 
 	void Start();
@@ -66,6 +66,7 @@ void ScreenCapture::Start()
 	if (active.exchange(true))
 		return;
 
+	stop.Reset();
 	thread = std::thread(&ScreenCapture::Run, this);
 }
 
@@ -74,6 +75,7 @@ void ScreenCapture::Stop()
 	if (!active.exchange(false))
 		return;
 
+	stop.Stop();
 	if (thread.joinable())
 		thread.join();
 
@@ -85,21 +87,18 @@ void ScreenCapture::Run()
 {
 	os_set_thread_name("haiku-screen-capture");
 
-	BScreen screen(B_MAIN_SCREEN_ID);
-	if (!screen.IsValid()) {
-		blog(LOG_ERROR, "[haiku-capture] Unable to connect to the main screen");
+	std::unique_ptr<BScreen> screen = open_main_screen(stop, "Screen capture");
+	if (!screen)
 		return;
-	}
 
 	/* below the app_server and normal applications; the copy itself is throttled by CaptureThrottle */
 	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
 
 	CaptureThrottle throttle("Screen capture");
 	BandedScreenReader reader;
-	std::vector<uint8_t> pixels;
-	uint32_t stride = 0;
+	CapturedFrame captured;
 
-	while (active) {
+	while (!stop.Stopped()) {
 		bool cursor, banded;
 		int rate;
 		{
@@ -109,29 +108,32 @@ void ScreenCapture::Run()
 			rate = fps;
 		}
 
-		const BRect frame = screen.Frame();
+		const BRect frame = screen->Frame();
 		const uint64_t timestamp = os_gettime_ns();
 
-		const uint64_t took = reader.Read(screen, frame, cursor, banded, pixels, stride);
-		if (took) {
-			const uint32_t width = (uint32_t)frame.IntegerWidth() + 1;
-			const uint32_t height = (uint32_t)frame.IntegerHeight() + 1;
-			throttle.Record(took, (uint64_t)width * height);
+		if (!reader.Read(*screen, frame, cursor, banded, stop, captured)) {
+			if (!stop.WaitFor(100000000ULL))
+				break;
+			throttle.Wait(rate, stop);
+			continue;
+		}
+		throttle.Record(captured.took, (uint64_t)captured.width * captured.height);
 
+		/* Frame() is cached for a few ms: if the mode changed around the read, rows outside the new frame
+		 * weren't copied, so drop that frame */
+		if (screen->Frame() == frame) {
 			struct obs_source_frame out = {};
-			out.data[0] = pixels.data();
-			out.linesize[0] = stride;
-			out.width = width;
-			out.height = height;
+			out.data[0] = (uint8_t *)captured.data;
+			out.linesize[0] = captured.linesize;
+			out.width = captured.width;
+			out.height = captured.height;
 			out.format = VIDEO_FORMAT_BGRX;
 			out.full_range = true;
 			out.timestamp = timestamp;
 			obs_source_output_video(source, &out);
-		} else {
-			os_sleep_ms(100);
 		}
 
-		throttle.Wait(rate);
+		throttle.Wait(rate, stop);
 	}
 }
 

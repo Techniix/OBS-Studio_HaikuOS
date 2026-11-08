@@ -487,10 +487,11 @@ struct gs_window {
 	uint32_t id;
 	void *display;
 #elif defined(__HAIKU__)
-	/* Haiku swapchains render offscreen; each presented frame is passed to this callback as top-down BGRA
-	 * pixels. It is called from the graphics thread, so the owner must hand the data over to its own
-	 * looper/UI thread. */
-	void (*present)(void *param, const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t linesize);
+	/* Haiku swapchains render offscreen; each presented frame is passed to this callback as BGRA pixels.
+	 * `top_row` points at the frame's top row and `stride` is the signed distance in bytes from one row to
+	 * the next one down (negative when the frame is stored bottom-up, as glReadPixels returns it). It is
+	 * called from the graphics thread, so the owner must hand the data over to its own looper/UI thread. */
+	void (*present)(void *param, const uint8_t *top_row, uint32_t width, uint32_t height, int32_t stride);
 	void *param;
 #endif
 };

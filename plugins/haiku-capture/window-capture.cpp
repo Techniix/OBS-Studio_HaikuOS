@@ -81,7 +81,9 @@ std::string app_name_for_team(team_id team)
 	return "?";
 }
 
-bool read_window(int32 token, WindowEntry &entry)
+/* Reads a window's title, geometry and state. The application name is looked up only with `lookup_app` (a
+ * roster round trip): a window's team, and so its application, never changes. */
+bool read_window(int32 token, WindowEntry &entry, bool lookup_app)
 {
 	client_window_info *info = get_window_info(token);
 	if (!info)
@@ -107,7 +109,8 @@ bool read_window(int32 token, WindowEntry &entry)
 	if (!normal)
 		return false; /* hidden or desktop windows */
 
-	entry.app = app_name_for_team(team);
+	if (lookup_app)
+		entry.app = app_name_for_team(team);
 	return true;
 }
 
@@ -125,7 +128,7 @@ std::vector<WindowEntry> list_windows()
 
 	for (int32 i = 0; i < count; i++) {
 		WindowEntry entry;
-		if (!read_window(tokens[i], entry) || entry.title.empty())
+		if (!read_window(tokens[i], entry, true) || entry.title.empty())
 			continue;
 
 		/* Skip OBS's own windows (capturing them would recurse) */
@@ -168,6 +171,38 @@ bool find_window(const std::string &id, WindowEntry &out)
 	return false;
 }
 
+/* Exact app+title match only. Cheap enough to poll: the application is looked up only for windows that have
+ * the right title. */
+bool find_exact_window(const std::string &id, WindowEntry &out)
+{
+	const size_t sep = id.find(ID_SEPARATOR);
+	if (sep == std::string::npos || sep + 1 == id.size())
+		return false;
+	const std::string app = id.substr(0, sep);
+	const std::string title = id.substr(sep + 1);
+
+	int32 count = 0;
+	int32 *tokens = get_token_list(-1, &count);
+	if (!tokens)
+		return false;
+
+	const team_id self = (team_id)getpid();
+	bool found = false;
+	for (int32 i = 0; i < count && !found; i++) {
+		WindowEntry entry;
+		if (!read_window(tokens[i], entry, false) || entry.team == self || entry.title != title)
+			continue;
+		entry.app = app_name_for_team(entry.team);
+		if (entry.app == app) {
+			out = std::move(entry);
+			found = true;
+		}
+	}
+
+	free(tokens);
+	return found;
+}
+
 /* Whether another window in front of `token` overlaps `rect` on the current workspace. */
 bool is_covered(int32 token, const BRect &rect)
 {
@@ -207,9 +242,9 @@ struct WindowCapture {
 	bool capture_cursor = true;
 	int capture_method = CAPTURE_TEAR_FREE;
 	int fps = 30;
-	bool settings_changed = true;
 
 	std::atomic_bool active = false;
+	StopSignal stop;
 	std::thread thread;
 
 	void Start();
@@ -221,6 +256,7 @@ void WindowCapture::Start()
 {
 	if (active.exchange(true))
 		return;
+	stop.Reset();
 	thread = std::thread(&WindowCapture::Run, this);
 }
 
@@ -228,6 +264,7 @@ void WindowCapture::Stop()
 {
 	if (!active.exchange(false))
 		return;
+	stop.Stop();
 	if (thread.joinable())
 		thread.join();
 	obs_source_output_video(source, nullptr);
@@ -238,62 +275,88 @@ void WindowCapture::Run()
 	os_set_thread_name("haiku-window-capture");
 	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
 
-	BScreen screen(B_MAIN_SCREEN_ID);
-	if (!screen.IsValid()) {
-		blog(LOG_ERROR, "[haiku-capture] Unable to connect to the main screen");
+	std::unique_ptr<BScreen> screen = open_main_screen(stop, "Window capture");
+	if (!screen)
 		return;
-	}
 
 	BandedScreenReader reader;
-	std::vector<uint8_t> pixels;
-	uint32_t stride = 0;
+	CapturedFrame captured;
+	std::string id; /* the selection `window` was found for */
 	WindowEntry window;
 	bool have_window = false;
+	bool exact = false;   /* `window` is the selected window, not just another one of the same application */
+	bool showing = false; /* a frame has been output since the last clear */
 	bool was_covered = false;
 	bool warned_missing = false;
 	CaptureThrottle throttle("Window capture");
 	uint64_t next_rescan = 0;
+	uint64_t next_exact_check = 0;
 	uint64_t next_cover_check = 0;
 
-	while (active) {
-		std::string id;
+	while (!stop.Stopped()) {
 		bool decor, cursor, banded;
+		bool selection_changed = false;
 		int rate;
 		{
 			std::lock_guard<std::mutex> lock(settings_mutex);
-			id = window_id;
+			/* Only a different selection drops the tracked window: re-finding it after any other change
+			 * would fail the exact match once its title has changed and pick another window of the app */
+			if (window_id != id) {
+				id = window_id;
+				have_window = false;
+				next_rescan = 0;
+				warned_missing = false;
+				selection_changed = true;
+			}
 			decor = decorations;
 			cursor = capture_cursor;
 			banded = capture_method == CAPTURE_SMOOTH_POINTER;
 			rate = fps > 0 ? fps : 30;
-			if (settings_changed) {
-				have_window = false;
-				next_rescan = 0;
-				settings_changed = false;
-			}
 		}
 		const uint64_t now = os_gettime_ns();
 
 		/* Refresh the window's geometry each frame; look it up again if it disappeared */
-		if (have_window && !read_window(window.token, window))
+		if (have_window && !read_window(window.token, window, false))
 			have_window = false;
 
 		if (!have_window && !id.empty() && now >= next_rescan) {
 			have_window = find_window(id, window);
 			next_rescan = now + 1000000000ULL; /* retry once a second */
 			if (have_window) {
+				exact = make_id(window) == id;
+				next_exact_check = now + 1000000000ULL;
 				warned_missing = false;
-				blog(LOG_INFO, "[haiku-capture] Capturing window '%s' of '%s'", window.title.c_str(),
-				     window.app.c_str());
+				blog(LOG_INFO,
+				     exact ? "[haiku-capture] Capturing window '%s' of '%s'"
+					   : "[haiku-capture] Selected window not open; capturing window '%s' of '%s' "
+					     "until it appears",
+				     window.title.c_str(), window.app.c_str());
 			} else if (!warned_missing) {
 				warned_missing = true;
 				blog(LOG_INFO, "[haiku-capture] Window not found, waiting for it to appear");
 			}
+		} else if (have_window && !exact && now >= next_exact_check) {
+			/* Capturing a stand-in of the same application: switch to the selected window when it opens */
+			next_exact_check = now + 1000000000ULL;
+			WindowEntry found;
+			if (find_exact_window(id, found)) {
+				window = std::move(found);
+				exact = true;
+				blog(LOG_INFO, "[haiku-capture] Capturing window '%s' of '%s'", window.title.c_str(),
+				     window.app.c_str());
+			}
+		}
+
+		/* Closed, deselected or not open: don't keep showing the old window. A minimized window or one on
+		 * another workspace keeps its last frame (unless the selection changed to it). */
+		if (showing && (!have_window || (selection_changed && !window.on_screen))) {
+			obs_source_output_video(source, nullptr);
+			showing = false;
 		}
 
 		if (have_window && window.on_screen) {
 			BRect rect = decor ? window.decorated : window.frame;
-			rect = rect & screen.Frame();
+			rect = rect & screen->Frame();
 			rect.left = floorf(rect.left);
 			rect.top = floorf(rect.top);
 			rect.right = floorf(rect.right);
@@ -312,27 +375,24 @@ void WindowCapture::Run()
 					was_covered = covered;
 				}
 
-				const uint64_t took = reader.Read(screen, rect, cursor, banded, pixels, stride);
-				if (took) {
-					const uint32_t width = (uint32_t)rect.IntegerWidth() + 1;
-					const uint32_t height = (uint32_t)rect.IntegerHeight() + 1;
-					throttle.Record(took, (uint64_t)width * height);
+				if (reader.Read(*screen, rect, cursor, banded, stop, captured)) {
+					throttle.Record(captured.took, (uint64_t)captured.width * captured.height);
 
 					struct obs_source_frame frame = {};
-					frame.data[0] = pixels.data();
-					frame.linesize[0] = stride;
-					frame.width = width;
-					frame.height = height;
+					frame.data[0] = (uint8_t *)captured.data;
+					frame.linesize[0] = captured.linesize;
+					frame.width = captured.width;
+					frame.height = captured.height;
 					frame.format = VIDEO_FORMAT_BGRX;
 					frame.full_range = true;
 					frame.timestamp = now;
 					obs_source_output_video(source, &frame);
+					showing = true;
 				}
 			}
 		}
-		/* Minimized/hidden/other workspace: keep showing the last frame */
 
-		throttle.Wait(rate);
+		throttle.Wait(rate, stop);
 	}
 }
 
@@ -351,7 +411,6 @@ void window_capture_update(void *data, obs_data_t *settings)
 	wc->capture_cursor = obs_data_get_bool(settings, S_CAPTURE_CURSOR);
 	wc->capture_method = (int)obs_data_get_int(settings, S_CAPTURE_METHOD);
 	wc->fps = (int)obs_data_get_int(settings, S_FPS);
-	wc->settings_changed = true;
 }
 
 void *window_capture_create(obs_data_t *settings, obs_source_t *source)

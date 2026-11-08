@@ -18,6 +18,7 @@
 #include "tap-node.h"
 
 #include <Buffer.h>
+#include <BufferGroup.h>
 #include <ByteOrder.h>
 #include <TimeSource.h>
 
@@ -43,6 +44,7 @@ TapNode::TapNode(obs_tap_shm *shm_, const media_format &preferred_)
 TapNode::~TapNode()
 {
 	Quit();
+	delete upstream_group;
 }
 
 BMediaAddOn *TapNode::AddOn(int32 *id) const
@@ -128,33 +130,47 @@ status_t TapNode::NegotiateFormat(media_format &proposed) const
 
 void TapNode::PublishFormat(const media_format &fmt)
 {
-	const media_raw_audio_format &raw = fmt.u.raw_audio;
+	/* seqlock writer (see audio-tap-shm.h). The serial is kept here, not read back from the shared area,
+	 * which readers can write to. */
+	const media_multi_audio_format &raw = fmt.u.raw_audio;
+	__atomic_store_n(&shm->format_serial, ++format_serial, __ATOMIC_RELAXED); /* odd: update in progress */
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	shm->frame_rate = raw.frame_rate;
 	shm->channels = raw.channel_count;
 	shm->format = raw.format;
 	shm->byte_order = raw.byte_order;
-	__sync_synchronize();
-	atomic_add((int32 *)&shm->format_serial, 1);
+	shm->channel_mask = raw.channel_mask;
+	__atomic_store_n(&shm->format_serial, ++format_serial, __ATOMIC_RELEASE); /* even: consistent */
 }
 
 void TapNode::CopyToRing(const void *data, size_t size)
 {
+	/* Only compile-time constants and node-private state decide where the copy goes: the shared header is
+	 * mapped read-write by every reader, so nothing read from it may steer a memcpy in this real-time path. */
+	const size_t ring = OBS_TAP_RING_SIZE;
 	if (!size)
 		return;
-	if (size > shm->ring_size)
-		size = shm->ring_size;
+	if (size > OBS_TAP_MAX_WRITE) {
+		/* readers rely on this bound (audio-tap-shm.h); keep the newest whole frames */
+		const size_t frame = (format.u.raw_audio.format & media_raw_audio_format::B_AUDIO_SIZE_MASK) *
+				     format.u.raw_audio.channel_count;
+		size_t keep = OBS_TAP_MAX_WRITE;
+		if (frame > 0 && frame <= keep)
+			keep -= keep % frame;
+		data = (const uint8 *)data + (size - keep);
+		size = keep;
+	}
 
-	const int64 pos = shm->write_pos;
-	const size_t offset = (size_t)(pos % shm->ring_size);
-	const size_t first = (size < shm->ring_size - offset) ? size : shm->ring_size - offset;
+	const size_t offset = (size_t)(write_total % (int64)ring);
+	const size_t first = (size < ring - offset) ? size : ring - offset;
 
 	memcpy(shm->ring + offset, data, first);
 	if (first < size)
 		memcpy(shm->ring, (const uint8 *)data + first, size - first);
 
-	/* the data must be visible before readers see the new position */
-	__sync_synchronize();
-	shm->write_pos = pos + (int64)size;
+	write_total += (int64)size;
+	/* release: the data is visible before readers see the new position */
+	__atomic_store_n(&shm->write_pos, write_total, __ATOMIC_RELEASE);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -188,7 +204,8 @@ void TapNode::BufferReceived(BBuffer *buffer)
 		return;
 	}
 
-	/* the copy is a plain memcpy into a 1 MiB ring; it never blocks the real-time path */
+	/* the copy is a plain memcpy into the shared ring (OBS_TAP_RING_SIZE); it never blocks the real-time
+	 * path */
 	CopyToRing(buffer->Data(), buffer->SizeUsed());
 
 	if (output.destination == media_destination::null || !output_enabled) {
@@ -290,14 +307,30 @@ status_t TapNode::DisposeOutputCookie(int32)
 
 status_t TapNode::SetBufferGroup(const media_source &src, BBufferGroup *group)
 {
-	if (src != output.source)
+	/* A consumer downstream asked us to use its buffers. Pass the request on to the mixer so it can write
+	 * straight into them (we forward buffers unchanged, so that is all a pass-through needs). Haiku's
+	 * multi_audio output node does not call SetOutputBuffersFor(), so normally this is never reached and
+	 * the mixer keeps its own buffer group; buffers are forwarded without copying either way. */
+	if (src != output.source) {
+		delete group; /* the Media Kit hands us ownership of the group */
 		return B_MEDIA_BAD_SOURCE;
-	if (input.source == media_source::null)
+	}
+	if (input.source == media_source::null) {
+		delete group;
 		return B_ERROR;
+	}
 
-	/* let the mixer write straight into the sound card's buffers: zero-copy forwarding */
+	/* SetOutputBuffersFor() only sends the buffer ids; the mixer builds its own group from them. Keep ours
+	 * (our clones of the card's buffers) until it is replaced or the node goes away. */
 	int32 change_tag = 0;
-	return SetOutputBuffersFor(input.source, input.destination, group, nullptr, &change_tag);
+	status_t err = SetOutputBuffersFor(input.source, input.destination, group, nullptr, &change_tag);
+	if (err != B_OK) {
+		delete group;
+		return err;
+	}
+	delete upstream_group;
+	upstream_group = group;
+	return B_OK;
 }
 
 status_t TapNode::PrepareToConnect(const media_source &src, const media_destination &dst, media_format *fmt,

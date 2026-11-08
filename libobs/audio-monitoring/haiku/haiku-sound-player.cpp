@@ -75,7 +75,14 @@ extern "C" void obs_haiku_sound_player_destroy(obs_haiku_sound_player *p)
 	if (!p)
 		return;
 
-	p->player->Stop(true, false);
+	/* Stop without blocking: Stop(true, ...) polls IsPlaying() for up to 500 ms and then snoozes
+	 * Latency() + 2 ms so queued buffers finish playing, which is only about letting the tail play
+	 * out (and ~BSoundPlayer would do the same if the player were still started, hence the explicit
+	 * non-blocking Stop first). Callback safety comes from the destructor: it releases the
+	 * SoundPlayNode, whose DeleteHook (BMediaEventLooper) calls Quit(), which closes the control port
+	 * and wait_for_thread()s the control thread -- the only thread that calls PlayBuffer -- before the
+	 * node is deleted. So play_buffer cannot run once delete returns. */
+	p->player->Stop(false, false);
 	delete p->player;
 	delete p;
 }

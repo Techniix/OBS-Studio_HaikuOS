@@ -45,10 +45,77 @@
 #include <Screen.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <stdint.h>
 #include <string.h>
 #include <vector>
+
+/*
+ * libobs calls show/hide (and so the sources' Stop(), which joins the capture thread) on the graphics thread.
+ * Every wait in a capture thread goes through this so that Stop() wakes it at once instead of rendering stalling
+ * until a sleep runs out.
+ */
+class StopSignal {
+public:
+	void Reset()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		stopped = false;
+	}
+
+	void Stop()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			stopped = true;
+		}
+		cond.notify_all();
+	}
+
+	bool Stopped() const { return stopped; }
+
+	/* Waits until os_gettime_ns() reaches `deadline`. Returns false if Stop() was called. */
+	bool WaitUntil(uint64_t deadline)
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		while (!stopped) {
+			const uint64_t now = os_gettime_ns();
+			if (now >= deadline)
+				return true;
+			cond.wait_for(lock, std::chrono::nanoseconds((int64_t)(deadline - now)));
+		}
+		return false;
+	}
+
+	bool WaitFor(uint64_t ns) { return WaitUntil(os_gettime_ns() + ns); }
+
+private:
+	std::mutex mutex;
+	std::condition_variable cond;
+	std::atomic_bool stopped = false;
+};
+
+/* Connects to the main screen, retrying once a second until that works or `stop` is signalled (returns null). */
+static inline std::unique_ptr<BScreen> open_main_screen(StopSignal &stop, const char *what)
+{
+	bool warned = false;
+	while (!stop.Stopped()) {
+		std::unique_ptr<BScreen> screen = std::make_unique<BScreen>(B_MAIN_SCREEN_ID);
+		if (screen->IsValid())
+			return screen;
+		if (!warned) {
+			blog(LOG_ERROR, "[haiku-capture] %s: unable to connect to the main screen, retrying", what);
+			warned = true;
+		}
+		screen.reset();
+		stop.WaitFor(1000000000ULL);
+	}
+	return nullptr;
+}
 
 class CaptureThrottle {
 public:
@@ -62,8 +129,8 @@ public:
 		last_pixels = pixels;
 	}
 
-	/* Sleeps until the next frame is due given the requested `fps`. */
-	void Wait(int fps)
+	/* Sleeps until the next frame is due given the requested `fps`. Returns false if `stop` was signalled. */
+	bool Wait(int fps, StopSignal &stop)
 	{
 		const uint64_t interval = 1000000000ULL / (uint64_t)(fps > 0 ? fps : 30);
 		/* a read of duration d must be followed by at least d * (1 - duty) / duty of idle time */
@@ -84,10 +151,11 @@ public:
 
 		next += step;
 		const uint64_t now = os_gettime_ns();
-		if (next < now)
+		if (next < now) {
 			next = now; /* fell behind: don't try to catch up */
-		else
-			os_sleepto_ns(next);
+			return !stop.Stopped();
+		}
+		return stop.WaitUntil(next);
 	}
 
 	void Reset() { next = os_gettime_ns(); }
@@ -119,45 +187,74 @@ static inline void add_capture_method_property(obs_properties_t *props)
 	obs_property_set_long_description(p, obs_module_text("CaptureMethod.Description"));
 }
 
+/* One captured frame, BGRX rows of `linesize` bytes; valid until the next BandedScreenReader::Read(). */
+struct CapturedFrame {
+	const uint8_t *data = nullptr;
+	uint32_t linesize = 0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint64_t took = 0; /* time spent inside the app_server */
+};
+
 class BandedScreenReader {
 public:
-	/* Reads `rect` (screen coordinates, integral) into `frame` as BGRX rows of `stride` bytes, in one piece
-	 * (tear-free) or in short bands (smooth pointer). Returns the time spent inside the app_server, or 0 on
-	 * failure. */
-	uint64_t Read(BScreen &screen, BRect rect, bool cursor, bool banded, std::vector<uint8_t> &frame,
-		      uint32_t &stride)
+	/* Reads `rect` (screen coordinates, integral) in one piece (tear-free) or in short bands (smooth pointer).
+	 * Tear-free frames point straight into the bitmap the app_server wrote to (libobs copies the frame during
+	 * obs_source_output_video(), before the next read); banded frames are assembled in a buffer. Returns false
+	 * on failure, or if `stop` was signalled before all bands were read. */
+	bool Read(BScreen &screen, BRect rect, bool cursor, bool banded, StopSignal &stop, CapturedFrame &out)
 	{
 		const int32 width = rect.IntegerWidth() + 1;
 		const int32 height = rect.IntegerHeight() + 1;
 		if (width <= 0 || height <= 0)
-			return 0;
+			return false;
 
-		/* the app_server copies each read to the bitmap's top-left corner */
-		const int32 capacity = banded ? kMaxRows : height;
-		if (!band || band->Bounds().IntegerWidth() + 1 != width || band->Bounds().IntegerHeight() + 1 < capacity) {
-			band = std::make_unique<BBitmap>(BRect(0, 0, width - 1, capacity - 1), B_RGB32);
+		/* The app_server copies each read to the bitmap's top-left corner, at most the bitmap's size, and rows
+		 * are addressed through BytesPerRow(), so a larger bitmap works as well: only grow it, rounded up, so
+		 * that resizing a window doesn't reallocate it every frame. */
+		const int32 rows_needed = banded ? std::min(kMaxRows, height) : height;
+		const int32 have_width = band ? band->Bounds().IntegerWidth() + 1 : 0;
+		const int32 have_rows = band ? band->Bounds().IntegerHeight() + 1 : 0;
+		if (have_width < width || have_rows < rows_needed) {
+			const int32 alloc_width = RoundUp(std::max(width, have_width));
+			const int32 alloc_rows = RoundUp(std::max(rows_needed, have_rows));
+			band = std::make_unique<BBitmap>(BRect(0, 0, alloc_width - 1, alloc_rows - 1), B_RGB32);
 			if (band->InitCheck() != B_OK) {
 				band.reset();
-				return 0;
+				return false;
 			}
 		}
 
-		stride = (uint32_t)width * 4;
-		frame.resize((size_t)stride * height);
-
 		const uint8_t *bits = (const uint8_t *)band->Bits();
 		const size_t band_stride = (size_t)band->BytesPerRow();
+
+		if (!banded) {
+			const uint64_t start = os_gettime_ns();
+			const status_t err = screen.ReadBitmap(band.get(), cursor, &rect);
+			out.took = os_gettime_ns() - start;
+			if (err != B_OK)
+				return false;
+
+			out.data = bits;
+			out.linesize = (uint32_t)band_stride;
+			out.width = (uint32_t)width;
+			out.height = (uint32_t)height;
+			return true;
+		}
+
+		const size_t stride = (size_t)width * 4;
+		frame.resize(stride * height);
 		uint64_t total = 0;
 
 		for (int32 y = 0; y < height;) {
-			const int32 n = banded ? std::min(rows, height - y) : height;
+			const int32 n = std::min(rows, height - y);
 			BRect part(rect.left, rect.top + y, rect.right, rect.top + y + n - 1);
 
 			const uint64_t start = os_gettime_ns();
 			const status_t err = screen.ReadBitmap(band.get(), cursor, &part);
 			const uint64_t took = os_gettime_ns() - start;
 			if (err != B_OK)
-				return 0;
+				return false;
 			total += took;
 
 			for (int32 r = 0; r < n; r++)
@@ -165,24 +262,34 @@ public:
 			y += n;
 
 			/* size the next band so one read holds the app_server for about kTargetNs */
-			if (banded && took > 0) {
+			if (took > 0) {
 				const double scaled = (double)n * (double)kTargetNs / (double)took;
 				rows = std::clamp((int32)scaled, kMinRows, kMaxRows);
 			}
 
-			/* let the app_server move the cursor and draw before the next band */
-			if (y < height)
-				snooze(kGapUs);
+			/* let the app_server move the cursor and draw before the next band; Stop() abandons the frame */
+			if (y < height && !stop.WaitFor(kGapNs))
+				return false;
 		}
-		return total;
+
+		out.data = frame.data();
+		out.linesize = (uint32_t)stride;
+		out.width = (uint32_t)width;
+		out.height = (uint32_t)height;
+		out.took = total;
+		return true;
 	}
 
 private:
 	static constexpr uint64_t kTargetNs = 2000000; /* 2 ms per band */
-	static constexpr bigtime_t kGapUs = 1000;
+	static constexpr uint64_t kGapNs = 1000000;
 	static constexpr int32 kMinRows = 8;
 	static constexpr int32 kMaxRows = 512;
+	static constexpr int32 kAlign = 64;
+
+	static int32 RoundUp(int32 v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
 	std::unique_ptr<BBitmap> band;
+	std::vector<uint8_t> frame;
 	int32 rows = 64;
 };

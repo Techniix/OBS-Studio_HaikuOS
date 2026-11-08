@@ -61,8 +61,18 @@
 #define PARK_Y -30000.0f
 
 enum {
-	MSG_INJECT = 'inj_', /* window -> app: page (re)loaded, inject CSS / scripts */
+	/* window -> app: page (re)loaded, inject CSS and window.obsstudio; "committed" bool: a new main-frame
+	 * document, "finished" bool: its DOM is ready (runs the startup script once per load) */
+	MSG_INJECT = 'inj_',
 };
+
+/* Bumped whenever the offscreen bitmap may have changed. Everything that draws into it runs on the
+ * application thread while it dispatches a message (BWebPage::paint() for HANDLE_DRAW and visibility
+ * changes, BWebPage::scroll() which blits synchronously from inside WebCore timers, input and script), or in
+ * BWebView::FrameResized() on the window thread. HelperApp::DispatchMessage() bumps it after each message,
+ * HelperView::FrameResized() after a resize; the pump only copies a frame when it changed. A page with
+ * nothing going on (no timers, animations or input) dispatches nothing, so a static overlay costs one copy. */
+static std::atomic<uint32> paint_serial{1};
 
 /* Page script support that mirrors what obs-browser offers pages (the subset that needs no frontend round
  * trip): window.obsstudio.pluginVersion and the visibility/activity events. */
@@ -110,6 +120,7 @@ public:
 		BWebView::FrameResized(width, height);
 		if (width >= 0.0f && height >= 0.0f)
 			offscreen_ready = true;
+		paint_serial++; /* the offscreen bitmap was reallocated or its exposed part cleared */
 	}
 
 	std::atomic_bool offscreen_ready{false};
@@ -125,8 +136,20 @@ public:
 	{
 	}
 
-	void LoadCommitted(const BString &, BWebView *) override { be_app->PostMessage(MSG_INJECT); }
-	void LoadFinished(const BString &, BWebView *) override { be_app->PostMessage(MSG_INJECT); }
+	/* BWebWindow only forwards these for the main frame (FrameLoaderClientHaiku drops child-frame load
+	 * messages); LoadFinished is LOAD_DOC_COMPLETED, which also comes for in-page navigation (fragments) */
+	void LoadCommitted(const BString &, BWebView *) override
+	{
+		BMessage msg(MSG_INJECT);
+		msg.AddBool("committed", true);
+		be_app->PostMessage(&msg);
+	}
+	void LoadFinished(const BString &, BWebView *) override
+	{
+		BMessage msg(MSG_INJECT);
+		msg.AddBool("finished", true);
+		be_app->PostMessage(&msg);
+	}
 
 	void TitleChanged(const BString &title, BWebView *) override
 	{
@@ -266,10 +289,7 @@ public:
 			return;
 		}
 		case OBS_BROWSER_MSG_RELOAD:
-			if (view && window->Lock()) {
-				view->Reload();
-				window->Unlock();
-			}
+			Reload(message->GetBool("nocache", false));
 			return;
 		case OBS_BROWSER_MSG_EXECUTE_JS: {
 			const char *script;
@@ -317,10 +337,26 @@ public:
 			}
 			return;
 		case MSG_INJECT:
+			if (message->GetBool("committed", false))
+				startup_pending = true;
 			Inject();
+			if (message->GetBool("finished", false) && startup_pending) {
+				startup_pending = false;
+				if (!startup_script.empty())
+					RunScript(startup_script.c_str());
+			}
 			return;
 		}
 		BApplication::MessageReceived(message);
+	}
+
+	void DispatchMessage(BMessage *message, BHandler *handler) override
+	{
+		/* the message is gone after dispatching (BWebPage coalesces queued HANDLE_DRAW messages) */
+		const bool may_paint = message->what != OBS_BROWSER_MSG_STARTUP_SCRIPT;
+		BApplication::DispatchMessage(message, handler);
+		if (may_paint)
+			paint_serial++;
 	}
 
 private:
@@ -355,7 +391,8 @@ private:
 			mapped->helper_state = old->helper_state;
 		}
 		mapped->helper_heartbeat = system_time();
-		mapped->helper_team = (int32_t)Team();
+		__sync_synchronize();
+		mapped->helper_team = (int32_t)Team(); /* tells OBS the switch is done */
 		shm = mapped;
 		area = clone;
 		if (window && window->Lock()) {
@@ -402,6 +439,26 @@ private:
 		Inject(); /* transparency and CSS may have changed */
 	}
 
+	/* HaikuWebKit has no cache-bypassing reload (BWebPage/BWebFrame::Reload() is a normal reload that
+	 * revalidates) and no call that clears the cache. Dropping the memory cache to zero capacity and back
+	 * evicts what no page uses any more; resources the current page still holds are revalidated. */
+	void Reload(bool nocache)
+	{
+		if (nocache) {
+			if (!warned_nocache) {
+				LOG("HaikuWebKit cannot bypass its cache; the page reloads normally (unused cached resources "
+				    "are dropped, the rest is revalidated)\n");
+				warned_nocache = true;
+			}
+			BWebPage::SetCacheModel(B_WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+			BWebPage::SetCacheModel(B_WEBKIT_CACHE_MODEL_WEB_BROWSER);
+		}
+		if (view && window->Lock()) {
+			view->Reload();
+			window->Unlock();
+		}
+	}
+
 	void RunScript(const char *script)
 	{
 		BWebFrame *frame = (view && view->WebPage()) ? view->WebPage()->MainFrame() : nullptr;
@@ -417,7 +474,8 @@ private:
 	}
 
 	/* Runs on the application thread, which is WebCore's main thread (BWebPage::InitializeOnce attaches the
-	 * WebCore run loop to be_app). */
+	 * WebCore run loop to be_app). Idempotent, so it runs whenever a window object may be new and after every
+	 * configuration; the startup script runs once per main-frame load instead (MSG_INJECT). */
 	void Inject()
 	{
 		BWebFrame *frame = (view && view->WebPage()) ? view->WebPage()->MainFrame() : nullptr;
@@ -437,24 +495,22 @@ private:
 					 escaped + "';})();";
 			RunScript(js.c_str());
 		}
-
-		if (!startup_script.empty())
-			RunScript(startup_script.c_str());
 	}
 
+	/* the same events and payloads as obs-browser: detail is {"visible":bool} / {"active":bool} */
 	void Visibility(BMessage *message)
 	{
 		bool value;
 		if (message->FindBool("visible", &value) == B_OK) {
 			std::string js = std::string("window.dispatchEvent(new CustomEvent('obsSourceVisibleChanged',"
-						     "{detail:") +
-					 (value ? "true" : "false") + "}));";
+						     "{detail:{visible:") +
+					 (value ? "true" : "false") + "}}));";
 			RunScript(js.c_str());
 		}
 		if (message->FindBool("active", &value) == B_OK) {
 			std::string js = std::string("window.dispatchEvent(new CustomEvent('obsSourceActiveChanged',"
-						     "{detail:") +
-					 (value ? "true" : "false") + "}));";
+						     "{detail:{active:") +
+					 (value ? "true" : "false") + "}}));";
 			RunScript(js.c_str());
 		}
 	}
@@ -565,6 +621,8 @@ private:
 	{
 		bigtime_t next = system_time();
 		bool warned_alpha = false;
+		uint32 copied_serial = 0;             /* paint_serial starts at 1: the first tick always copies */
+		obs_browser_shm *copied_to = nullptr; /* a new area always gets a frame */
 
 		while (!quitting) {
 			const bigtime_t now = system_time();
@@ -585,10 +643,17 @@ private:
 				return;
 			}
 
-			if (window && view->offscreen_ready && window->LockWithTimeout(interval) == B_OK) {
+			/* Read the serial before getOffscreen(), which syncs the offscreen view: anything drawn after
+			 * this read bumps it again and is copied on the next tick. */
+			const uint32 serial = paint_serial.load();
+			if ((serial != copied_serial || s != copied_to) && window && view->offscreen_ready &&
+			    window->LockWithTimeout(interval) == B_OK) {
 				BBitmap *bitmap = WebCore::DumpRenderTreeClient::getOffscreen(view);
 				if (bitmap && bitmap->Lock()) {
-					CopyFrame(s, bitmap, warned_alpha);
+					if (CopyFrame(s, bitmap, warned_alpha)) {
+						copied_serial = serial;
+						copied_to = s;
+					}
 					bitmap->Unlock();
 				}
 				window->Unlock();
@@ -601,7 +666,8 @@ private:
 		}
 	}
 
-	void CopyFrame(obs_browser_shm *s, BBitmap *bitmap, bool &warned_alpha)
+	/* false if nothing was published (and the same picture has to be copied again later) */
+	bool CopyFrame(obs_browser_shm *s, BBitmap *bitmap, bool &warned_alpha)
 	{
 		const BRect bounds = bitmap->Bounds();
 		int32 w = (int32)bounds.IntegerWidth() + 1;
@@ -612,15 +678,15 @@ private:
 		if (h > height)
 			h = height;
 		if (w <= 0 || h <= 0)
-			return;
+			return false;
 
 		const color_space cs = bitmap->ColorSpace();
 		if (cs != B_RGB32 && cs != B_RGBA32)
-			return;
+			return false;
 
 		const uint32 dst_stride = (uint32)w * 4;
 		if ((uint64)dst_stride * (uint64)h > s->capacity)
-			return; /* OBS is about to hand us a bigger area */
+			return false; /* OBS is about to hand us a bigger area */
 
 		const uint8 *src = (const uint8 *)bitmap->Bits();
 		const int32 src_stride = bitmap->BytesPerRow();
@@ -659,6 +725,7 @@ private:
 		s->frame_count++;
 		__sync_synchronize();
 		atomic_add((int32 *)&s->seq, 1); /* even: complete */
+		return true;
 	}
 
 	area_id source_area;
@@ -680,6 +747,8 @@ private:
 	std::string css;
 	std::string current_url;
 	std::string startup_script;
+	bool startup_pending = false; /* a main-frame load committed and its startup script has not run yet */
+	bool warned_nocache = false;
 	int32 buttons = 0;
 };
 

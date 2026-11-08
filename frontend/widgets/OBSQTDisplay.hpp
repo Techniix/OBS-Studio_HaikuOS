@@ -22,13 +22,17 @@ class OBSQTDisplay : public QWidget {
 	bool destroying = false;
 
 #ifdef __HAIKU__
-	/* libobs renders Haiku swapchains offscreen and hands every frame to us (see gl-haiku.c). */
+	/* libobs renders Haiku swapchains offscreen and hands every frame to us (see gl-haiku.c).
+	 * backFrame is written by the graphics thread only (while the display exists) and then swapped with
+	 * frontFrame under frameMutex; paintEvent takes a shallow copy of frontFrame under the lock and paints
+	 * it without holding the lock, so a slow UI paint never stalls the graphics thread. */
 	std::mutex frameMutex;
-	QImage frame;
+	QImage frontFrame;
+	QImage backFrame;
 	std::atomic_bool frameUpdatePending = false;
 
-	static void HaikuPresent(void *param, const uint8_t *bgra, uint32_t width, uint32_t height,
-				 uint32_t linesize);
+	static void HaikuPresent(void *param, const uint8_t *top_row, uint32_t width, uint32_t height,
+				 int32_t stride);
 #endif
 
 protected:

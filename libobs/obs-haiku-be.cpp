@@ -19,6 +19,7 @@
 
 #include <string.h>
 
+#include <Application.h>
 #include <InterfaceDefs.h>
 #include <Point.h>
 
@@ -30,7 +31,8 @@ extern "C" bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTE
 {
 	key_info info;
 
-	/* Talks to the app_server; works from any thread, no BApplication required. */
+	/* Talks to the input_server over a port; works from any thread with no BApplication.
+	 * (Unlike get_mouse(), which needs be_app; see below.) */
 	if (get_key_info(&info) != B_OK)
 		return false;
 
@@ -44,6 +46,12 @@ extern "C" bool obs_haiku_get_mouse_buttons(uint32_t *buttons)
 {
 	BPoint where;
 	uint32 state = 0;
+
+	/* get_mouse() goes through BPrivate::AppServerLink, which calls debugger() when there is
+	 * no be_app (e.g. the hotkey thread running before/without Qt's BApplication). Report no
+	 * buttons instead. */
+	if (be_app == NULL)
+		return false;
 
 	if (get_mouse(&where, &state) != B_OK)
 		return false;

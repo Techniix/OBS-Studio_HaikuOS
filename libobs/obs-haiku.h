@@ -35,11 +35,12 @@ extern "C" {
 #define OBS_HAIKU_CONTROL_KEY 0x00000004 /* B_CONTROL_KEY */
 #define OBS_HAIKU_OPTION_KEY 0x00000040  /* B_OPTION_KEY: the Windows key by default */
 
-/* Global keyboard state from the app_server: key bitmap indexed by Haiku raw key code, and the current
+/* Global keyboard state from the input_server: key bitmap indexed by Haiku raw key code, and the current
  * modifier mask (which reflects the user's Keymap preferences, e.g. swapped Ctrl/Alt). */
 bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTES], uint32_t *modifiers);
 
-/* Global mouse button bitmask (B_PRIMARY_MOUSE_BUTTON = 1, B_SECONDARY = 2, B_TERTIARY = 4, ...). */
+/* Global mouse button bitmask (B_PRIMARY_MOUSE_BUTTON = 1, B_SECONDARY = 2, B_TERTIARY = 4, ...) from the
+ * app_server. Returns false without a BApplication (the app_server link would call debugger()). */
 bool obs_haiku_get_mouse_buttons(uint32_t *buttons);
 
 #ifdef __cplusplus

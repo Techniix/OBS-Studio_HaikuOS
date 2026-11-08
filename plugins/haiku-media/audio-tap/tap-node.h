@@ -99,4 +99,7 @@ private:
 	media_format format; /* wildcard until the first side connects; then both sides share it */
 	bigtime_t downstream_latency = 0;
 	bool output_enabled = true;
+	int64 write_total = 0;   /* bytes copied into the ring; only ever stored to shm->write_pos */
+	int32 format_serial = 0; /* seqlock counter, only ever stored to shm->format_serial */
+	BBufferGroup *upstream_group = nullptr; /* group passed on to the mixer by SetBufferGroup() */
 };
