@@ -40,6 +40,11 @@
  * under a timeout. A driver that hangs, crashes or renders wrong pixels there gets OSMesa instead of a frozen
  * OBS. See run_gl_probe().
  *
+ * A driver can also pass the self-test and hang later on a path the test doesn't reach. With EGL, a watchdog
+ * thread notices when a thread has held the context for too long (see watchdog_thread()), logs the driver's
+ * identity, records it in a marker file and offers to restart OBS with the CPU renderer. Later launches skip
+ * EGL while that same driver is installed (see gl_platform_create()).
+ *
  * Readback costs one glReadPixels per displayed frame, which is acceptable for preview/projector sizes and
  * keeps the renderer independent of any toolkit. The rows are handed over bottom-up as GL returns them, with
  * the pointer at the top row and a negative stride, so the consumer's copy into its own image does the vertical
@@ -49,20 +54,30 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <OS.h>
+#include <image.h>
+
 #include <obs.h>
 #include <util/bmem.h>
+#include <util/dstr.h>
 #include <util/platform.h>
+#include <util/threading.h>
 
 #include "gl-subsystem.h"
+#include "gl-haiku-alert.h"
+#include "haiku-gl-probe/gl-identity.h"
 
 #include <glad/glad_egl.h>
 
@@ -130,6 +145,13 @@ struct gl_windowinfo {
 	size_t readback_size;
 };
 
+/* see haiku-gl-probe/gl-identity.h */
+struct gl_identity {
+	bool valid;
+	uint64_t hash;
+	char text[GL_IDENTITY_MAX]; /* parts separated by '\n' */
+};
+
 struct gl_platform {
 	bool use_osmesa;
 
@@ -141,6 +163,17 @@ struct gl_platform {
 	/* OSMesa backend */
 	OSMesaContext osmesa_ctx;
 	uint32_t osmesa_dummy; /* 1x1 buffer used when no swapchain is loaded */
+
+	/* EGL backend: the driver's identity and the hang watchdog (see watchdog_thread()) */
+	struct gl_identity identity;
+	char renderer[256];
+	bool watchdog_running;
+	pthread_t watchdog;
+	os_event_t *watchdog_event;
+	int watchdog_timeout_s;
+	_Atomic uint64_t held_since; /* os_gettime_ns() when device_enter_context() began, 0 while released */
+	atomic_int holder;           /* thread_id of the thread that entered */
+	atomic_uint enters;          /* device_enter_context() calls so far (saturates) */
 };
 
 #define GL_UNSIGNED_BYTE_VALUE 0x1401 /* GL_UNSIGNED_BYTE, for OSMesaMakeCurrent */
@@ -534,22 +567,59 @@ static const char *gl_probe_exit_string(int code)
 }
 
 struct gl_probe_output {
-	char line[256];
+	char line[1536]; /* an identity part holds a path (B_PATH_NAME_LENGTH) */
 	size_t len;
 	unsigned lines;
+
+	/* the driver identity the probe reports ("IDENTITY <hash>", "IDENTITY-PART <part>" lines) */
+	bool have_hash;
+	uint64_t hash;
+	struct dstr identity;
 };
+
+#define GL_PROBE_IDENTITY "IDENTITY "
+#define GL_PROBE_IDENTITY_PART "IDENTITY-PART "
 
 static void gl_probe_flush_line(struct gl_probe_output *out)
 {
 	if (!out->len)
 		return;
 	out->line[out->len] = '\0';
+	out->len = 0;
+
+	if (strncmp(out->line, GL_PROBE_IDENTITY, strlen(GL_PROBE_IDENTITY)) == 0) {
+		char *end = NULL;
+		out->hash = strtoull(out->line + strlen(GL_PROBE_IDENTITY), &end, 16);
+		out->have_hash = end && end != out->line + strlen(GL_PROBE_IDENTITY);
+		return;
+	}
+	if (strncmp(out->line, GL_PROBE_IDENTITY_PART, strlen(GL_PROBE_IDENTITY_PART)) == 0) {
+		if (out->identity.len)
+			dstr_cat_ch(&out->identity, '\n');
+		dstr_cat(&out->identity, out->line + strlen(GL_PROBE_IDENTITY_PART));
+		return;
+	}
+
 	if (out->lines < GL_PROBE_MAX_LOG_LINES)
 		blog(LOG_INFO, "Haiku GL probe: %s", out->line);
 	else if (out->lines == GL_PROBE_MAX_LOG_LINES)
 		blog(LOG_INFO, "Haiku GL probe: (further output dropped)");
 	out->lines++;
-	out->len = 0;
+}
+
+/* The probe's identity, if it reported a complete one (its hash matches the text). */
+static void gl_probe_take_identity(struct gl_probe_output *out, struct gl_identity *id)
+{
+	id->valid = false;
+	if (!out->have_hash || !out->identity.len || out->identity.len >= sizeof(id->text))
+		return;
+	snprintf(id->text, sizeof(id->text), "%s", out->identity.array);
+	id->hash = gl_identity_hash(id->text);
+	if (id->hash != out->hash) {
+		blog(LOG_WARNING, "Haiku GL: driver self-test reported an inconsistent driver identity, ignored");
+		return;
+	}
+	id->valid = true;
 }
 
 static void gl_probe_add_output(struct gl_probe_output *out, const char *data, size_t size)
@@ -647,13 +717,15 @@ static int gl_probe_fd(int fd)
 
 /*
  * Runs obs-haiku-gl-probe, which drives the EGL driver the way OBS does (surfaceless context, one context
- * handed between threads, FBO rendering, fences, readback) for 120 frames and checks the pixels. A driver
- * that hangs (as a young NVK/Zink once did on its first frames) would otherwise freeze OBS's graphics thread
- * and with it the UI; in a child process it costs the timeout and a fallback to OSMesa. The probe runs on
- * every launch, so a driver update is always re-tested; on a healthy driver it costs one EGL initialisation
- * and a few milliseconds of rendering. Its output goes into the OBS log.
+ * handed between threads, FBO rendering, fences, readback, a 2560x1080 async-video texture streamed through
+ * its pixel unpack buffer from both threads, several swapchains of different sizes that get resized) for 120
+ * frames and checks the pixels. A driver that hangs (as a young NVK/Zink once did on its first frames) would
+ * otherwise freeze OBS's graphics thread and with it the UI; in a child process it costs the timeout and a
+ * fallback to OSMesa. The probe runs on every launch, so a driver update is always re-tested; on a healthy
+ * driver it costs one EGL initialisation and a fraction of a second of rendering. Its output goes into the
+ * OBS log, except the driver identity it reports, which is returned in *identity (valid only if it passed).
  */
-static enum gl_probe_result run_gl_probe(void)
+static enum gl_probe_result run_gl_probe(struct gl_identity *identity)
 {
 	const char *skip = getenv("OBS_HAIKU_GL_PROBE");
 	if (skip && strcmp(skip, "0") == 0) {
@@ -744,6 +816,7 @@ static enum gl_probe_result run_gl_probe(void)
 	/* collect the output until the probe closes the pipe (it exited) or the time is up */
 	const uint64_t deadline = start + (uint64_t)(timeout * 1e9);
 	struct gl_probe_output out = {0};
+	dstr_init(&out.identity);
 	bool timed_out = false;
 	for (;;) {
 		const uint64_t now = os_gettime_ns();
@@ -769,6 +842,8 @@ static enum gl_probe_result run_gl_probe(void)
 	}
 	gl_probe_flush_line(&out);
 	close(fds[0]);
+	gl_probe_take_identity(&out, identity);
+	dstr_free(&out.identity);
 
 	int status = 0;
 	pid_t reaped = timed_out ? 0 : gl_probe_reap(pid, &status, deadline);
@@ -816,6 +891,401 @@ static enum gl_probe_result run_gl_probe(void)
 }
 
 /* ---------------------------------------------------------------------------------------------------------- */
+/* Driver identity and the hang record                                                                        */
+
+/*
+ * The hang record: a small text file in OBS's config directory, written by the watchdog when the hardware
+ * driver hangs, holding the hung driver's identity (haiku-gl-probe/gl-identity.h). While it exists and the
+ * installed driver has the same identity, OBS uses the CPU renderer. A changed identity (driver updated)
+ * removes it.
+ */
+#define GL_HANG_MARKER "obs-studio/haiku-gl-hang"
+#define GL_HANG_MARKER_KEY "identity "
+
+static void log_identity(int level, const char *prefix, const struct gl_identity *id)
+{
+	blog(level, "%sdriver identity %016" PRIx64 ":", prefix, id->hash);
+	const char *part = id->text;
+	while (part && *part) {
+		const char *end = strchr(part, '\n');
+		const int len = end ? (int)(end - part) : (int)strlen(part);
+		blog(level, "%s  %.*s", prefix, len, part);
+		part = end ? end + 1 : NULL;
+	}
+}
+
+/* in-process identity; needs the EGL context current */
+static void identity_compute(struct gl_identity *id)
+{
+	gl_identity_build(id->text, sizeof(id->text), (const char *)glGetString(GL_RENDERER),
+			  (const char *)glGetString(GL_VERSION));
+	id->hash = gl_identity_hash(id->text);
+	id->valid = true;
+}
+
+/* Reads the identity hash from the hang record. Returns false if there is none (or it is unreadable). */
+static bool hang_marker_read(uint64_t *hash)
+{
+	char *path = os_get_config_path_ptr(GL_HANG_MARKER);
+	char *text = path ? os_quick_read_utf8_file(path) : NULL;
+	bool found = false;
+
+	for (const char *line = text; line && *line;) {
+		if (strncmp(line, GL_HANG_MARKER_KEY, strlen(GL_HANG_MARKER_KEY)) == 0) {
+			char *end = NULL;
+			*hash = strtoull(line + strlen(GL_HANG_MARKER_KEY), &end, 16);
+			found = end && end != line + strlen(GL_HANG_MARKER_KEY);
+			break;
+		}
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
+	if (text && !found)
+		blog(LOG_WARNING, "Haiku GL: ignoring unreadable hang record %s", path);
+	bfree(text);
+	bfree(path);
+	return found;
+}
+
+static void hang_marker_remove(void)
+{
+	char *path = os_get_config_path_ptr(GL_HANG_MARKER);
+	if (path && os_unlink(path) == 0)
+		blog(LOG_INFO, "Haiku GL: removed the hang record %s", path);
+	bfree(path);
+}
+
+static bool hang_marker_write(const struct gl_identity *id, const char *renderer)
+{
+	char *dir = os_get_config_path_ptr("obs-studio");
+	char *path = os_get_config_path_ptr(GL_HANG_MARKER);
+	bool ok = false;
+
+	if (dir && path && os_mkdirs(dir) != MKDIR_ERROR) {
+		FILE *file = fopen(path, "w");
+		if (file) {
+			fprintf(file,
+				"# Written by OBS Studio when the hardware OpenGL driver stopped responding.\n"
+				"# While this driver (identity below) is installed, OBS uses the CPU renderer.\n"
+				"# Update the driver, delete this file, or start OBS with OBS_HAIKU_GL=egl to use it.\n"
+				"# Driver: %s\n" GL_HANG_MARKER_KEY "%016" PRIx64 "\n",
+				renderer, id->hash);
+			const char *part = id->text;
+			while (part && *part) {
+				const char *end = strchr(part, '\n');
+				const int len = end ? (int)(end - part) : (int)strlen(part);
+				fprintf(file, "part %.*s\n", len, part);
+				part = end ? end + 1 : NULL;
+			}
+			/* the machine may well need a reset after a GPU hang: get it onto the disk now */
+			ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
+			ok = fclose(file) == 0 && ok;
+		}
+	}
+	if (ok)
+		blog(LOG_ERROR, "Haiku GL watchdog: recorded the hang in %s", path);
+	else
+		blog(LOG_ERROR, "Haiku GL watchdog: unable to write the hang record %s (%s)", path ? path : "?",
+		     strerror(errno));
+	bfree(dir);
+	bfree(path);
+	return ok;
+}
+
+/* Whether libOSMesa can be found on the library path, without loading it into a process that has a hung
+ * driver in it. */
+static bool osmesa_installed(void)
+{
+	if (osmesa.lib)
+		return true;
+
+	const char *env = getenv("LIBRARY_PATH");
+	char *list = bstrdup(env && *env ? env
+					 : "/boot/home/config/non-packaged/lib:/boot/home/config/lib:"
+					   "/boot/system/non-packaged/lib:/boot/system/lib");
+	char *app_dir = os_get_executable_path_ptr("");
+	bool found = false;
+	char *save = NULL;
+
+	for (char *dir = strtok_r(list, ":", &save); dir && !found; dir = strtok_r(NULL, ":", &save)) {
+		struct dstr path = {0};
+		/* %A is the application's directory */
+		if (strncmp(dir, "%A", 2) == 0) {
+			dstr_copy(&path, app_dir ? app_dir : "");
+			dstr_cat(&path, dir + 2);
+		} else {
+			dstr_copy(&path, dir);
+		}
+		const size_t base = path.len;
+		static const char *names[] = {"/libOSMesa.so.8", "/libOSMesa.so"};
+		for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !found; i++) {
+			dstr_resize(&path, base);
+			dstr_cat(&path, names[i]);
+			found = access(path.array, R_OK) == 0;
+		}
+		dstr_free(&path);
+	}
+	bfree(app_dir);
+	bfree(list);
+	return found;
+}
+
+/* ---------------------------------------------------------------------------------------------------------- */
+/* Hang watchdog (EGL only)                                                                                   */
+
+/*
+ * libobs's graphics thread enters the context (gs_enter_context() -> device_enter_context()) several times per
+ * frame and leaves it in between; other threads enter it briefly to create or update resources. A thread that
+ * holds it for many seconds is stuck in the driver, which takes the UI with it (the UI thread waits for the
+ * graphics mutex). Long legitimate holds happen during startup only (obs_init_graphics() compiles every
+ * effect in one hold; a cold shader cache on a young driver can take seconds), so the watchdog is armed only
+ * after GL_WATCHDOG_ARM_ENTERS entries, which the graphics thread reaches within seconds of running.
+ */
+#define GL_WATCHDOG_DEFAULT_TIMEOUT_S 15
+#define GL_WATCHDOG_ARM_ENTERS 300
+
+/* Restarts OBS: a shell waits for this team to end (so OBS's single-instance check doesn't see it), then
+ * runs the same executable with the same arguments and OBS_HAIKU_GL removed (or set to osmesa if the hang
+ * record could not be written). Then ends this team. Only returns if nothing could be started. */
+static void relaunch_obs(bool force_osmesa)
+{
+	char exe[B_PATH_NAME_LENGTH] = "";
+	image_info image;
+	int32 cookie = 0;
+	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &image) == B_OK) {
+		if (image.type == B_APP_IMAGE) {
+			snprintf(exe, sizeof(exe), "%s", image.name);
+			break;
+		}
+	}
+	if (!*exe) {
+		blog(LOG_ERROR, "Haiku GL watchdog: unable to find the OBS executable, not restarting");
+		return;
+	}
+
+	/* libobs keeps a copy of main()'s arguments (obs_set_cmdline_args()) */
+	const struct obs_cmdline_args args = obs_get_cmdline_args();
+	const int extra = args.argc > 1 && args.argv ? args.argc - 1 : 0;
+	char team[16];
+	snprintf(team, sizeof(team), "%d", (int)getpid());
+
+	/* waits at most 20 s for the old team, then starts OBS anyway */
+	static const char *script = "team=$1; shift; i=0; "
+				    "while kill -0 \"$team\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.2; i=$((i+1)); done; "
+				    "exec \"$@\"";
+	char **argv = bzalloc(sizeof(char *) * (size_t)(extra + 7));
+	size_t n = 0;
+	argv[n++] = "/bin/sh";
+	argv[n++] = "-c";
+	argv[n++] = (char *)script;
+	argv[n++] = "obs-haiku-restart";
+	argv[n++] = team;
+	argv[n++] = exe;
+	for (int i = 1; i <= extra; i++)
+		argv[n++] = args.argv[i];
+	argv[n] = NULL;
+
+	extern char **environ;
+	size_t env_count = 0;
+	while (environ[env_count])
+		env_count++;
+	char **envp = bzalloc(sizeof(char *) * (env_count + 2));
+	size_t e = 0;
+	for (size_t i = 0; i < env_count; i++) {
+		if (strncmp(environ[i], "OBS_HAIKU_GL=", strlen("OBS_HAIKU_GL=")) != 0)
+			envp[e++] = environ[i];
+	}
+	if (force_osmesa)
+		envp[e++] = "OBS_HAIKU_GL=osmesa";
+	envp[e] = NULL;
+
+	posix_spawnattr_t attr;
+	sigset_t set;
+	posix_spawnattr_init(&attr);
+	sigemptyset(&set);
+	posix_spawnattr_setsigmask(&attr, &set);
+	gl_probe_default_signals(&set);
+	posix_spawnattr_setsigdefault(&attr, &set);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+
+	pid_t pid = -1;
+	const int err = posix_spawn(&pid, argv[0], NULL, &attr, argv, envp);
+	posix_spawnattr_destroy(&attr);
+	bfree(envp);
+	bfree(argv);
+
+	if (err != 0) {
+		blog(LOG_ERROR, "Haiku GL watchdog: unable to restart OBS (%s)", strerror(err));
+		return;
+	}
+	blog(LOG_ERROR, "Haiku GL watchdog: restarting %s%s, ending this instance", exe,
+	     force_osmesa ? " with OBS_HAIKU_GL=osmesa" : "");
+
+	/* Kills every thread of the team, the one stuck in the driver included (kill_team() wants a real team
+	 * id, B_CURRENT_TEAM is rejected) */
+	kill_team(getpid());
+	_exit(EXIT_FAILURE);
+}
+
+static void watchdog_report(struct gl_platform *plat, uint64_t held_ns, thread_id holder, bool *recorded)
+{
+	thread_info info;
+	const char *name = get_thread_info(holder, &info) == B_OK ? info.name : "?";
+
+	blog(LOG_ERROR,
+	     "Haiku GL watchdog: the graphics driver stopped responding: thread %d (%s) has held the OpenGL "
+	     "context for %.0f s",
+	     (int)holder, name, (double)held_ns / 1e9);
+	blog(LOG_ERROR, "Haiku GL watchdog: driver: %s", plat->renderer);
+	log_identity(LOG_ERROR, "Haiku GL watchdog: ", &plat->identity);
+	*recorded = hang_marker_write(&plat->identity, plat->renderer);
+}
+
+static struct gl_haiku_alert *watchdog_alert(struct gl_platform *plat, uint64_t held_ns, bool can_restart)
+{
+	struct dstr text = {0};
+	dstr_printf(&text,
+		    "The graphics driver stopped responding.\n\n"
+		    "OBS has been waiting %.0f seconds for the graphics driver (%s).",
+		    (double)held_ns / 1e9, plat->renderer);
+	if (can_restart)
+		dstr_cat(&text, " OBS can restart using the CPU renderer, which is slower but does not depend on "
+				"the driver. A recording or stream in progress stops, and the recording may be "
+				"incomplete.\n\n"
+				"OBS keeps using the CPU renderer until this driver is updated. To try the driver "
+				"again anyway, start OBS with OBS_HAIKU_GL=egl.");
+	else
+		dstr_cat(&text, " The CPU renderer (libOSMesa, HaikuPorts package \"mesa\") is not installed, so OBS "
+				"cannot switch to it. Quitting stops a recording or stream in progress, and the "
+				"recording may be incomplete.");
+
+	struct gl_haiku_alert *alert =
+		gl_haiku_alert_show("OBS Studio", text.array, "Keep waiting",
+				    can_restart ? "Restart with CPU renderer" : "Quit OBS");
+	dstr_free(&text);
+	return alert;
+}
+
+static void *watchdog_thread(void *data)
+{
+	struct gl_platform *plat = data;
+	const uint64_t timeout_ns = (uint64_t)plat->watchdog_timeout_s * 1000000000ull;
+	uint64_t hung_hold = 0; /* held_since of the hold that was declared a hang */
+	uint64_t ask_at = 0;
+	bool recorded = false, can_restart = false;
+	struct gl_haiku_alert *alert = NULL;
+
+	os_set_thread_name("haiku-gl-watchdog");
+
+	while (os_event_timedwait(plat->watchdog_event, 1000) == ETIMEDOUT) {
+		const uint64_t since = atomic_load(&plat->held_since);
+		const uint64_t now = os_gettime_ns();
+
+		if (hung_hold && since != hung_hold) {
+			/* that hold ended after all: not a hang worth a CPU renderer next time */
+			blog(LOG_WARNING,
+			     "Haiku GL watchdog: the graphics driver responded again after %.0f s; keeping the "
+			     "hardware renderer",
+			     (double)(now - hung_hold) / 1e9);
+			if (alert)
+				gl_haiku_alert_close(alert);
+			alert = NULL;
+			if (recorded)
+				hang_marker_remove();
+			hung_hold = 0;
+			recorded = false;
+		}
+
+		if (alert) {
+			const int answer = gl_haiku_alert_wait(alert, 0);
+			if (answer == GL_HAIKU_ALERT_PENDING)
+				continue;
+			alert = NULL;
+			if (answer == 1) {
+				blog(LOG_ERROR, "Haiku GL watchdog: the user chose to %s",
+				     can_restart ? "restart with the CPU renderer" : "quit");
+				if (can_restart) {
+					relaunch_obs(!recorded);
+				} else {
+					kill_team(getpid());
+					_exit(EXIT_FAILURE);
+				}
+			}
+			blog(LOG_WARNING, "Haiku GL watchdog: waiting another %d s for the graphics driver",
+			     plat->watchdog_timeout_s);
+			ask_at = now + timeout_ns;
+			continue;
+		}
+
+		if (!since || atomic_load(&plat->enters) < GL_WATCHDOG_ARM_ENTERS)
+			continue;
+		const uint64_t held_ns = now > since ? now - since : 0;
+		if (!hung_hold) {
+			if (held_ns <= timeout_ns)
+				continue;
+			hung_hold = since;
+			watchdog_report(plat, held_ns, (thread_id)atomic_load(&plat->holder), &recorded);
+			can_restart = osmesa_installed();
+			ask_at = now;
+		}
+		if (now >= ask_at) {
+			alert = watchdog_alert(plat, held_ns, can_restart);
+			if (!alert) {
+				blog(LOG_ERROR, "Haiku GL watchdog: no alert can be shown (no BApplication); OBS keeps "
+						"waiting for the driver");
+				ask_at = UINT64_MAX;
+			}
+		}
+	}
+
+	if (alert)
+		gl_haiku_alert_close(alert);
+	return NULL;
+}
+
+/* OBS_HAIKU_GL_WATCHDOG=<seconds> (0 disables) */
+static void watchdog_start(struct gl_platform *plat)
+{
+	plat->watchdog_timeout_s = GL_WATCHDOG_DEFAULT_TIMEOUT_S;
+	const char *env = getenv("OBS_HAIKU_GL_WATCHDOG");
+	if (env && *env) {
+		char *end = NULL;
+		long value = strtol(env, &end, 10);
+		if (end != env && *end == '\0' && value >= 0 && value <= 3600)
+			plat->watchdog_timeout_s = (int)value;
+		else
+			blog(LOG_WARNING, "Haiku GL: ignoring invalid OBS_HAIKU_GL_WATCHDOG '%s'", env);
+	}
+	if (plat->watchdog_timeout_s == 0) {
+		blog(LOG_INFO, "Haiku GL: driver hang watchdog disabled (OBS_HAIKU_GL_WATCHDOG=0)");
+		return;
+	}
+
+	if (os_event_init(&plat->watchdog_event, OS_EVENT_TYPE_MANUAL) != 0)
+		return;
+	if (pthread_create(&plat->watchdog, NULL, watchdog_thread, plat) != 0) {
+		os_event_destroy(plat->watchdog_event);
+		plat->watchdog_event = NULL;
+		blog(LOG_WARNING, "Haiku GL: unable to start the driver hang watchdog");
+		return;
+	}
+	plat->watchdog_running = true;
+	blog(LOG_INFO, "Haiku GL: driver hang watchdog: %d s", plat->watchdog_timeout_s);
+}
+
+static void watchdog_stop(struct gl_platform *plat)
+{
+	if (!plat->watchdog_running)
+		return;
+	os_event_signal(plat->watchdog_event);
+	pthread_join(plat->watchdog, NULL);
+	os_event_destroy(plat->watchdog_event);
+	plat->watchdog_event = NULL;
+	plat->watchdog_running = false;
+}
+
+/* ---------------------------------------------------------------------------------------------------------- */
 
 static bool egl_create_and_load(gs_device_t *device, bool fallback_available)
 {
@@ -850,6 +1320,15 @@ static bool osmesa_create_and_load(gs_device_t *device)
 	return false;
 }
 
+/* Without OSMesa (Mesa 25 has none) a driver that should be avoided is the only chance left. */
+static bool osmesa_instead_of_egl(gs_device_t *device, const char *why)
+{
+	if (osmesa_create_and_load(device))
+		return true;
+	blog(LOG_WARNING, "Haiku GL: OSMesa is not available; using the hardware driver that %s", why);
+	return egl_create_and_load(device, false);
+}
+
 extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adapter)
 {
 	UNUSED_PARAMETER(adapter);
@@ -865,26 +1344,73 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 
 	/* Nothing forced: test the EGL driver in a separate process first (see run_gl_probe()). */
 	enum gl_probe_result probe = GL_PROBE_UNAVAILABLE;
+	struct gl_identity *probe_id = bzalloc(sizeof(struct gl_identity));
 	if (want_egl && want_osmesa)
-		probe = run_gl_probe();
+		probe = run_gl_probe(probe_id);
+	if (probe != GL_PROBE_PASSED)
+		probe_id->valid = false;
 
+	/*
+	 * The hang record (see watchdog_thread()) of a driver that hung in an earlier session. Only consulted
+	 * when nothing is forced: OBS_HAIKU_GL=egl uses the driver regardless (and keeps the record). The
+	 * probe's identity decides: the same driver gets the CPU renderer, a different one gets the record
+	 * removed. Without one (OBS_HAIKU_GL_PROBE=0, probe missing) the identity is computed in this process
+	 * after EGL is up, and the record only ever avoids that driver, it is not removed: the image list of this
+	 * process may differ from the probe's, so a mismatch here does not prove an update.
+	 */
+	uint64_t marker_hash = 0;
+	const bool have_marker = want_egl && (probe == GL_PROBE_PASSED || probe == GL_PROBE_UNAVAILABLE) &&
+				 hang_marker_read(&marker_hash);
+	bool marker_match = false, marker_check_late = false;
+	if (have_marker && !want_osmesa) {
+		blog(LOG_WARNING, "Haiku GL: the hardware driver hung in a previous session; using it anyway "
+				  "(OBS_HAIKU_GL=egl)");
+	} else if (have_marker && probe_id->valid) {
+		marker_match = probe_id->hash == marker_hash;
+		if (!marker_match) {
+			blog(LOG_INFO,
+			     "Haiku GL: the driver changed since it hung in a previous session (identity %016" PRIx64
+			     ", was %016" PRIx64 "); trying the hardware driver again",
+			     probe_id->hash, marker_hash);
+			hang_marker_remove();
+		}
+	} else if (have_marker) {
+		marker_check_late = true;
+	}
+
+	static const char *hung_warning = "Haiku GL: the hardware driver hung in a previous session; using the CPU "
+					  "renderer. Update the driver, or start OBS with OBS_HAIKU_GL=egl to try "
+					  "it again.";
 	bool created = false;
 	if (probe == GL_PROBE_FAILED) {
 		blog(LOG_WARNING, "Haiku GL: using the CPU renderer (OSMesa) instead of the hardware OpenGL driver. "
 				  "Start OBS with OBS_HAIKU_GL=egl to use the driver anyway.");
-		created = osmesa_create_and_load(device);
-		if (!created) {
-			/* without OSMesa (Mesa 25 has none) the failed driver is the only chance left */
-			blog(LOG_WARNING, "Haiku GL: OSMesa is not available; trying the driver that failed the "
-					  "self-test");
-			created = egl_create_and_load(device, false);
-		}
+		created = osmesa_instead_of_egl(device, "failed the self-test");
+	} else if (marker_match) {
+		blog(LOG_WARNING, "%s", hung_warning);
+		created = osmesa_instead_of_egl(device, "hung before");
 	} else {
 		if (want_egl) {
 			created = egl_create_and_load(device, want_osmesa);
 			if (created && probe == GL_PROBE_NO_EGL)
 				blog(LOG_WARNING, "Haiku GL: the self-test found no EGL, but OBS did; the driver is "
 						  "used untested");
+			if (created && marker_check_late) {
+				identity_compute(&plat->identity);
+				if (plat->identity.hash == marker_hash) {
+					blog(LOG_WARNING, "%s", hung_warning);
+					if (osmesa_installed()) {
+						egl_context_destroy(plat);
+						created = osmesa_instead_of_egl(device, "hung before");
+					} else {
+						blog(LOG_WARNING, "Haiku GL: OSMesa is not available; using the hardware "
+								  "driver that hung before");
+					}
+				} else {
+					blog(LOG_INFO, "Haiku GL: the hang record of a previous session names another "
+						       "driver (no self-test to compare with); keeping it");
+				}
+			}
 		}
 		if (!created && want_osmesa)
 			created = osmesa_create_and_load(device);
@@ -892,13 +1418,30 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 
 	if (!created) {
 		blog(LOG_ERROR, "Haiku GL: no OpenGL backend available. Install Mesa: 'pkgman install mesa'");
+		bfree(probe_id);
 		bfree(plat);
 		device->plat = NULL;
 		return NULL;
 	}
 
+	const char *renderer = (const char *)glGetString(GL_RENDERER);
+	snprintf(plat->renderer, sizeof(plat->renderer), "%s", renderer ? renderer : "?");
 	blog(LOG_INFO, "Haiku GL: rendering through %s", plat->use_osmesa ? "OSMesa" : "EGL (surfaceless)");
-	blog(LOG_INFO, "Haiku GL: %s", (const char *)glGetString(GL_RENDERER));
+	blog(LOG_INFO, "Haiku GL: %s", plat->renderer);
+
+	if (!plat->use_osmesa) {
+		/* the probe ran the same driver stack in a minimal process; prefer its identity, so a hang record
+		 * written now is recognised by the next launch's probe */
+		if (probe_id->valid)
+			plat->identity = *probe_id;
+		else if (!plat->identity.valid)
+			identity_compute(&plat->identity);
+		blog(LOG_INFO, "Haiku GL: driver identity %016" PRIx64 "%s", plat->identity.hash,
+		     probe_id->valid ? " (from the self-test)" : "");
+		log_identity(LOG_DEBUG, "Haiku GL: ", &plat->identity);
+		watchdog_start(plat);
+	}
+	bfree(probe_id);
 	return plat;
 }
 
@@ -906,6 +1449,8 @@ extern void gl_platform_destroy(struct gl_platform *plat)
 {
 	if (!plat)
 		return;
+
+	watchdog_stop(plat);
 
 	if (plat->use_osmesa)
 		osmesa_context_destroy(plat);
@@ -951,6 +1496,13 @@ extern void gl_platform_cleanup_swapchain(struct gs_swap_chain *swap)
 
 extern void device_enter_context(gs_device_t *device)
 {
+	struct gl_platform *plat = device->plat;
+
+	/* heartbeat for the watchdog: eglMakeCurrent() itself may wait for the GPU, so this is set before it */
+	atomic_store(&plat->holder, (int)find_thread(NULL));
+	atomic_store(&plat->held_since, os_gettime_ns());
+	if (atomic_load(&plat->enters) < GL_WATCHDOG_ARM_ENTERS)
+		atomic_fetch_add(&plat->enters, 1);
 	make_current(device);
 }
 
@@ -964,6 +1516,7 @@ extern void device_leave_context(gs_device_t *device)
 	device->cur_fbo = NULL;
 
 	release_current(device->plat);
+	atomic_store(&device->plat->held_since, 0);
 }
 
 extern bool device_enum_adapters(gs_device_t *device, bool (*callback)(void *param, const char *name, uint32_t id),

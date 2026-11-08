@@ -58,11 +58,13 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
   ```
   Platform: Haiku (haiku)
   With the nvidia-haiku driver (Zink), when its self-test passes:
-    Haiku GL probe: OK: EGL 1.5, GL_VENDOR=..., GL_RENDERER=zink ..., GL_VERSION=... (120 frames, ...)
+    Haiku GL probe: OK: EGL 1.5, GL_VENDOR=..., GL_RENDERER=zink ..., GL_VERSION=... (120 frames, 60 context hand-offs, 48 streamed 2560x1080 uploads, 6 swapchain resizes, ... ms)
     Haiku GL: driver self-test passed (... ms)
     Haiku EGL: version 1.5, vendor: Mesa Project
     Haiku GL: rendering through EGL (surfaceless)
     Haiku GL: zink Vulkan 1.x (NVIDIA GeForce RTX 5070 ...)
+    Haiku GL: driver identity 0123456789abcdef (from the self-test)
+    Haiku GL: driver hang watchdog: 15 s
   Without it (HaikuPorts Mesa 22):
     Haiku EGL: eglInitialize failed: ...
     Haiku GL: rendering through OSMesa
@@ -91,6 +93,23 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
       after up to 8 s the log shows `Haiku GL: the OpenGL driver failed its self-test: ...` and
       `using the CPU renderer (OSMesa)`, and the preview works. `ps | grep gl-probe` shows no leftover probe.
       With `OBS_HAIKU_GL=egl` the test is skipped (and the driver hang reproduces).
+      The test also streams a Screen-Capture-sized texture and renders two swapchains of different sizes;
+      on a healthy driver `driver self-test passed (... ms)` stays well under 1000 ms.
+- [ ] **Driver hang watchdog.** On a driver that passes the self-test but hangs later (e.g. when a Screen
+      Capture source is added), about 15 s after the freeze the log shows
+      `Haiku GL watchdog: the graphics driver stopped responding: thread ... has held the OpenGL context for 16 s`,
+      the driver and its identity, and `recorded the hang in .../obs-studio/haiku-gl-hang`, and an alert
+      "The graphics driver stopped responding." appears.
+  - [ ] **Keep waiting**: the alert comes back after another 15 s.
+  - [ ] **Restart with CPU renderer**: OBS closes and starts again within a few seconds (it may mention the
+        unclean shutdown); the new log shows `Haiku GL: the hardware driver hung in a previous session; using
+        the CPU renderer...` and `rendering through OSMesa`. The scene collection is intact; a recording that
+        was running may be incomplete.
+  - [ ] Starting OBS again keeps the CPU renderer; `OBS_HAIKU_GL=egl ./obs` uses the driver (and the hang can be
+        reproduced). After a driver update the log shows `the driver changed since it hung in a previous
+        session ...; trying the hardware driver again` and the record file is gone.
+  - [ ] `OBS_HAIKU_GL_WATCHDOG=0` disables the watchdog (`driver hang watchdog disabled`); `=5` makes it fire
+        after 5 s. Loading a large scene collection at startup must not trigger it.
 
 To test the software path on an NVIDIA machine too, start OBS once with `OBS_HAIKU_GL=osmesa ./obs`.
 

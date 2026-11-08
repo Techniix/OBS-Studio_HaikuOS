@@ -123,12 +123,53 @@ backend, `gl-haiku.c` first runs `obs-haiku-gl-probe` (`libobs-opengl/haiku-gl-p
 as a separate process, with a timeout (8 s, `OBS_HAIKU_GL_PROBE_TIMEOUT=<seconds>`). The probe uses the same EGL
 config and 3.3 core context as OBS, hands the context between a render thread and an upload thread the way
 libobs does, and renders 120 frames into an FBO with a shader, a fence wait, `glReadPixels` and a mapped
-pixel-buffer readback, checking every pixel. Pass: EGL is used. Hang, crash, wrong pixels or an unsignalled
-fence: the probe is killed, the reason is logged and OBS uses OSMesa, so a young or broken driver costs speed,
-not a frozen OBS. No EGL at all: the probe exits at once and the normal EGL attempt fails fast into OSMesa.
-Missing probe: EGL untested, as before. It runs at every launch, so a driver update is always re-tested;
-`OBS_HAIKU_GL_PROBE=0` skips it. It can be run by hand (`obs-haiku-gl-probe [--frames N]`; exit 0 pass, 2 no EGL,
-3 no 3.3 context, 4 wrong pixels or GL error, 5 fence never signalled). HaikuPorts builds that Mesa with `-Dosmesa=true` on the
+pixel-buffer readback, checking every pixel. In the first 48 frames it also streams a 2560x1080 BGRX texture the
+way an async source such as Screen Capture is uploaded (`gs_texture_set_image()`: the texture's own
+`GL_PIXEL_UNPACK_BUFFER`, `glMapBuffer(GL_WRITE_ONLY)`, `glUnmapBuffer`, `glTexImage2D` from the buffer), from
+both threads, and draws it into two swapchain framebuffers of different sizes (the preview and a properties
+dialog's preview, which is resized several times and recreated once), each read back like `device_present()`;
+every frame ends with a second fence. A healthy driver passes in well under a second. Pass: EGL is used. Hang,
+crash, wrong pixels or an unsignalled fence: the probe is killed, the reason is logged and OBS uses OSMesa, so a
+young or broken driver costs speed, not a frozen OBS. No EGL at all: the probe exits at once and the normal EGL
+attempt fails fast into OSMesa. Missing probe: EGL untested, as before. It runs at every launch, so a driver
+update is always re-tested; `OBS_HAIKU_GL_PROBE=0` skips it. It can be run by hand
+(`obs-haiku-gl-probe [--frames N]`; exit 0 pass, 2 no EGL, 3 no 3.3 context, 4 wrong pixels or GL error, 5 fence
+never signalled). The probe also reports the driver's identity (below).
+
+**Driver hang watchdog.** A driver can still hang on a path the probe does not reach. With EGL, every
+`device_enter_context()` records when the context was taken and `device_leave_context()` clears it; a watchdog
+thread checks once a second. When one thread has held the context for more than 15 s
+(`OBS_HAIKU_GL_WATCHDOG=<seconds>`, `0` disables it), it is a GPU hang: libobs's graphics thread enters and leaves
+the context several times per frame, and other threads only hold it briefly. The long legitimate holds (effect
+compilation in `obs_init_graphics()`) happen at startup, so the watchdog is armed only after 300 context
+entries, a few seconds after the graphics thread starts. On a hang it logs `Haiku GL watchdog: the graphics
+driver stopped responding: ...` with the holding thread, `GL_RENDERER` and the driver identity, writes the
+hang record `~/config/settings/obs-studio/haiku-gl-hang` and shows a native alert ("The graphics driver stopped
+responding. ...") with **Restart with CPU renderer** (default) and **Keep waiting**. Restart runs
+`/bin/sh`, which waits for the hung OBS team to end (at most 20 s, so OBS's "already running" check doesn't
+trigger), then starts the same executable with the arguments libobs saved from `main()`
+(`obs_get_cmdline_args()`) and `OBS_HAIKU_GL` removed from the environment (set to `osmesa` if the record could not
+be written); OBS then ends its own team (`kill_team()`), which also ends the thread stuck in the driver. The new
+instance may report the unclean shutdown. Keep waiting asks again after another full timeout. If the driver
+recovers, the record is removed again. Without libOSMesa the second button is **Quit OBS**; without a
+`BApplication` no alert is shown and OBS keeps waiting (the log still has the details).
+
+**Driver identity and the hang record.** The identity (`haiku-gl-probe/gl-identity.h`, shared by the probe and
+`gl-haiku.c`) is `GL_RENDERER`, `GL_VERSION`, path, size and modification time of every image in the team that
+belongs to the GL/Vulkan stack (path contains `/vulkan`, `libvulkan`, `libEGL`, `libGL`, `/dri/`, `mesa`,
+`gallium`, `zink`, `nouveau`, `nvk`, `nvidia` or `glvnd`), the Vulkan ICD manifests in `VK_DRIVER_FILES` /
+`VK_ICD_FILENAMES`, and the kernel graphics drivers (`add-ons/kernel/drivers/dev/graphics`), sorted; its id is the
+64-bit FNV-1a hash. The probe prints it (`IDENTITY`/`IDENTITY-PART` lines, not copied to the log). At startup,
+with nothing forced and the probe passed, a hang record with the same identity makes OBS use OSMesa
+(`Haiku GL: the hardware driver hung in a previous session; using the CPU renderer. Update the driver, or start
+OBS with OBS_HAIKU_GL=egl to try it again.`); a different identity means the driver was updated: the record is
+removed and EGL is used. `OBS_HAIKU_GL=egl` ignores the record and keeps it. With `OBS_HAIKU_GL_PROBE=0` (or no
+probe) the identity is computed inside OBS after EGL is up; a match still selects OSMesa, but a mismatch keeps
+the record, since OBS's own image list may differ from the probe's. The watchdog records the probe's identity
+when there is one, so the next launch's probe recognises it. Without OSMesa (Mesa 25 alone) the driver is used
+anyway, with a warning.
+
+**OSMesa.** HaikuPorts builds Mesa 22 with `-Dosmesa=true` on the
 llvmpipe (`swrast` + LLVM) driver, which provides OpenGL 3.3 core and beyond. `libOSMesa` is loaded with
 `dlopen()` (Mesa 25 no longer has it), so one binary works with either Mesa.
 
