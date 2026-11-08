@@ -45,6 +45,10 @@
 
 #define OBS_BROWSER_CLIENT_TIMEOUT 5000000LL /* µs without a client heartbeat before the helper quits */
 
+/* HaikuWebKit's cookie database (WebCore's curl CookieJarDB, SQLite), one per storage directory; every helper
+ * using the same directory shares it. The same name WebPositive uses. */
+#define OBS_BROWSER_COOKIE_DB "cookie.jar.db"
+
 #define OBS_BROWSER_TITLE_LEN 256
 #define OBS_BROWSER_URL_LEN 2048
 

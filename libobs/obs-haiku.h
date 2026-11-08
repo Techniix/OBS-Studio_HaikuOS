@@ -43,6 +43,16 @@ bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTES], uint32_
  * app_server. Returns false without a BApplication (the app_server link would call debugger()). */
 bool obs_haiku_get_mouse_buttons(uint32_t *buttons);
 
+/* Keeps Haiku's screen saver (and with it the DPMS power-down, which only the screen blanker triggers)
+ * from starting while OBS records or streams. If there was no user input for at least min_idle_us
+ * microseconds, re-sends a mouse-moved event at the cursor's current position through the input_server
+ * (public set_mouse_position()), which resets the screen saver filter's idle timer just like real input.
+ * Nothing persistent is changed, so there is nothing to restore after a crash. Does nothing (returns
+ * false) without a BApplication, while a mouse button is held, while the cursor rests near a screen corner
+ * (the screen saver's "blank now" corner) or while the screen blanker is already running (so a running or
+ * locked screen saver is never dismissed). */
+bool obs_haiku_reset_idle_timer(int64_t min_idle_us);
+
 #ifdef __cplusplus
 }
 #endif

@@ -46,6 +46,7 @@
 #include <MediaRoster.h>
 #include <MessageRunner.h>
 #include <OS.h>
+#include <String.h>
 #include <TimeSource.h>
 
 #include <errno.h>
@@ -60,6 +61,8 @@
 #define OBS_TAP_LOCK_PATH "/tmp/obs-haiku-audio-tap.lock"
 /* how long a starting helper waits for a previous one to finish restoring the routing */
 #define LOCK_WAIT_US 5000000
+/* how often the watchdog asks the media server for the default audio output (see CheckDefaultOutput()) */
+#define DEFAULT_POLL_US 2000000
 
 enum {
 	MSG_WATCHDOG = 'wdog',
@@ -224,12 +227,19 @@ public:
 		}
 
 		/* Media services restarting invalidates the routing we inserted into; quit (OBS starts a new helper,
-		 * which inserts the tap into the new routing). A new default audio output only takes effect when
-		 * Media preferences restarts the media services, which B_MEDIA_SERVER_QUIT covers; any other
-		 * rerouting of the mixer output disconnects our input, which the watchdog notices
-		 * (InputConnected()). B_MEDIA_DEFAULT_CHANGED is accepted by StartWatching() but the Media Kit never
-		 * sends it (Notifications.cpp: "TODO: missing: B_MEDIA_DEFAULT_CHANGED"); we watch it only in case a
-		 * future Haiku does. */
+		 * which inserts the tap into the new routing). Any other rerouting of the mixer output disconnects
+		 * our input, which the watchdog notices (InputConnected()).
+		 *
+		 * Picking another output in Media preferences calls SetAudioOutput(); the media server then
+		 * disconnects the mixer -> card link it made and connects the mixer to the new card
+		 * (DefaultManager::_ConnectMixerToOutput()). With the tap in between that link no longer exists and
+		 * the mixer output is busy, so the server's attempt fails and playback would stay on the old card
+		 * until media services restart. Nobody is told: B_MEDIA_DEFAULT_CHANGED is accepted by
+		 * StartWatching() but the Media Kit never sends it (Notifications.cpp: "TODO: missing:
+		 * B_MEDIA_DEFAULT_CHANGED"). So the watchdog polls the default output (CheckDefaultOutput()) and,
+		 * when it changes, removes the tap, makes the connection the server could not make and exits; OBS
+		 * starts a new helper on the new card. The notification is watched too in case a future Haiku
+		 * sends it. */
 		roster->StartWatching(BMessenger(this), B_MEDIA_SERVER_QUIT);
 		roster->StartWatching(BMessenger(this), B_MEDIA_DEFAULT_CHANGED);
 
@@ -254,6 +264,9 @@ public:
 				/* someone (Media preferences, Cortex) rerouted the mixer away from us */
 				fprintf(stderr, "obs-haiku-audio-tap: mixer was disconnected from the tap, exiting\n");
 				PostMessage(B_QUIT_REQUESTED);
+			} else if (system_time() - last_default_poll >= DEFAULT_POLL_US) {
+				last_default_poll = system_time();
+				CheckDefaultOutput(false);
 			}
 			return;
 		}
@@ -264,9 +277,9 @@ public:
 			return;
 		}
 		if (msg->what == B_MEDIA_DEFAULT_CHANGED) {
-			/* not sent by current Haiku (see ReadyToRun()) */
-			fprintf(stderr, "obs-haiku-audio-tap: default audio output changed, exiting\n");
-			PostMessage(B_QUIT_REQUESTED);
+			/* not sent by current Haiku (see ReadyToRun()); it may be about any default (video too), so
+			 * check what changed instead of assuming */
+			CheckDefaultOutput(true);
 			return;
 		}
 		BApplication::MessageReceived(msg);
@@ -317,9 +330,13 @@ private:
 		if ((err = roster->GetAudioMixer(&mixer)) != B_OK)
 			return err;
 		have_mixer = true;
-		if ((err = roster->GetAudioOutput(&card)) != B_OK)
+		BString card_input_name;
+		if ((err = roster->GetAudioOutput(&card, &baseline_input, &card_input_name)) != B_OK)
 			return err;
 		have_card = true;
+		/* CheckDefaultOutput() reacts to changes from here on */
+		baseline_node = card.node;
+		last_default_poll = system_time();
 
 		/* undo whatever a previous helper killed with SIGKILL left behind, then find the mixer -> sound
 		 * card connection */
@@ -435,7 +452,10 @@ private:
 		}
 
 		if (disconnected) {
-			RestoreOriginalLink();
+			/* after a change of the default output, connect the mixer to the new one (what the media
+			 * server tried to do); if that fails, playback goes back to where it was */
+			if (!follow_default || ConnectMixerToDefaultOutput() != B_OK)
+				RestoreOriginalLink();
 			disconnected = false;
 		}
 
@@ -491,6 +511,131 @@ private:
 		}
 		if (have_dest)
 			roster->ReleaseNode(dest);
+	}
+
+	/* The default audio output as the media server has it; the node reference is released right away. */
+	status_t QueryDefaultOutput(media_node_id *node, int32 *input_id)
+	{
+		media_node n;
+		int32 id = -1;
+		BString name;
+		status_t err = roster->GetAudioOutput(&n, &id, &name);
+		if (err != B_OK)
+			return err;
+		*node = n.node;
+		*input_id = id;
+		roster->ReleaseNode(n);
+		return B_OK;
+	}
+
+	/* Called every DEFAULT_POLL_US from the watchdog, and on B_MEDIA_DEFAULT_CHANGED (`notified`). Compares
+	 * the default output with the one at Insert() time rather than with the card we feed: those differ
+	 * legitimately when the default was changed before this helper started (the routing then stays as the
+	 * mixer had it), and comparing with the card would make every new helper quit again. A change has to be
+	 * seen on two polls in a row; errors (the server busy or restarting) are ignored. */
+	void CheckDefaultOutput(bool notified)
+	{
+		if (!roster || !tap || follow_default)
+			return;
+		media_node_id node = -1;
+		int32 input_id = -1;
+		if (QueryDefaultOutput(&node, &input_id) != B_OK) {
+			default_mismatches = 0;
+			return;
+		}
+		if (node == baseline_node && input_id == baseline_input) {
+			default_mismatches = 0;
+			return;
+		}
+		if (node == orig_dest_node && input_id == orig_out.destination.id) {
+			/* the new default is the card input we already feed (e.g. switched back): nothing to move */
+			baseline_node = node;
+			baseline_input = input_id;
+			default_mismatches = 0;
+			return;
+		}
+		if (default_mismatches == 0 || node != pending_node || input_id != pending_input) {
+			pending_node = node;
+			pending_input = input_id;
+			default_mismatches = 0;
+		}
+		default_mismatches++;
+		if (default_mismatches < 2 && !notified)
+			return;
+
+		fprintf(stderr,
+			"obs-haiku-audio-tap: default audio output changed (node %d input %d -> node %d input %d), "
+			"moving the mixer output there and exiting\n",
+			(int)baseline_node, (int)baseline_input, (int)node, (int)input_id);
+		follow_default = true;
+		PostMessage(B_QUIT_REQUESTED);
+	}
+
+	/* Connects the mixer to the current default output the way DefaultManager::_ConnectMixerToOutput() does
+	 * (time source, run mode, the selected input or else the last free one, native format first). Called
+	 * from Remove() with the tap already disconnected. The mixer starts the card itself (auto-start). */
+	status_t ConnectMixerToDefaultOutput()
+	{
+		media_node out;
+		int32 input_id = -1;
+		BString input_name;
+		status_t err = roster->GetAudioOutput(&out, &input_id, &input_name);
+		if (err != B_OK) {
+			log_status("default audio output", err);
+			return err;
+		}
+
+		media_output mixer_out;
+		media_input inputs[16];
+		int32 count = 0;
+		err = roster->GetFreeOutputsFor(mixer, &mixer_out, 1, &count, B_MEDIA_RAW_AUDIO);
+		if (err == B_OK && count < 1)
+			err = B_MEDIA_ALREADY_CONNECTED; /* someone else (a future media server?) connected it */
+		if (err == B_OK) {
+			count = 0;
+			err = roster->GetFreeInputsFor(out, inputs, 16, &count, B_MEDIA_RAW_AUDIO);
+			if (err == B_OK && count < 1)
+				err = B_MEDIA_ALREADY_CONNECTED;
+		}
+		if (err == B_OK) {
+			media_input card_in = inputs[count - 1];
+			for (int32 i = 0; i < count; i++) {
+				if (inputs[i].destination.id == input_id) {
+					card_in = inputs[i];
+					break;
+				}
+			}
+
+			media_node ts; /* GetTimeSource() takes no reference */
+			if (roster->GetTimeSource(&ts) == B_OK)
+				roster->SetTimeSourceFor(out.node, ts.node);
+			roster->SetRunModeNode(out, BMediaNode::B_RECORDING);
+
+			media_format fmt;
+			media_output o;
+			media_input i;
+			err = B_ERROR;
+			for (int attempt = 0; attempt < 3 && err != B_OK; attempt++) {
+				if (attempt == 0) {
+					if (roster->GetFormatFor(card_in, &fmt) != B_OK)
+						continue;
+				} else if (attempt == 1) {
+					fmt = orig_format;
+				} else {
+					fmt = media_format();
+					fmt.type = B_MEDIA_RAW_AUDIO;
+					fmt.u.raw_audio = media_raw_audio_format::wildcard;
+				}
+				err = roster->Connect(mixer_out.source, card_in.destination, &fmt, &o, &i);
+			}
+			if (err == B_OK)
+				fprintf(stderr, "obs-haiku-audio-tap: system mixer now plays to node %d input %d\n",
+					(int)out.node, (int)card_in.destination.id);
+		}
+		if (err != B_OK)
+			log_status("connecting the mixer to the new default output failed", err);
+		roster->ReleaseNode(out);
+		return err;
 	}
 
 	void ReleaseLock()
@@ -549,6 +694,15 @@ private:
 
 	media_node mixer, card;
 	bool have_mixer = false, have_card = false;
+
+	/* default output tracking, see CheckDefaultOutput() */
+	media_node_id baseline_node = -1;
+	int32 baseline_input = -1;
+	media_node_id pending_node = -1;
+	int32 pending_input = -1;
+	int default_mismatches = 0;
+	bigtime_t last_default_poll = 0;
+	bool follow_default = false; /* the default changed: Remove() connects the mixer to the new one */
 
 	media_output orig_out;
 	media_node_id orig_dest_node = -1;

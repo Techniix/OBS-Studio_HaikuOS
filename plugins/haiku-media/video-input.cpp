@@ -23,11 +23,13 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <GraphicsDefs.h>
 
 #define S_DEVICE_ID "device_id"
+#define S_RESOLUTION "resolution"
 #define S_ACTIVE_ONLY_WHEN_SHOWN "deactivate_when_not_showing"
 
 #define T_(text) obs_module_text(text)
@@ -36,15 +38,19 @@ namespace {
 
 struct VideoInput {
 	obs_source_t *source = nullptr;
-	std::string device_id;
-	bool active_only_when_shown = false;
-	bool shown = false;
-	std::unique_ptr<HaikuRecorder> recorder;
+	/* opens the device and keeps it open, retrying while it is busy or gone (media-device.hpp) */
+	std::unique_ptr<HaikuCapture> capture;
 	std::atomic_bool warned_format = false;
 
-	void Open();
-	void Close();
-	void Refresh();
+	/* update() runs on the UI thread, show()/hide() wherever libobs calls them; properties() reads too */
+	std::mutex settings_mutex;
+	std::string device_id;
+	std::string resolution;
+	bool active_only_when_shown = false;
+	bool shown = false;
+
+	void Refresh(); /* settings_mutex held */
+	void OnOpened(const media_format &format, const HaikuOpenResult &result);
 	void OnBuffer(const void *data, size_t size, const media_format &format);
 };
 
@@ -72,41 +78,22 @@ bool map_color_space(color_space cs, video_format &format, uint32_t &bytes_per_p
 	}
 }
 
-void VideoInput::Open()
+/* supervisor thread */
+void VideoInput::OnOpened(const media_format &format, const HaikuOpenResult &result)
 {
-	if (!recorder) {
-		recorder = std::make_unique<HaikuRecorder>(
-			"OBS Video Input", B_MEDIA_RAW_VIDEO,
-			[this](const void *data, size_t size, const media_format &format) {
-				OnBuffer(data, size, format);
-			});
-	}
-
-	if (recorder->Open(device_id, B_MEDIA_RAW_VIDEO) == B_OK) {
-		const media_raw_video_format &raw = recorder->ConnectedFormat().u.raw_video;
-		blog(LOG_INFO, "[haiku-media] '%s': capturing from '%s' (%ux%u, color space 0x%x, %.2f fps)",
-		     obs_source_get_name(source), device_id.c_str(), raw.display.line_width, raw.display.line_count,
-		     (unsigned)raw.display.format, raw.field_rate);
-	}
-}
-
-void VideoInput::Close()
-{
-	if (recorder)
-		recorder->Close();
-
-	obs_source_output_video(source, nullptr);
+	const media_raw_video_format &raw = format.u.raw_video;
+	warned_format = false;
+	if (result.size_refused)
+		blog(LOG_WARNING, "[haiku-media] '%s': the device refused the requested frame size; using its default",
+		     obs_source_get_name(source));
+	blog(LOG_INFO, "[haiku-media] '%s': capturing (%ux%u, color space 0x%x, %.2f fps)",
+	     obs_source_get_name(source), raw.display.line_width, raw.display.line_count,
+	     (unsigned)raw.display.format, raw.field_rate);
 }
 
 void VideoInput::Refresh()
 {
-	const bool want_open = !active_only_when_shown || shown;
-	const bool is_open = recorder && recorder->IsOpen();
-
-	if (want_open && !is_open)
-		Open();
-	else if (!want_open && is_open)
-		Close();
+	capture->Configure(device_id, HaikuParseVideoSize(resolution.c_str()), !active_only_when_shown || shown);
 }
 
 void VideoInput::OnBuffer(const void *data, size_t size, const media_format &format)
@@ -157,16 +144,10 @@ const char *video_input_get_name(void *)
 void video_input_update(void *data, obs_data_t *settings)
 {
 	VideoInput *vi = static_cast<VideoInput *>(data);
-	std::string device_id = obs_data_get_string(settings, S_DEVICE_ID);
+	std::lock_guard<std::mutex> lock(vi->settings_mutex);
+	vi->device_id = obs_data_get_string(settings, S_DEVICE_ID);
+	vi->resolution = obs_data_get_string(settings, S_RESOLUTION);
 	vi->active_only_when_shown = obs_data_get_bool(settings, S_ACTIVE_ONLY_WHEN_SHOWN);
-
-	if (device_id != vi->device_id) {
-		vi->device_id = device_id;
-		vi->warned_format = false;
-		if (vi->recorder && vi->recorder->IsOpen())
-			vi->Close();
-	}
-
 	vi->Refresh();
 }
 
@@ -174,7 +155,11 @@ void *video_input_create(obs_data_t *settings, obs_source_t *source)
 {
 	VideoInput *vi = new VideoInput;
 	vi->source = source;
-	vi->device_id = obs_data_get_string(settings, S_DEVICE_ID);
+	vi->capture = std::make_unique<HaikuCapture>(
+		source, "OBS Video Input", B_MEDIA_RAW_VIDEO,
+		[vi](const void *data, size_t size, const media_format &format) { vi->OnBuffer(data, size, format); },
+		[vi](const media_format &format, const HaikuOpenResult &result) { vi->OnOpened(format, result); },
+		[vi]() { obs_source_output_video(vi->source, nullptr); });
 	video_input_update(vi, settings);
 	return vi;
 }
@@ -182,13 +167,14 @@ void *video_input_create(obs_data_t *settings, obs_source_t *source)
 void video_input_destroy(void *data)
 {
 	VideoInput *vi = static_cast<VideoInput *>(data);
-	vi->recorder.reset();
+	vi->capture.reset(); /* stops the supervisor and recorder threads before VideoInput goes away */
 	delete vi;
 }
 
 void video_input_show(void *data)
 {
 	VideoInput *vi = static_cast<VideoInput *>(data);
+	std::lock_guard<std::mutex> lock(vi->settings_mutex);
 	vi->shown = true;
 	vi->Refresh();
 }
@@ -196,6 +182,7 @@ void video_input_show(void *data)
 void video_input_hide(void *data)
 {
 	VideoInput *vi = static_cast<VideoInput *>(data);
+	std::lock_guard<std::mutex> lock(vi->settings_mutex);
 	vi->shown = false;
 	vi->Refresh();
 }
@@ -203,16 +190,40 @@ void video_input_hide(void *data)
 void video_input_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, S_DEVICE_ID, HAIKU_MEDIA_DEFAULT_DEVICE);
+	obs_data_set_default_string(settings, S_RESOLUTION, HAIKU_MEDIA_DEFAULT_SIZE);
 	obs_data_set_default_bool(settings, S_ACTIVE_ONLY_WHEN_SHOWN, false);
 }
 
-obs_properties_t *video_input_properties(void *)
+/* the frame sizes depend on the device */
+bool video_input_device_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
 {
+	obs_property_t *sizes = obs_properties_get(props, S_RESOLUTION);
+	if (sizes)
+		HaikuFillVideoSizeList(sizes, obs_data_get_string(settings, S_DEVICE_ID),
+				       obs_data_get_string(settings, S_RESOLUTION));
+	return true;
+}
+
+obs_properties_t *video_input_properties(void *data)
+{
+	VideoInput *vi = static_cast<VideoInput *>(data);
 	obs_properties_t *props = obs_properties_create();
 
 	obs_property_t *list = obs_properties_add_list(props, S_DEVICE_ID, T_("Device"), OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_STRING);
 	HaikuFillDeviceList(list, B_MEDIA_RAW_VIDEO);
+	obs_property_set_modified_callback(list, video_input_device_modified);
+
+	obs_property_t *sizes = obs_properties_add_list(props, S_RESOLUTION, T_("Resolution"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
+	std::string device_id = HAIKU_MEDIA_DEFAULT_DEVICE, resolution = HAIKU_MEDIA_DEFAULT_SIZE;
+	if (vi) {
+		std::lock_guard<std::mutex> lock(vi->settings_mutex);
+		device_id = vi->device_id;
+		resolution = vi->resolution;
+	}
+	HaikuFillVideoSizeList(sizes, device_id, resolution.c_str());
+	obs_property_set_long_description(sizes, T_("Resolution.Description"));
 
 	obs_properties_add_bool(props, S_ACTIVE_ONLY_WHEN_SHOWN, T_("DeactivateWhenNotShowing"));
 

@@ -36,8 +36,9 @@ if(CMAKE_C_COMPILER_ID STREQUAL GNU)
 endif()
 
 # libroot provides libc, libm, libdl and pthreads; libbe provides the Interface Kit (keyboard/mouse state);
-# libmedia provides BSoundPlayer for audio monitoring.
-target_link_libraries(libobs PRIVATE be media $<$<NOT:$<BOOL:${HAVE_MATH_IN_STD_LIB}>>:m>)
+# libmedia provides BSoundPlayer for audio monitoring; libgame provides set_mouse_position(), used to keep the
+# screen saver from starting while recording/streaming (os_inhibit_sleep).
+target_link_libraries(libobs PRIVATE be game media $<$<NOT:$<BOOL:${HAVE_MATH_IN_STD_LIB}>>:m>)
 
 target_enable_feature(libobs "Haiku platform support")
 target_enable_feature(libobs "Media Kit audio monitoring (Haiku)")

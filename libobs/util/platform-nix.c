@@ -30,6 +30,7 @@
 #if defined(__HAIKU__)
 #include <OS.h>
 #include <image.h>
+#include "../obs-haiku.h"
 #else
 #include <uuid/uuid.h>
 #endif
@@ -708,11 +709,7 @@ os_inhibit_t *os_inhibit_sleep_create(const char *reason)
 		return info;
 	}
 #endif
-#if !defined(__HAIKU__)
-	/* Haiku's screen saver has no xdg-screensaver/D-Bus interface to poke; without a stop event,
-	 * os_inhibit_sleep_set_active() becomes a no-op instead of failing to spawn every 30 seconds. */
 	os_event_init(&info->stop_event, OS_EVENT_TYPE_AUTO);
-#endif
 	posix_spawnattr_init(&info->attr);
 
 	sigemptyset(&set);
@@ -726,6 +723,26 @@ os_inhibit_t *os_inhibit_sleep_create(const char *reason)
 }
 
 extern char **environ;
+
+#if defined(__HAIKU__)
+/* Haiku has no xdg-screensaver/D-Bus inhibitor and no idle system sleep (the power daemon only acts on the
+ * power button; ACPI sleep is only used to power off). What blanks the screen is the input_server's screen
+ * saver filter, which launches screen_blanker -- and that is also the only thing that applies the DPMS
+ * stand-by/suspend/off settings -- once no input event has passed through it for the configured time
+ * (30 s at the least). Instead of changing the user's ScreenSaver settings (a private file format, and a
+ * crash would leave them changed), reset the filter's idle timer the way input does, through a public API;
+ * see obs_haiku_reset_idle_timer(). Polling every 10 s and only acting after 10 s without input keeps the
+ * idle time below 20 s. */
+#define SCREENSAVER_RESET_MS 10000
+#define SCREENSAVER_MIN_IDLE_US 10000000
+
+static void reset_screensaver(os_inhibit_t *info)
+{
+	UNUSED_PARAMETER(info);
+	obs_haiku_reset_idle_timer(SCREENSAVER_MIN_IDLE_US);
+}
+#else
+#define SCREENSAVER_RESET_MS 30000
 
 static void reset_screensaver(os_inhibit_t *info)
 {
@@ -741,12 +758,13 @@ static void reset_screensaver(os_inhibit_t *info)
 		blog(LOG_WARNING, "Failed to create xdg-screensaver: %d", err);
 	}
 }
+#endif
 
 static void *screensaver_thread(void *param)
 {
 	os_inhibit_t *info = param;
 
-	while (os_event_timedwait(info->stop_event, 30000) == ETIMEDOUT)
+	while (os_event_timedwait(info->stop_event, SCREENSAVER_RESET_MS) == ETIMEDOUT)
 		reset_screensaver(info);
 
 	return NULL;

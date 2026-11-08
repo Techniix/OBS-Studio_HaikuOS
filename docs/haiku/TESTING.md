@@ -10,7 +10,7 @@ text and log lines are the most useful thing to send back.
 ## 0. What was verified before this test
 
 **Status (2026-11-07):** on the maintainer's machine (x86-64, RTX 5070) the port builds, starts and records an MP4
-with Screen Capture, using the OSMesa renderer (`OBS_HAIKU_GL=osmesa`; the nvidia-haiku Zink path hangs on a fence
+with Screen Capture, using the OSMesa renderer (`OBS_HAIKU_GL=osmesa`; before the driver self-test was added, the nvidia-haiku Zink path hung on a fence
 wait, a driver issue being fixed there). Desktop audio tap insertion works; the rest of this list is still open.
 
 Before that first build, it was checked with a harness
@@ -57,7 +57,9 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
 - [ ] The log contains lines like these (exact text varies):
   ```
   Platform: Haiku (haiku)
-  With the nvidia-haiku driver (Zink):
+  With the nvidia-haiku driver (Zink), when its self-test passes:
+    Haiku GL probe: OK: EGL 1.5, GL_VENDOR=..., GL_RENDERER=zink ..., GL_VERSION=... (120 frames, ...)
+    Haiku GL: driver self-test passed (... ms)
     Haiku EGL: version 1.5, vendor: Mesa Project
     Haiku GL: rendering through EGL (surfaceless)
     Haiku GL: zink Vulkan 1.x (NVIDIA GeForce RTX 5070 ...)
@@ -84,6 +86,11 @@ Keep the Terminal open; libobs logs to it and to `~/config/settings/obs-studio/l
 - [ ] The preview area in the middle shows the canvas (black when there are no sources) and **not** a
       frozen or garbage image.
 - [ ] Resizing the main window resizes the preview without flicker or stretching artifacts.
+
+- [ ] **Driver self-test.** On a driver that hangs (like nvidia-haiku before its fence fix), OBS still starts:
+      after up to 8 s the log shows `Haiku GL: the OpenGL driver failed its self-test: ...` and
+      `using the CPU renderer (OSMesa)`, and the preview works. `ps | grep gl-probe` shows no leftover probe.
+      With `OBS_HAIKU_GL=egl` the test is skipped (and the driver hang reproduces).
 
 To test the software path on an NVIDIA machine too, start OBS once with `OBS_HAIKU_GL=osmesa ./obs`.
 

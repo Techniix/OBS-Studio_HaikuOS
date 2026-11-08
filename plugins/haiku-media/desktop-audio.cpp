@@ -122,12 +122,14 @@ void reap_helper()
 	reap_helper_locked();
 }
 
-bool spawn_helper()
+enum class SpawnResult { Started, StillRunning, Failed };
+
+SpawnResult spawn_helper()
 {
 	std::lock_guard<std::mutex> lock(spawn_mutex);
 	reap_helper_locked(); /* a zombie still passes kill(pid, 0) */
 	if (helper_pid > 0 && kill(helper_pid, 0) == 0)
-		return true; /* still starting up */
+		return SpawnResult::StillRunning; /* still starting up, or still restoring the routing on exit */
 
 	const std::string path = helper_path();
 	mark_background_app(path);
@@ -136,11 +138,11 @@ bool spawn_helper()
 	int err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
 	if (err != 0) {
 		blog(LOG_WARNING, "[haiku-media] desktop audio: could not start %s: %s", path.c_str(), strerror(err));
-		return false;
+		return SpawnResult::Failed;
 	}
 	helper_pid = pid;
 	blog(LOG_INFO, "[haiku-media] desktop audio: started %s (team %d)", path.c_str(), (int)pid);
-	return true;
+	return SpawnResult::Started;
 }
 
 audio_format obs_format_for(uint32_t format)
@@ -239,6 +241,15 @@ bool DesktopAudio::Attach()
 		return false;
 	}
 	warned_protocol = false;
+
+	/* Not inserted yet (the helper sets helper_alive once the tap is in the mixer's path, well within the
+	 * heartbeat grace it starts with) or no longer (an exiting helper clears it before removing the tap and
+	 * its area): not ready. Attaching now would latch onto a helper that is going away. */
+	if (__atomic_load_n(&mapped->helper_alive, __ATOMIC_ACQUIRE) == 0) {
+		delete_area(clone);
+		clone = -1;
+		return false;
+	}
 
 	shm = mapped;
 	heartbeat = &mapped->client_heartbeat;
@@ -408,10 +419,15 @@ void DesktopAudio::Run()
 			if (!Attach()) {
 				const bigtime_t now = system_time();
 				if (now - last_spawn > spawn_interval) {
-					if (last_spawn)
-						spawn_interval = std::min<bigtime_t>(spawn_interval * 2, 60000000);
-					spawn_helper();
-					last_spawn = now;
+					/* A helper of ours that still runs is starting up or exiting (e.g. after the
+					 * default audio output changed, tap-app.cpp): poll again shortly instead of
+					 * waiting a whole interval, so a new one starts as soon as the old is gone. */
+					if (spawn_helper() != SpawnResult::StillRunning) {
+						if (last_spawn)
+							spawn_interval =
+								std::min<bigtime_t>(spawn_interval * 2, 60000000);
+						last_spawn = now;
+					}
 				}
 				snooze(100000);
 				continue;

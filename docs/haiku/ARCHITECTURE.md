@@ -115,7 +115,20 @@ the offscreen buffers, chosen at startup (`OBS_HAIKU_GL=egl|osmesa` forces one):
 | OSMesa | Mesa 22.0.5 (current HaikuPorts `mesa`) | One OSMesa context; each swapchain is a memory buffer bound with `OSMesaMakeCurrent()` |
 
 Mesa 22.0.5 ships `libEGL`, but HaikuPorts patches its Haiku EGL driver to fail `eglInitialize()` ("Does not
-work"), so EGL is tried first and OSMesa is the fallback. HaikuPorts builds that Mesa with `-Dosmesa=true` on the
+work"), so EGL is tried first and OSMesa is the fallback.
+
+**Driver self-test.** A hardware driver can initialise fine and then hang or misrender once real work starts
+(the nvidia-haiku Zink/NVK stack hung on a GPU fence in OBS's first frames). Unless `OBS_HAIKU_GL` forces a
+backend, `gl-haiku.c` first runs `obs-haiku-gl-probe` (`libobs-opengl/haiku-gl-probe/`, installed next to `obs`)
+as a separate process, with a timeout (8 s, `OBS_HAIKU_GL_PROBE_TIMEOUT=<seconds>`). The probe uses the same EGL
+config and 3.3 core context as OBS, hands the context between a render thread and an upload thread the way
+libobs does, and renders 120 frames into an FBO with a shader, a fence wait, `glReadPixels` and a mapped
+pixel-buffer readback, checking every pixel. Pass: EGL is used. Hang, crash, wrong pixels or an unsignalled
+fence: the probe is killed, the reason is logged and OBS uses OSMesa, so a young or broken driver costs speed,
+not a frozen OBS. No EGL at all: the probe exits at once and the normal EGL attempt fails fast into OSMesa.
+Missing probe: EGL untested, as before. It runs at every launch, so a driver update is always re-tested;
+`OBS_HAIKU_GL_PROBE=0` skips it. It can be run by hand (`obs-haiku-gl-probe [--frames N]`; exit 0 pass, 2 no EGL,
+3 no 3.3 context, 4 wrong pixels or GL error, 5 fence never signalled). HaikuPorts builds that Mesa with `-Dosmesa=true` on the
 llvmpipe (`swrast` + LLVM) driver, which provides OpenGL 3.3 core and beyond. `libOSMesa` is loaded with
 `dlopen()` (Mesa 25 no longer has it), so one binary works with either Mesa.
 

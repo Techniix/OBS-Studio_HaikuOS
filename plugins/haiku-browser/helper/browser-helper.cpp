@@ -48,11 +48,17 @@
 #include <WebViewConstants.h>
 #include <WebWindow.h>
 
+#include <image.h>
+
 #include <atomic>
+#include <dlfcn.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define LOG(...) fprintf(stderr, "obs-haiku-browser: " __VA_ARGS__)
 
@@ -207,10 +213,11 @@ public:
 
 class HelperApp : public BApplication {
 public:
-	HelperApp(area_id source_area, const char *storage)
+	/* storage: the resolved storage directory (see resolve_storage_dir()); empty if there is none */
+	HelperApp(area_id source_area, const std::string &storage)
 		: BApplication(OBS_BROWSER_HELPER_SIGNATURE),
 		  source_area(source_area),
-		  storage(storage ? storage : "")
+		  storage(storage)
 	{
 	}
 
@@ -224,16 +231,8 @@ public:
 		BWebPage::InitializeOnce();
 		BWebPage::SetCacheModel(B_WEBKIT_CACHE_MODEL_WEB_BROWSER);
 
-		BPath path;
-		if (!storage.empty()) {
-			path.SetTo(storage.c_str());
-		} else if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
-			path.Append("obs-studio/plugin_config/obs-browser/haiku-webkit");
-		}
-		if (path.InitCheck() == B_OK) {
-			create_directory(path.Path(), 0755);
-			BWebSettings::SetPersistentStoragePath(path.Path());
-		}
+		if (!storage.empty())
+			BWebSettings::SetPersistentStoragePath(storage.c_str());
 
 		window = new HelperWindow(BRect(PARK_X, PARK_Y, PARK_X + width - 1, PARK_Y + height - 1));
 		window->shm = shm;
@@ -752,6 +751,147 @@ private:
 	int32 buttons = 0;
 };
 
+/* --storage <dir> (a browser dock's cookie profile, from the QCef cookie manager) or, for browser sources, one
+ * directory shared by all of them. Created if needed; empty if it cannot be. */
+static std::string resolve_storage_dir(const char *storage)
+{
+	BPath path;
+	if (storage && *storage)
+		path.SetTo(storage);
+	else if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK)
+		path.Append("obs-studio/plugin_config/obs-browser/haiku-webkit");
+	if (path.InitCheck() != B_OK || create_directory(path.Path(), 0700) != B_OK)
+		return std::string();
+	return path.Path();
+}
+
+static bool curl_backend_loaded()
+{
+	image_info info;
+	int32 cookie = 0;
+	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
+		const char *leaf = strrchr(info.name, '/');
+		if (!strncmp(leaf ? leaf + 1 : info.name, "libcurl", 7))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * WebCore's CookieJarDB opens the shared database without a busy timeout, and treats any failure while opening
+ * it (including SQLITE_BUSY from "PRAGMA journal_mode=WAL" or the quick_check while another helper or the
+ * panel's cookie manager holds a lock) as corruption: it deletes the database and every login with it
+ * (CookieJarDB::openDatabase() -> deleteAllDatabaseFiles()). Several helpers start together when OBS starts.
+ *
+ * sqlite3_auto_extension() registers an entry point that SQLite calls for every connection opened afterwards in
+ * this process, at the end of sqlite3_open_v2() and so before WebKit's first statement. It is registered in the
+ * library instance WebKit links: dlopen() of the soname WebKit already loaded returns that same image.
+ */
+namespace sqlite_busy {
+
+struct sqlite3;
+typedef int (*busy_timeout_fn)(sqlite3 *, int);
+typedef int (*auto_extension_fn)(void (*)(void));
+
+constexpr int kTimeoutMs = 5000;
+busy_timeout_fn busy_timeout = nullptr;
+
+/* the documented entry point signature: int xEntryPoint(sqlite3 *, char **pzErrMsg,
+ * const sqlite3_api_routines *); a non-zero return would make the open fail */
+extern "C" int entry_point(sqlite3 *db, char **, const void *)
+{
+	if (busy_timeout)
+		busy_timeout(db, kTimeoutMs);
+	return 0; /* SQLITE_OK */
+}
+
+static bool already_loaded()
+{
+	image_info info;
+	int32 cookie = 0;
+	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
+		const char *leaf = strrchr(info.name, '/');
+		if (!strncmp(leaf ? leaf + 1 : info.name, "libsqlite3", 10))
+			return true;
+	}
+	return false;
+}
+
+static void install()
+{
+	/* the same names browser-panel.cpp resolves */
+	const bool loaded = already_loaded();
+	void *lib = dlopen("libsqlite3.so.0", RTLD_NOW | RTLD_GLOBAL);
+	if (!lib)
+		lib = dlopen("libsqlite3.so", RTLD_NOW | RTLD_GLOBAL);
+	if (!lib) {
+		LOG("libsqlite3 is not available; the cookie database is opened without a busy timeout\n");
+		return;
+	}
+	if (!loaded)
+		LOG("libsqlite3 was not loaded with HaikuWebKit; if WebKit has its own copy, the cookie database "
+		    "is opened without a busy timeout\n");
+	busy_timeout = reinterpret_cast<busy_timeout_fn>(dlsym(lib, "sqlite3_busy_timeout"));
+	auto auto_extension = reinterpret_cast<auto_extension_fn>(dlsym(lib, "sqlite3_auto_extension"));
+	if (!busy_timeout || !auto_extension ||
+	    auto_extension(reinterpret_cast<void (*)(void)>(entry_point)) != 0) {
+		busy_timeout = nullptr;
+		LOG("libsqlite3 cannot register a busy timeout; the cookie database is opened without one\n");
+	}
+	/* the library stays loaded: the entry point is called for as long as the process lives */
+}
+
+} // namespace sqlite_busy
+
+/*
+ * Persistent, shared cookies. HaikuWebKit (1.9.19 and 1.10 as packaged) uses WebCore's curl network backend;
+ * its cookie store is an SQLite database (CookieJarDB) at $CURL_COOKIE_JAR_PATH, or "cookie.jar.db" in the
+ * current directory without it (WebCore's NetworkStorageSessionCurl.cpp; WebPositive sets the same variable).
+ * Every request and every document.cookie access queries that database, and SQLite (WAL journal) arbitrates
+ * between processes, so all helpers given the same storage directory share one live cookie jar: a login in
+ * one dock is visible to the others on their next request. The BUrlContext/BNetworkCookieJar a BWebView can
+ * be given is not consulted by curl builds (FrameNetworkingContextHaiku ignores it under USE(CURL)).
+ *
+ * Must run before WebKit is initialized: the storage session reads the variable when it is first created.
+ */
+static void setup_cookie_store(const std::string &dir)
+{
+	/* The database holds login tokens; so do local storage and the cache. Nothing this process creates is
+	 * meant for other users: SQLite creates files 0644 & ~umask and gives -wal/-shm the database's mode. */
+	umask(077);
+
+	if (dir.empty() || access(dir.c_str(), W_OK) != 0) {
+		/* the in-memory jar of earlier versions, never a stray file in the current directory */
+		LOG("no usable storage directory; cookies are kept in memory for this page only\n");
+		setenv("CURL_COOKIE_JAR_PATH", ":memory:", 1);
+		return;
+	}
+
+	/* tighten what earlier versions or another umask left behind (best effort: we may not own it) */
+	chmod(dir.c_str(), 0700);
+	const std::string db = dir + "/" OBS_BROWSER_COOKIE_DB;
+	for (const char *suffix : {"", "-wal", "-shm", "-journal"}) {
+		const std::string file = db + suffix;
+		if (chmod(file.c_str(), 0600) != 0 && errno != ENOENT)
+			LOG("cannot restrict permissions of %s: %s\n", file.c_str(), strerror(errno));
+	}
+
+	/* before WebKit's storage session first opens the database (lazily, on the first cookie access of a
+	 * load). Opening is not serialized across helpers with a lock: that first access happens inside WebCore,
+	 * with no hook before or after it; the busy timeout makes concurrent opens wait instead of failing. */
+	sqlite_busy::install();
+
+	setenv("CURL_COOKIE_JAR_PATH", db.c_str(), 1);
+	/* A WebKit that stops honouring the variable falls back to "cookie.jar.db" in the current directory,
+	 * which is then the same file. The helper only uses absolute paths itself. */
+	if (chdir(dir.c_str()) != 0)
+		LOG("cannot change to %s: %s\n", dir.c_str(), strerror(errno));
+
+	if (!curl_backend_loaded())
+		LOG("libcurl is not loaded: if this HaikuWebKit does not use the curl network backend, cookies are "
+		    "kept in memory per page and not persisted\n");
+}
+
 int main(int argc, char **argv)
 {
 	area_id area = -1;
@@ -770,7 +910,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	HelperApp app(area, storage);
+	const std::string storage_dir = resolve_storage_dir(storage);
+	setup_cookie_store(storage_dir);
+
+	HelperApp app(area, storage_dir);
 	app.Run();
 	return 0;
 }

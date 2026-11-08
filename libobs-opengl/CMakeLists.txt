@@ -21,6 +21,12 @@ if(NOT TARGET OBS::glad)
   add_subdirectory("${CMAKE_SOURCE_DIR}/deps/glad" "${CMAKE_BINARY_DIR}/deps/glad")
 endif()
 
+if(OS_HAIKU)
+  # EGL driver self-test that gl-haiku.c runs before it uses EGL; built and installed next to the obs executable
+  add_subdirectory(haiku-gl-probe)
+  add_dependencies(libobs-opengl obs-haiku-gl-probe)
+endif()
+
 if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
   find_package(Libdrm REQUIRED)
   find_package(X11 REQUIRED)

@@ -25,7 +25,6 @@
 
 #include <atomic>
 #include <memory>
-#include <string>
 #include <vector>
 
 #define S_DEVICE_ID "device_id"
@@ -36,8 +35,8 @@ namespace {
 
 struct AudioInput {
 	obs_source_t *source = nullptr;
-	std::string device_id;
-	std::unique_ptr<HaikuRecorder> recorder;
+	/* opens the device and keeps it open, retrying while it is busy or gone (media-device.hpp) */
+	std::unique_ptr<HaikuCapture> capture;
 	std::vector<uint8_t> convert_buffer;
 	std::atomic_bool warned_format = false;
 
@@ -46,25 +45,17 @@ struct AudioInput {
 	uint32_t map_mask = 0;
 	AudioChannelMap channel_map;
 
-	void Open();
+	void OnOpened(const media_format &format);
 	void OnBuffer(const void *data, size_t size, const media_format &format);
 };
 
-void AudioInput::Open()
+/* supervisor thread */
+void AudioInput::OnOpened(const media_format &format)
 {
-	if (!recorder) {
-		recorder = std::make_unique<HaikuRecorder>(
-			"OBS Audio Input", B_MEDIA_RAW_AUDIO,
-			[this](const void *data, size_t size, const media_format &format) {
-				OnBuffer(data, size, format);
-			});
-	}
-
-	if (recorder->Open(device_id, B_MEDIA_RAW_AUDIO) == B_OK) {
-		const media_raw_audio_format &raw = recorder->ConnectedFormat().u.raw_audio;
-		blog(LOG_INFO, "[haiku-media] '%s': capturing from '%s' (%u ch, %.0f Hz, format 0x%x)",
-		     obs_source_get_name(source), device_id.c_str(), raw.channel_count, raw.frame_rate, raw.format);
-	}
+	const media_raw_audio_format &raw = format.u.raw_audio;
+	warned_format = false;
+	blog(LOG_INFO, "[haiku-media] '%s': capturing (%u ch, %.0f Hz, format 0x%x)", obs_source_get_name(source),
+	     raw.channel_count, raw.frame_rate, raw.format);
 }
 
 void AudioInput::OnBuffer(const void *data, size_t size, const media_format &format)
@@ -164,20 +155,18 @@ const char *audio_input_get_name(void *)
 void audio_input_update(void *data, obs_data_t *settings)
 {
 	AudioInput *ai = static_cast<AudioInput *>(data);
-	std::string device_id = obs_data_get_string(settings, S_DEVICE_ID);
-
-	if (ai->recorder && ai->recorder->IsOpen() && device_id == ai->device_id)
-		return;
-
-	ai->device_id = device_id;
-	ai->warned_format = false;
-	ai->Open();
+	/* no Media Kit work here: the capture's thread (re)opens the device, also when it is busy now */
+	ai->capture->Configure(obs_data_get_string(settings, S_DEVICE_ID), HaikuVideoSize(), true);
 }
 
 void *audio_input_create(obs_data_t *settings, obs_source_t *source)
 {
 	AudioInput *ai = new AudioInput;
 	ai->source = source;
+	ai->capture = std::make_unique<HaikuCapture>(
+		source, "OBS Audio Input", B_MEDIA_RAW_AUDIO,
+		[ai](const void *data, size_t size, const media_format &format) { ai->OnBuffer(data, size, format); },
+		[ai](const media_format &format, const HaikuOpenResult &) { ai->OnOpened(format); }, nullptr);
 	audio_input_update(ai, settings);
 	return ai;
 }
@@ -185,7 +174,7 @@ void *audio_input_create(obs_data_t *settings, obs_source_t *source)
 void audio_input_destroy(void *data)
 {
 	AudioInput *ai = static_cast<AudioInput *>(data);
-	ai->recorder.reset(); /* stops the recorder thread before AudioInput goes away */
+	ai->capture.reset(); /* stops the supervisor and recorder threads before AudioInput goes away */
 	delete ai;
 }
 

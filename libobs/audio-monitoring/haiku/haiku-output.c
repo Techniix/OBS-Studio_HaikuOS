@@ -18,13 +18,17 @@
 /*
  * Audio monitoring ("Monitor and Output") on Haiku.
  *
- * Each monitored source gets a BSoundPlayer connected to the system mixer. libobs pushes the source's audio
- * (planar float) into a FIFO from its audio thread; the player's realtime thread pulls interleaved float
- * frames out of it. The FIFO is kept short so monitoring latency stays bounded; on underrun the player
- * outputs silence and re-buffers a little before resuming.
+ * Each monitored source gets a player. libobs pushes the source's audio (planar float) into a FIFO from its
+ * audio thread, resampled to interleaved float at the player's rate and channel count; the player's
+ * realtime thread pulls frames out of it. The FIFO is kept short so monitoring latency stays bounded; on
+ * underrun the player outputs silence and re-buffers a little before resuming.
  *
- * Haiku routes all application audio through the system mixer, so the only monitoring device is
- * "default" (the frontend adds that entry itself).
+ * Devices: "default" (added by the frontend) is the system mixer, which mixes, resamples and follows the
+ * output chosen in Media preferences. The other entries are physical outputs (e.g. a USB headset) played to
+ * directly, bypassing the mixer: those dictate rate and channel count (resampled here) and sample format
+ * (converted by the shared device player, which also mixes the monitored sources). A saved device that is
+ * missing or busy falls back to the mixer (see haiku-sound-player.cpp). A device's clock isn't synchronised
+ * to OBS's: drift is absorbed by the FIFO (dropping on overflow, re-buffering on underrun).
  */
 
 #include "../../media-io/audio-resampler.h"
@@ -53,7 +57,6 @@ struct audio_monitor {
 	bool mutex_initialized;
 	struct deque data;
 	audio_resampler_t *resampler;
-
 	uint32_t channels;
 	size_t bytes_per_frame;
 	size_t prebuffer_bytes;
@@ -70,9 +73,8 @@ bool obs_audio_monitoring_available(void)
 
 void obs_enum_audio_monitoring_devices(obs_enum_audio_device_cb cb, void *data)
 {
-	/* Only the system mixer ("default", added by the caller) exists. */
-	UNUSED_PARAMETER(cb);
-	UNUSED_PARAMETER(data);
+	/* The system mixer ("default") is added by the caller; list the physical outputs. */
+	obs_haiku_enum_output_devices(cb, data);
 }
 
 bool devices_match(const char *id1, const char *id2)
@@ -82,10 +84,10 @@ bool devices_match(const char *id1, const char *id2)
 	return strcmp(id1, id2) == 0;
 }
 
-static void fill_buffer(void *param, float *buffer, size_t frames, uint32_t channels)
+static void fill_buffer(void *param, float *buffer, size_t frames)
 {
 	struct audio_monitor *monitor = param;
-	const size_t want = frames * channels * sizeof(float);
+	const size_t want = frames * monitor->bytes_per_frame;
 	size_t have = 0;
 
 	pthread_mutex_lock(&monitor->mutex);
@@ -168,10 +170,6 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 	const uint32_t rate = info->samples_per_sec;
 
 	monitor->source = source;
-	monitor->channels = channels;
-	monitor->bytes_per_frame = sizeof(float) * channels;
-	monitor->prebuffer_bytes = monitor->bytes_per_frame * rate * PREBUFFER_MS / 1000;
-	monitor->max_bytes = monitor->bytes_per_frame * rate * MAX_LATENCY_MS / 1000;
 	monitor->buffering = true;
 
 	if (pthread_mutex_init(&monitor->mutex, NULL) != 0) {
@@ -196,8 +194,28 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 		}
 	}
 
+	char name[128];
+	snprintf(name, sizeof(name), "OBS Monitor: %s", obs_source_get_name(source));
+
+	/* Not started yet, so fill_buffer can't run before the fields below are set. */
+	struct obs_haiku_output_format out;
+	monitor->player = obs_haiku_sound_player_create(id, name, rate, channels, (size_t)rate * BUFFER_MS / 1000,
+							fill_buffer, monitor, &out);
+	if (!monitor->player) {
+		blog(LOG_WARNING, "%s: Failed to create BSoundPlayer (is the media server running?)", __FUNCTION__);
+		return false;
+	}
+
+	monitor->channels = out.channels;
+	monitor->bytes_per_frame = sizeof(float) * out.channels;
+	monitor->prebuffer_bytes = monitor->bytes_per_frame * out.sample_rate * PREBUFFER_MS / 1000;
+	monitor->max_bytes = monitor->bytes_per_frame * out.sample_rate * MAX_LATENCY_MS / 1000;
+
+	/* 1-6 and 8 channels map directly onto speaker_layout values (checked by the player) */
 	struct resample_info from = {.samples_per_sec = rate, .speakers = info->speakers, .format = AUDIO_FORMAT_FLOAT_PLANAR};
-	struct resample_info to = {.samples_per_sec = rate, .speakers = info->speakers, .format = AUDIO_FORMAT_FLOAT};
+	struct resample_info to = {.samples_per_sec = out.sample_rate,
+				   .speakers = (enum speaker_layout)out.channels,
+				   .format = AUDIO_FORMAT_FLOAT};
 
 	monitor->resampler = audio_resampler_create(&to, &from);
 	if (!monitor->resampler) {
@@ -205,13 +223,8 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 		return false;
 	}
 
-	char name[128];
-	snprintf(name, sizeof(name), "OBS Monitor: %s", obs_source_get_name(source));
-
-	monitor->player = obs_haiku_sound_player_create(name, rate, channels, (size_t)rate * BUFFER_MS / 1000,
-							fill_buffer, monitor);
-	if (!monitor->player) {
-		blog(LOG_WARNING, "%s: Failed to create BSoundPlayer (is the media server running?)", __FUNCTION__);
+	if (!obs_haiku_sound_player_start(monitor->player)) {
+		blog(LOG_WARNING, "%s: Failed to start BSoundPlayer", __FUNCTION__);
 		return false;
 	}
 

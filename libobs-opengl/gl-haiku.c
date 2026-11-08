@@ -35,6 +35,11 @@
  *    caller-provided memory buffer, one per swapchain. libOSMesa is loaded at runtime, so the same binary works
  *    whether or not it exists (Mesa 25 removed OSMesa).
  *
+ * Unless a backend is forced, EGL is only used after the driver passed a self-test: obs-haiku-gl-probe (installed
+ * next to the obs executable, see haiku-gl-probe/gl-probe.c) runs OBS's usage pattern in a separate process
+ * under a timeout. A driver that hangs, crashes or renders wrong pixels there gets OSMesa instead of a frozen
+ * OBS. See run_gl_probe().
+ *
  * Readback costs one glReadPixels per displayed frame, which is acceptable for preview/projector sizes and
  * keeps the renderer independent of any toolkit. The rows are handed over bottom-up as GL returns them, with
  * the pointer at the top row and a negative stride, so the consumer's copy into its own image does the vertical
@@ -42,12 +47,20 @@
  */
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <obs.h>
 #include <util/bmem.h>
+#include <util/platform.h>
 
 #include "gl-subsystem.h"
 
@@ -488,6 +501,355 @@ static bool load_gl(gs_device_t *device)
 	return true;
 }
 
+/* ---------------------------------------------------------------------------------------------------------- */
+/* Driver self-test                                                                                           */
+
+#define GL_PROBE_NAME "obs-haiku-gl-probe"
+#define GL_PROBE_DEFAULT_TIMEOUT_S 8.0
+#define GL_PROBE_MAX_LOG_LINES 40
+#define GL_PROBE_REAP_TIMEOUT_MS 2000
+
+enum gl_probe_result {
+	GL_PROBE_PASSED,
+	GL_PROBE_NO_EGL,      /* the probe found no usable EGL display */
+	GL_PROBE_FAILED,      /* hang, crash, wrong pixels, no suitable context: don't use EGL */
+	GL_PROBE_UNAVAILABLE, /* skipped, missing or could not be run: behave as without a probe */
+};
+
+/* exit codes of obs-haiku-gl-probe (haiku-gl-probe/gl-probe.c) */
+static const char *gl_probe_exit_string(int code)
+{
+	switch (code) {
+	case 2:
+		return "no usable EGL display";
+	case 3:
+		return "no usable OpenGL 3.3 core context";
+	case 4:
+		return "wrong pixels or an OpenGL error";
+	case 5:
+		return "a GPU fence never signalled";
+	default:
+		return "unexpected exit status";
+	}
+}
+
+struct gl_probe_output {
+	char line[256];
+	size_t len;
+	unsigned lines;
+};
+
+static void gl_probe_flush_line(struct gl_probe_output *out)
+{
+	if (!out->len)
+		return;
+	out->line[out->len] = '\0';
+	if (out->lines < GL_PROBE_MAX_LOG_LINES)
+		blog(LOG_INFO, "Haiku GL probe: %s", out->line);
+	else if (out->lines == GL_PROBE_MAX_LOG_LINES)
+		blog(LOG_INFO, "Haiku GL probe: (further output dropped)");
+	out->lines++;
+	out->len = 0;
+}
+
+static void gl_probe_add_output(struct gl_probe_output *out, const char *data, size_t size)
+{
+	for (size_t i = 0; i < size; i++) {
+		if (data[i] == '\n' || data[i] == '\r') {
+			gl_probe_flush_line(out);
+		} else {
+			out->line[out->len++] = data[i];
+			if (out->len == sizeof(out->line) - 1)
+				gl_probe_flush_line(out);
+		}
+	}
+}
+
+/* waitpid() with a deadline (os_gettime_ns() based). Returns pid when reaped, 0 on timeout, -1 on error. */
+static pid_t gl_probe_reap(pid_t pid, int *status, uint64_t deadline)
+{
+	for (;;) {
+		pid_t ret = waitpid(pid, status, WNOHANG);
+		if (ret == pid || (ret == -1 && errno != EINTR))
+			return ret;
+		if (os_gettime_ns() >= deadline)
+			return 0;
+		os_sleep_ms(5);
+	}
+}
+
+/*
+ * The signals the probe gets with their default action (posix_spawnattr_setsigdefault). Haiku's posix_spawn
+ * calls sigaction(SIG_DFL) for every member and fails the whole spawn on the first rejection, and the kernel
+ * rejects SIGKILL, SIGKILLTHR, SIGSTOP and its internal thread signals (BLOCKABLE_SIGNALS), so a full set
+ * never spawns. Only ignored dispositions survive exec, so these are the catchable signals OBS or one of its
+ * libraries may have set to SIG_IGN.
+ *
+ * Note: the probe inherits every OBS file descriptor that lacks FD_CLOEXEC; Haiku's posix_spawn has no
+ * close-by-default flag or closefrom file action, and the probe holds them only for its short lifetime.
+ */
+static void gl_probe_default_signals(sigset_t *set)
+{
+	static const int signals[] = {
+		SIGHUP,  SIGINT,  SIGQUIT, SIGILL,  SIGABRT, SIGFPE,  SIGSEGV, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD,
+		SIGUSR1, SIGUSR2, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT,
+#ifdef SIGBUS
+		SIGBUS,
+#endif
+#ifdef SIGTRAP
+		SIGTRAP,
+#endif
+#ifdef SIGPOLL
+		SIGPOLL,
+#endif
+#if defined(SIGIO) && (!defined(SIGPOLL) || SIGIO != SIGPOLL)
+		SIGIO,
+#endif
+#ifdef SIGWINCH
+		SIGWINCH,
+#endif
+#ifdef SIGPROF
+		SIGPROF,
+#endif
+#ifdef SIGSYS
+		SIGSYS,
+#endif
+#ifdef SIGURG
+		SIGURG,
+#endif
+#ifdef SIGVTALRM
+		SIGVTALRM,
+#endif
+#ifdef SIGXCPU
+		SIGXCPU,
+#endif
+#ifdef SIGXFSZ
+		SIGXFSZ,
+#endif
+	};
+	sigemptyset(set);
+	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+		sigaddset(set, signals[i]);
+}
+
+/* Moves fd above stdin/stdout/stderr (OBS may have been started with them closed) and marks it close-on-exec. */
+static int gl_probe_fd(int fd)
+{
+	if (fd >= 0 && fd <= STDERR_FILENO) {
+		int moved = fcntl(fd, F_DUPFD, STDERR_FILENO + 1);
+		close(fd);
+		fd = moved;
+	}
+	if (fd >= 0)
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+	return fd;
+}
+
+/*
+ * Runs obs-haiku-gl-probe, which drives the EGL driver the way OBS does (surfaceless context, one context
+ * handed between threads, FBO rendering, fences, readback) for 120 frames and checks the pixels. A driver
+ * that hangs (as a young NVK/Zink once did on its first frames) would otherwise freeze OBS's graphics thread
+ * and with it the UI; in a child process it costs the timeout and a fallback to OSMesa. The probe runs on
+ * every launch, so a driver update is always re-tested; on a healthy driver it costs one EGL initialisation
+ * and a few milliseconds of rendering. Its output goes into the OBS log.
+ */
+static enum gl_probe_result run_gl_probe(void)
+{
+	const char *skip = getenv("OBS_HAIKU_GL_PROBE");
+	if (skip && strcmp(skip, "0") == 0) {
+		blog(LOG_INFO, "Haiku GL: driver self-test skipped (OBS_HAIKU_GL_PROBE=0)");
+		return GL_PROBE_UNAVAILABLE;
+	}
+
+	double timeout = GL_PROBE_DEFAULT_TIMEOUT_S;
+	const char *timeout_env = getenv("OBS_HAIKU_GL_PROBE_TIMEOUT");
+	if (timeout_env && *timeout_env) {
+		char *end = NULL;
+		double value = strtod(timeout_env, &end);
+		if (end != timeout_env && value > 0.0 && value <= 3600.0)
+			timeout = value;
+		else
+			blog(LOG_WARNING, "Haiku GL: ignoring invalid OBS_HAIKU_GL_PROBE_TIMEOUT '%s'", timeout_env);
+	}
+
+	char *path = os_get_executable_path_ptr(GL_PROBE_NAME);
+	if (!path || access(path, X_OK) != 0) {
+		blog(LOG_WARNING, "Haiku GL: driver self-test %s not found, using EGL without it",
+		     path ? path : GL_PROBE_NAME);
+		bfree(path);
+		return GL_PROBE_UNAVAILABLE;
+	}
+
+	int fds[2];
+	if (pipe(fds) != 0) {
+		blog(LOG_WARNING, "Haiku GL: driver self-test not run: pipe() failed (%s)", strerror(errno));
+		bfree(path);
+		return GL_PROBE_UNAVAILABLE;
+	}
+	fds[0] = gl_probe_fd(fds[0]);
+	fds[1] = gl_probe_fd(fds[1]);
+	if (fds[0] < 0 || fds[1] < 0) {
+		if (fds[0] >= 0)
+			close(fds[0]);
+		if (fds[1] >= 0)
+			close(fds[1]);
+		blog(LOG_WARNING, "Haiku GL: driver self-test not run: no file descriptors");
+		bfree(path);
+		return GL_PROBE_UNAVAILABLE;
+	}
+
+	/* the child's stdout and stderr go into the pipe, stdin is /dev/null; dup2 clears close-on-exec */
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&actions, fds[1], STDERR_FILENO);
+
+	/* OBS's threads may block or catch signals; the probe starts with defaults so SIGALRM/SIGKILL work */
+	posix_spawnattr_t attr;
+	sigset_t set;
+	posix_spawnattr_init(&attr);
+	sigemptyset(&set);
+	posix_spawnattr_setsigmask(&attr, &set);
+	gl_probe_default_signals(&set);
+	posix_spawnattr_setsigdefault(&attr, &set);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+
+	char timeout_arg[16];
+	snprintf(timeout_arg, sizeof(timeout_arg), "%u", (unsigned)(timeout + 0.999));
+	char *argv[] = {path, "--timeout", timeout_arg, NULL};
+	extern char **environ;
+
+	const uint64_t start = os_gettime_ns();
+	pid_t pid = -1;
+	int err = posix_spawn(&pid, path, &actions, &attr, argv, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	posix_spawnattr_destroy(&attr);
+	close(fds[1]);
+	if (err != 0) {
+		/* Haiku's posix_spawn forks first: if the child failed before exec, it exits right after
+		 * reporting the error, too late for posix_spawn's own WNOHANG waitpid; reap it here */
+		if (pid > 0) {
+			int ignored;
+			gl_probe_reap(pid, &ignored, os_gettime_ns() + GL_PROBE_REAP_TIMEOUT_MS * 1000000ull);
+		}
+		blog(LOG_WARNING, "Haiku GL: driver self-test %s could not be started (%s), using EGL without it", path,
+		     strerror(err));
+		close(fds[0]);
+		bfree(path);
+		return GL_PROBE_UNAVAILABLE;
+	}
+	bfree(path);
+
+	/* collect the output until the probe closes the pipe (it exited) or the time is up */
+	const uint64_t deadline = start + (uint64_t)(timeout * 1e9);
+	struct gl_probe_output out = {0};
+	bool timed_out = false;
+	for (;;) {
+		const uint64_t now = os_gettime_ns();
+		if (now >= deadline) {
+			timed_out = true;
+			break;
+		}
+		struct pollfd pfd = {.fd = fds[0], .events = POLLIN};
+		int ready = poll(&pfd, 1, (int)((deadline - now) / 1000000 + 1));
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready < 0)
+			break;
+		if (ready == 0)
+			continue;
+		char buf[512];
+		ssize_t got = read(fds[0], buf, sizeof(buf));
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break; /* EOF */
+		gl_probe_add_output(&out, buf, (size_t)got);
+	}
+	gl_probe_flush_line(&out);
+	close(fds[0]);
+
+	int status = 0;
+	pid_t reaped = timed_out ? 0 : gl_probe_reap(pid, &status, deadline);
+	if (reaped == 0) {
+		timed_out = true;
+		/* SIGKILL ends every thread of the team, including one stuck in the driver */
+		kill(pid, SIGKILL);
+		reaped = gl_probe_reap(pid, &status, os_gettime_ns() + GL_PROBE_REAP_TIMEOUT_MS * 1000000ull);
+		if (reaped == 0)
+			blog(LOG_WARNING, "Haiku GL: driver self-test (team %d) did not go away after SIGKILL",
+			     (int)pid);
+	}
+	const double elapsed_ms = (double)(os_gettime_ns() - start) / 1e6;
+
+	if (timed_out) {
+		blog(LOG_WARNING,
+		     "Haiku GL: the OpenGL driver failed its self-test: no result after %.0f s, the driver hangs "
+		     "(OBS_HAIKU_GL_PROBE_TIMEOUT=<seconds> allows a slower driver more time)",
+		     timeout);
+		return GL_PROBE_FAILED;
+	}
+	if (reaped < 0) {
+		/* ECHILD: someone else reaped it (SIGCHLD ignored); the result is unknown */
+		blog(LOG_WARNING, "Haiku GL: driver self-test result unavailable (%s), using EGL without it",
+		     strerror(errno));
+		return GL_PROBE_UNAVAILABLE;
+	}
+	if (WIFSIGNALED(status)) {
+		blog(LOG_WARNING, "Haiku GL: the OpenGL driver failed its self-test: the test crashed (signal %d)",
+		     WTERMSIG(status));
+		return GL_PROBE_FAILED;
+	}
+	const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	if (code == 0) {
+		blog(LOG_INFO, "Haiku GL: driver self-test passed (%.0f ms)", elapsed_ms);
+		return GL_PROBE_PASSED;
+	}
+	if (code == 2) {
+		blog(LOG_INFO, "Haiku GL: driver self-test: %s", gl_probe_exit_string(code));
+		return GL_PROBE_NO_EGL;
+	}
+	blog(LOG_WARNING, "Haiku GL: the OpenGL driver failed its self-test: %s (exit status %d)",
+	     gl_probe_exit_string(code), code);
+	return GL_PROBE_FAILED;
+}
+
+/* ---------------------------------------------------------------------------------------------------------- */
+
+static bool egl_create_and_load(gs_device_t *device, bool fallback_available)
+{
+	struct gl_platform *plat = device->plat;
+
+	if (!egl_context_create(plat)) {
+		if (fallback_available)
+			blog(LOG_INFO, "Haiku GL: no usable EGL (normal with HaikuPorts' Mesa 22), using OSMesa");
+		return false;
+	}
+	if (load_gl(device))
+		return true;
+
+	/* a context that cannot be made current or is below 3.3 is as good as none */
+	egl_context_destroy(plat);
+	if (fallback_available)
+		blog(LOG_INFO, "Haiku GL: EGL context unusable, falling back to OSMesa");
+	return false;
+}
+
+static bool osmesa_create_and_load(gs_device_t *device)
+{
+	struct gl_platform *plat = device->plat;
+
+	if (!osmesa_context_create(plat))
+		return false;
+	if (load_gl(device))
+		return true;
+
+	osmesa_context_destroy(plat);
+	plat->use_osmesa = false;
+	return false;
+}
+
 extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adapter)
 {
 	UNUSED_PARAMETER(adapter);
@@ -501,25 +863,31 @@ extern struct gl_platform *gl_platform_create(gs_device_t *device, uint32_t adap
 	const bool want_egl = !forced || strcmp(forced, "osmesa") != 0;
 	const bool want_osmesa = !forced || strcmp(forced, "egl") != 0;
 
-	bool created = false;
-	if (want_egl && egl_context_create(plat)) {
-		created = load_gl(device);
-		if (!created) {
-			/* a context that cannot be made current or is below 3.3 is as good as none */
-			egl_context_destroy(plat);
-			if (want_osmesa)
-				blog(LOG_INFO, "Haiku GL: EGL context unusable, falling back to OSMesa");
-		}
-	} else if (want_egl && want_osmesa) {
-		blog(LOG_INFO, "Haiku GL: no usable EGL (normal with HaikuPorts' Mesa 22), using OSMesa");
-	}
+	/* Nothing forced: test the EGL driver in a separate process first (see run_gl_probe()). */
+	enum gl_probe_result probe = GL_PROBE_UNAVAILABLE;
+	if (want_egl && want_osmesa)
+		probe = run_gl_probe();
 
-	if (!created && want_osmesa && osmesa_context_create(plat)) {
-		created = load_gl(device);
+	bool created = false;
+	if (probe == GL_PROBE_FAILED) {
+		blog(LOG_WARNING, "Haiku GL: using the CPU renderer (OSMesa) instead of the hardware OpenGL driver. "
+				  "Start OBS with OBS_HAIKU_GL=egl to use the driver anyway.");
+		created = osmesa_create_and_load(device);
 		if (!created) {
-			osmesa_context_destroy(plat);
-			plat->use_osmesa = false;
+			/* without OSMesa (Mesa 25 has none) the failed driver is the only chance left */
+			blog(LOG_WARNING, "Haiku GL: OSMesa is not available; trying the driver that failed the "
+					  "self-test");
+			created = egl_create_and_load(device, false);
 		}
+	} else {
+		if (want_egl) {
+			created = egl_create_and_load(device, want_osmesa);
+			if (created && probe == GL_PROBE_NO_EGL)
+				blog(LOG_WARNING, "Haiku GL: the self-test found no EGL, but OBS did; the driver is "
+						  "used untested");
+		}
+		if (!created && want_osmesa)
+			created = osmesa_create_and_load(device);
 	}
 
 	if (!created) {

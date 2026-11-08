@@ -28,30 +28,32 @@ Column meanings:
 - **Implemented**: the code exists for Haiku.
 - **Compiles**: "clang" means it passes the cross-check harness (syntax-only, clang, real Haiku headers); "GCC" would
   mean a real build on Haiku.
-- **Runs**, **Functionally tested**, **Fully verified**: on real Haiku hardware. Nothing has reached these yet.
+- **Runs**, **Functionally tested**, **Fully verified**: on real Haiku hardware (the maintainer's x86-64 machine with an
+  RTX 5070, hrev60368). "GCC" means the whole tree was built natively on Haiku; changes made after that build (the
+  2026-11-08 review fixes and supplements) are syntax-checked with clang until the next native build.
 
 | Feature | Implemented | Compiles | Runs | Functionally tested | Fully verified | Known limitations |
 | --- | --- | --- | --- | --- | --- | --- |
-| Build system (`OS_HAIKU`, `cmake/haiku`) | Yes | clang | – | – | – | Configures in the harness; native configure untested |
-| libobs platform layer (paths, system info, threads, UUIDs) | Yes | clang | – | – | – | Sleep inhibition is a no-op (Haiku has no API) |
-| OpenGL renderer (EGL or OSMesa, chosen at runtime, offscreen + readback) | Yes | clang | – | – | – | Without a hardware EGL driver (e.g. nvidia-haiku) rendering is on the CPU (llvmpipe); one `glReadPixels` per displayed preview frame |
-| Qt frontend (preview, projectors, multiview, settings) | Yes | clang | – | – | – | Preview is painted from a CPU copy |
-| Global hotkeys | Yes | clang | – | – | – | OBS "Ctrl" = Haiku Command key (Alt by default); punctuation on non-US layouts may bind to another key |
-| Recording / streaming (FFmpeg, x264, RTMP, WHIP) | Yes (portable) | clang | – | – | – | Software encoders only; no hardware encoders on Haiku |
-| SRT / RIST output (native MPEG-TS) | Yes (bundled libsrt 1.5.4, librist 0.2.12) | clang | – | – | – | Built from source with small Haiku patches |
-| obs-websocket 5 | Yes (bundled qrcodegen, Asio, WebSocket++) | clang | – | – | – | – |
-| Audio input capture (mic, line-in) | Yes (Media Kit `BMediaRecorder`) | clang | – | – | – | Busy devices stay silent until the source is re-saved |
-| Desktop audio capture | Yes (tap node helper, `obs-haiku-audio-tap`) | clang | – | – | – | Captures the whole system mix (no per-application capture); monitored sources are captured too |
-| Audio monitoring | Yes (`BSoundPlayer`) | clang | – | – | – | "Default" (system mixer) is the only device; ~50–250 ms latency |
-| Webcam / video capture devices | Yes (Media Kit) | clang | – | – | – | Uses the device's current format; no resolution/format picker yet |
+| Build system (`OS_HAIKU`, `cmake/haiku`) | Yes | GCC | Yes | Yes (full build on hrev60368) | – | `build.sh` turns optional features on or off from the installed packages each run |
+| libobs platform layer (paths, system info, threads, UUIDs, sleep inhibition) | Yes | GCC | Yes | Partly | – | Haiku has no idle system sleep; while recording/streaming the screen saver and display power-off are held off by resetting the input idle timer (public API, no settings changed) |
+| OpenGL renderer (EGL or OSMesa, chosen at runtime, offscreen + readback) | Yes | GCC | Yes (OSMesa) | Partly | – | Hardware EGL drivers (e.g. nvidia-haiku) are used only after passing a self-test in a separate process; a driver that hangs or misrenders falls back to OSMesa (CPU) automatically. One `glReadPixels` per displayed preview frame |
+| Qt frontend (preview, projectors, multiview, settings) | Yes | GCC | Yes | Partly | – | Preview is painted from a CPU copy |
+| Global hotkeys | Yes | GCC | – | – | – | OBS "Ctrl" = Haiku Command key (Alt by default); punctuation on non-US layouts may bind to another key |
+| Recording / streaming (FFmpeg, x264, RTMP, WHIP) | Yes (portable) | GCC | Yes | Partly (MP4 recording) | – | Software encoders only (see below) |
+| SRT / RIST output (native MPEG-TS) | Yes (bundled libsrt 1.5.4, librist 0.2.12) | GCC | – | – | – | Built from source with small Haiku patches |
+| obs-websocket 5 | Yes (bundled qrcodegen, Asio, WebSocket++) | GCC | – | – | – | – |
+| Audio input capture (mic, line-in) | Yes (Media Kit `BMediaRecorder`) | GCC | – | – | – | Busy or unplugged devices are retried automatically (1–10 s backoff) and picked up again when they return; 3–5 and 7 channel layouts are remapped to OBS layouts |
+| Desktop audio capture | Yes (tap node helper, `obs-haiku-audio-tap`) | GCC | Yes | Partly (tap insertion) | – | Captures the whole system mix (no per-application capture); monitored sources are captured too. Changing the output in Media preferences moves capture and playback to the new card within a few seconds; with OBS closed, a later output change needs "Restart media services" |
+| Audio monitoring | Yes (`BSoundPlayer`) | GCC | – | – | – | Default = system mixer; physical outputs the mixer doesn't use (e.g. a USB headset) can be chosen directly (sources on one card share one connection); a missing or busy card falls back to the mixer; no clock-drift correction beyond the buffer |
+| Webcam / video capture devices | Yes (Media Kit) | GCC | – | – | – | Resolution picker lists the sizes the device accepted when first opened; frame rate and colour space are fixed by Haiku's webcam driver; unplug/replug is followed automatically |
 | Screen capture | Yes (`BScreen::ReadBitmap`) | GCC | Yes | Partly (recording made) | – | Main screen only; reads pause the pointer briefly (*Tear-free*, default) or may show a seam on fast motion (*Smooth pointer*); capture rate drops automatically on slow frame-buffer reads |
-| Window capture | Yes, as screen-region capture of the tracked window | clang | – | – | – | Not isolated: windows covering it are captured too (app_server keeps no per-window buffers) |
-| Browser source | Yes (HaikuWebKit helper `obs-haiku-browser`) | clang | – | – | – | No WebGL, no per-source audio (page audio goes to Desktop Audio), transparency depends on WebKit's alpha output |
-| Browser docks (custom docks, service integrations) | Yes (QCef interface on HaikuWebKit) | clang | – | – | – | Cookies are kept per helper process in memory, not persisted |
-| Automatic scene switcher | Yes (matches application names) | clang | – | – | – | Window titles of other apps aren't used |
+| Window capture | Yes, as screen-region capture of the tracked window | GCC | – | – | – | Not isolated: windows covering it are captured too (app_server keeps no per-window buffers) |
+| Browser source | Yes (HaikuWebKit helper `obs-haiku-browser`) | GCC | – | – | – | No WebGL, no per-source audio (page audio goes to Desktop Audio), transparency depends on WebKit's alpha output |
+| Browser docks (custom docks, service integrations) | Yes (QCef interface on HaikuWebKit) | GCC | – | – | – | Cookies persist per cookie profile (mode 0600) and are shared live by all docks of a profile; persistent logins survive restarts, but session cookies (no expiry) are cleared in every dock whenever a new browser helper starts (HaikuWebKit behaviour) — use a site's "remember me" option; clearing/checking cookies from OBS needs libsqlite3 |
+| Automatic scene switcher | Yes (matches application names) | GCC | – | – | – | Window titles of other apps aren't used |
 | Scripting (Lua, Python) | Yes (portable) | clang | – | – | – | Needs SWIG, LuaJIT, Python packages |
-| Third-party plugins | Yes (standard module loading, plugin manager) | clang | – | – | – | Plugins must be built for Haiku |
-| AJA, DeckLink, NVENC, QSV, VA-API | No | – | – | – | – | No drivers/SDKs exist for Haiku |
+| Third-party plugins | Yes (standard module loading, plugin manager) | GCC | – | – | – | Plugins must be built for Haiku |
+| AJA, DeckLink, NVENC, QSV, VA-API | No | – | – | – | – | No drivers/SDKs exist for Haiku. NVENC needs NVIDIA's closed userspace libraries (Linux/Windows only); a hardware path on Haiku would be Vulkan Video encode through NVK once Mesa supports it |
 
 ## Quick start
 
