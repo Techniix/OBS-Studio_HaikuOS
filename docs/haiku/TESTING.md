@@ -1,5 +1,30 @@
 # Testing the Haiku port
 
+## Automated run
+
+If you only have a few minutes, run this from a Terminal on the Haiku desktop (not over SSH), then leave the
+machine alone until it finishes:
+
+```sh
+cd ~/OBS-Studio_HaikuOS
+build-aux/haiku/test.sh            # pull, build, test (the build takes a while)
+build-aux/haiku/test.sh --no-build # test the existing build only
+build-aux/haiku/test.sh --quick    # shorter recordings, skips the forced-GPU run
+```
+
+It pulls (`--ff-only`, skipped if the tree has local changes) and builds, collects system facts (packages,
+accelerants, Vulkan ICDs, environment, syslog), runs `obs-haiku-gl-probe`, then starts OBS three times (default
+renderer, `OBS_HAIKU_GL=osmesa`, and `OBS_HAIKU_GL=egl OBS_HAIKU_GL_WATCHDOG=0` last) and records a known scene
+(Screen Capture, a colour source, text, desktop audio) for 20 s each. OBS windows open and close by themselves.
+Every step has a time limit; hangs are recorded with a thread listing and `listimage`, then killed.
+
+Each OBS run uses a throwaway configuration in a temporary directory (`XDG_CONFIG_HOME`), so your own OBS
+settings, profiles and scenes are not touched. See `build-aux/haiku/test/make-config.sh` for what it contains.
+
+The last line printed is the archive on the Desktop (`obs-test-<branch>-<commit>-<time>.zip`). Send that file;
+`SUMMARY.txt` inside it has one PASS/FAIL/HANG/SKIPPED line per step. The manual checklist below is still
+needed for things the script cannot judge (preview, dialogs, docks, audio monitoring).
+
 A step-by-step checklist for the first runs on real hardware. Work through it in order; each step says what
 should happen and what to collect if it doesn't. Tick boxes as you go and note anything odd. Exact error
 text and log lines are the most useful thing to send back.
