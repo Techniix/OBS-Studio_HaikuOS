@@ -22,7 +22,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("haiku-capture", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Haiku screen and window capture";
+	return "Screen and window capture through Renga's capture API";
 }
 
 extern void haiku_register_screen_capture(void);

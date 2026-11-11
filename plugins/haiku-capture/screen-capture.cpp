@@ -16,126 +16,95 @@
 ******************************************************************************/
 
 /*
- * Screen capture through the app_server (BScreen::ReadBitmap).
+ * Screen Capture: the whole main screen, or a rectangle of it, through Renga's capture API
+ * (BScreenCapture::StartScreen()/StartRegion(); see capture-source.hpp for how frames travel).
  *
- * ReadBitmap copies the framebuffer into a client bitmap, which is a full-screen copy per frame, so it runs on
- * its own thread and feeds libobs as an asynchronous BGRX source instead of blocking the graphics thread.
+ * With a region the app_server copies and reports changes for that rectangle only, and libobs copies frames of
+ * that size: cheaper than capturing the whole screen and cropping the source.
  */
 
-#include <obs-module.h>
-#include <util/platform.h>
-#include <util/threading.h>
+#include "capture-source.hpp"
 
-#include <atomic>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include <algorithm>
 
-#include <Bitmap.h>
-#include <OS.h>
 #include <Screen.h>
 
-#include "capture-throttle.hpp"
-
-#define S_CAPTURE_CURSOR "capture_cursor"
-#define S_FPS "fps"
-
-#define T_(text) obs_module_text(text)
+#define S_MODE "mode"
+#define S_REGION_X "region_x"
+#define S_REGION_Y "region_y"
+#define S_REGION_WIDTH "region_width"
+#define S_REGION_HEIGHT "region_height"
 
 namespace {
 
-struct ScreenCapture {
-	obs_source_t *source = nullptr;
-
-	std::mutex settings_mutex;
-	bool capture_cursor = true;
-	int capture_method = CAPTURE_TEAR_FREE;
-	int fps = 30;
-
-	std::atomic_bool active = false;
-	StopSignal stop;
-	std::thread thread;
-
-	void Start();
-	void Stop();
-	void Run();
+enum capture_mode {
+	MODE_SCREEN = 0,
+	MODE_REGION = 1,
 };
 
-void ScreenCapture::Start()
-{
-	if (active.exchange(true))
-		return;
+struct Region {
+	int mode = MODE_SCREEN;
+	int x = 0;
+	int y = 0;
+	int width = 1280;
+	int height = 720;
 
-	stop.Reset();
-	thread = std::thread(&ScreenCapture::Run, this);
-}
+	bool operator==(const Region &other) const
+	{
+		return mode == other.mode && x == other.x && y == other.y && width == other.width &&
+		       height == other.height;
+	}
+};
 
-void ScreenCapture::Stop()
-{
-	if (!active.exchange(false))
-		return;
+class ScreenCapture : public CaptureSource {
+public:
+	explicit ScreenCapture(obs_source_t *source) : CaptureSource(source, "Screen capture") {}
 
-	stop.Stop();
-	if (thread.joinable())
-		thread.join();
+	void Update(obs_data_t *settings)
+	{
+		Region wanted;
+		wanted.mode = (int)obs_data_get_int(settings, S_MODE);
+		wanted.x = (int)obs_data_get_int(settings, S_REGION_X);
+		wanted.y = (int)obs_data_get_int(settings, S_REGION_Y);
+		wanted.width = std::max(1, (int)obs_data_get_int(settings, S_REGION_WIDTH));
+		wanted.height = std::max(1, (int)obs_data_get_int(settings, S_REGION_HEIGHT));
 
-	/* Clear the last frame so a hidden source doesn't keep showing stale content */
-	obs_source_output_video(source, nullptr);
-}
-
-void ScreenCapture::Run()
-{
-	os_set_thread_name("haiku-screen-capture");
-
-	std::unique_ptr<BScreen> screen = open_main_screen(stop, "Screen capture");
-	if (!screen)
-		return;
-
-	/* below the app_server and normal applications; the copy itself is throttled by CaptureThrottle */
-	set_thread_priority(find_thread(nullptr), B_LOW_PRIORITY);
-
-	CaptureThrottle throttle("Screen capture");
-	BandedScreenReader reader;
-	CapturedFrame captured;
-
-	while (!stop.Stopped()) {
-		bool cursor, banded;
-		int rate;
 		{
 			std::lock_guard<std::mutex> lock(settings_mutex);
-			cursor = capture_cursor;
-			banded = capture_method == CAPTURE_SMOOTH_POINTER;
-			rate = fps;
+			/* A session's source is fixed when it starts */
+			if (!(wanted == region)) {
+				RequestRestart();
+			}
+			region = wanted;
 		}
-
-		const BRect frame = screen->Frame();
-		const uint64_t timestamp = os_gettime_ns();
-
-		if (!reader.Read(*screen, frame, cursor, banded, stop, captured)) {
-			if (!stop.WaitFor(100000000ULL))
-				break;
-			throttle.Wait(rate, stop);
-			continue;
-		}
-		throttle.Record(captured.took, (uint64_t)captured.width * captured.height);
-
-		/* Frame() is cached for a few ms: if the mode changed around the read, rows outside the new frame
-		 * weren't copied, so drop that frame */
-		if (screen->Frame() == frame) {
-			struct obs_source_frame out = {};
-			out.data[0] = (uint8_t *)captured.data;
-			out.linesize[0] = captured.linesize;
-			out.width = captured.width;
-			out.height = captured.height;
-			out.format = VIDEO_FORMAT_BGRX;
-			out.full_range = true;
-			out.timestamp = timestamp;
-			obs_source_output_video(source, &out);
-		}
-
-		throttle.Wait(rate, stop);
+		UpdateCommon(settings);
 	}
-}
+
+protected:
+	status_t StartSession(BScreenCapture &capture) override
+	{
+		Region current;
+		{
+			std::lock_guard<std::mutex> lock(settings_mutex);
+			current = region;
+		}
+
+		if (current.mode != MODE_REGION) {
+			return capture.StartScreen(CommonFlags(), 0);
+		}
+
+		/* The app_server clips the rectangle to the screen (ScreenCaptureManager::_SourceFrame()) and
+		 * answers B_ENTRY_NOT_FOUND if nothing is left; Frame() is the clipped rectangle. */
+		const BRect rect(current.x, current.y, current.x + current.width - 1, current.y + current.height - 1);
+		return capture.StartRegion(rect, CommonFlags(), 0);
+	}
+
+	const char *MissingText() const override { return T_("Status.RegionOffScreen"); }
+
+private:
+	std::mutex settings_mutex;
+	Region region;
+};
 
 const char *screen_capture_get_name(void *)
 {
@@ -144,54 +113,83 @@ const char *screen_capture_get_name(void *)
 
 void screen_capture_update(void *data, obs_data_t *settings)
 {
-	ScreenCapture *sc = static_cast<ScreenCapture *>(data);
-	std::lock_guard<std::mutex> lock(sc->settings_mutex);
-
-	sc->capture_cursor = obs_data_get_bool(settings, S_CAPTURE_CURSOR);
-	sc->capture_method = (int)obs_data_get_int(settings, S_CAPTURE_METHOD);
-	sc->fps = (int)obs_data_get_int(settings, S_FPS);
+	static_cast<ScreenCapture *>(data)->Update(settings);
 }
 
 void *screen_capture_create(obs_data_t *settings, obs_source_t *source)
 {
-	ScreenCapture *sc = new ScreenCapture;
-	sc->source = source;
-	screen_capture_update(sc, settings);
+	ScreenCapture *sc = new ScreenCapture(source);
+	sc->Update(settings);
 	return sc;
 }
 
 void screen_capture_destroy(void *data)
 {
 	ScreenCapture *sc = static_cast<ScreenCapture *>(data);
-	sc->Stop();
+	sc->Hide();
 	delete sc;
 }
 
 void screen_capture_show(void *data)
 {
-	static_cast<ScreenCapture *>(data)->Start();
+	static_cast<ScreenCapture *>(data)->Show();
 }
 
 void screen_capture_hide(void *data)
 {
-	static_cast<ScreenCapture *>(data)->Stop();
+	static_cast<ScreenCapture *>(data)->Hide();
 }
 
 void screen_capture_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_bool(settings, S_CAPTURE_CURSOR, true);
-	obs_data_set_default_int(settings, S_CAPTURE_METHOD, CAPTURE_TEAR_FREE);
-	obs_data_set_default_int(settings, S_FPS, 30);
+	const Region defaults;
+	obs_data_set_default_int(settings, S_MODE, defaults.mode);
+	obs_data_set_default_int(settings, S_REGION_X, defaults.x);
+	obs_data_set_default_int(settings, S_REGION_Y, defaults.y);
+	obs_data_set_default_int(settings, S_REGION_WIDTH, defaults.width);
+	obs_data_set_default_int(settings, S_REGION_HEIGHT, defaults.height);
+	CaptureSource::CommonDefaults(settings);
 }
 
-obs_properties_t *screen_capture_properties(void *)
+bool mode_changed(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	const bool region = obs_data_get_int(settings, S_MODE) == MODE_REGION;
+	for (const char *name : {S_REGION_X, S_REGION_Y, S_REGION_WIDTH, S_REGION_HEIGHT}) {
+		obs_property_set_visible(obs_properties_get(props, name), region);
+	}
+	return true;
+}
+
+obs_properties_t *screen_capture_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 
-	obs_properties_add_bool(props, S_CAPTURE_CURSOR, T_("CaptureCursor"));
-	add_capture_method_property(props);
-	obs_property_t *fps = obs_properties_add_int_slider(props, S_FPS, T_("FrameRate"), 1, 60, 1);
-	obs_property_int_set_suffix(fps, " FPS");
+	CaptureSource::AddStatusProperties(props, static_cast<ScreenCapture *>(data));
+
+	obs_property_t *mode =
+		obs_properties_add_list(props, S_MODE, T_("Capture"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode, T_("Capture.Screen"), MODE_SCREEN);
+	obs_property_list_add_int(mode, T_("Capture.Region"), MODE_REGION);
+	obs_property_set_modified_callback(mode, mode_changed);
+
+	/* Limit the rectangle to the main screen as it is now (the only screen the capture API has, until
+	 * multi-monitor support, F-38). A rectangle that reaches outside after a mode change is clipped by the
+	 * app_server. */
+	int screen_width = 16384;
+	int screen_height = 16384;
+	{
+		BScreen screen(B_MAIN_SCREEN_ID);
+		if (screen.IsValid()) {
+			screen_width = screen.Frame().IntegerWidth() + 1;
+			screen_height = screen.Frame().IntegerHeight() + 1;
+		}
+	}
+	obs_properties_add_int(props, S_REGION_X, T_("Region.X"), 0, screen_width - 1, 1);
+	obs_properties_add_int(props, S_REGION_Y, T_("Region.Y"), 0, screen_height - 1, 1);
+	obs_properties_add_int(props, S_REGION_WIDTH, T_("Region.Width"), 1, screen_width, 1);
+	obs_properties_add_int(props, S_REGION_HEIGHT, T_("Region.Height"), 1, screen_height, 1);
+
+	CaptureSource::AddCommonProperties(props);
 
 	return props;
 }
