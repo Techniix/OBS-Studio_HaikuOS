@@ -25,6 +25,7 @@ whole port and rebasing onto a new upstream release stays manageable.
 12. [Other plugins](#12-other-plugins)
 13. [Known limitations and ideas](#13-known-limitations-and-ideas)
 14. [Design decisions](#14-design-decisions)
+15. [haiku-video-accel: hardware encoding](#15-haiku-video-accel-hardware-encoding)
 
 ## 1. Build system
 
@@ -575,3 +576,59 @@ Decisions taken during the port, with the reasons, so they can be revisited:
 | Haiku modifier convention (Ctrl = Command) | Matches Haiku's Qt plugin, so hotkeys captured in the UI are the ones polled. |
 | EGL first, OSMesa fallback, OSMesa loaded at runtime | The Mesa HaikuPorts ships today (22.0.5) has EGL disabled; Mesa 25 has working EGL but no OSMesa. Supporting both means OBS works now and keeps working after the Mesa update. |
 | Warnings not treated as errors | Haiku headers and GCC produce warnings upstream CI never sees. |
+
+## 15. haiku-video-accel: hardware encoding
+
+`plugins/haiku-video-accel` adds OBS video encoders on Renga's Media Kit video acceleration interface (roadmap
+F-31 phase 5, `headers/private/media/VideoAcceleration.h`; request O-11). The interface is vendor neutral and
+shaped like VA-API: back ends are add-ons in `add-ons/media/video_accelerators`, loaded by
+`BPrivate::VideoAcceleratorRoster` (libmedia), and each one lists profiles with decode/encode entry points, the
+largest picture and the surface formats (NV12, P010). The plug-in never talks to a driver, so it works with any
+back end that appears (Quasar's NVIDIA back end, Q-3, or Mesa's video through LinuxKPI DRM later).
+
+**Encoders.** `haiku_va_h264` (codec `h264`), `haiku_va_hevc` (`hevc`), `haiku_va_av1` (`av1`) and
+`haiku_va_vp9` (`vp9`). VP9 is there because VA-API-class hardware encodes it, OBS records it into Matroska, and
+it is the one codec of the four that Renga's software reference back end encodes; that makes it the only way to
+exercise the plug-in without a GPU back end. Names show the back end: "Hardware H.264 (<back end name>)".
+
+**Runtime check.** At module load (`haiku-video-accel.cpp`) the roster is asked, for each profile of each
+codec, which back end encodes it (`VideoAcceleratorRoster::Find(profile, B_VIDEO_ACCEL_ENCODE)`). `Find()`
+applies the user's choice: `~/config/settings/system/video_acceleration` (`backend <name>` or `backend off`),
+overridden by `RENGA_VIDEO_ACCELERATION`; with neither, only back ends with `IsHardware()` are used. An encoder
+type is registered only if that back end is hardware and offers the needed surface format (P010 for the 10-bit
+profiles). The software back end is chosen only by name and is offered only if `OBS_HAIKU_VA_ALLOW_SOFTWARE=1`
+is also set; such encoders are named "... (software test back end)" and their properties show a warning. The
+log lists the back ends, the choice in effect and what was offered. A changed choice needs an OBS restart.
+`CountAccelerators()` is called once at load because the roster's lazy loading takes no lock.
+
+**Frame path.** `get_video_info()` makes libobs deliver NV12 (P010 for 10-bit profiles). Per frame:
+`AcquireSurface()` (if every surface is in flight, packets are taken out and it is retried for up to about
+200 ms), the two planes are copied row by row with the surface's own `bytesPerRow`, and `SendSurface()` hands the
+surface back, forcing a key frame on the first frame and at every keyframe interval. `ReceivePacket()` is then
+called until `B_WOULD_BLOCK`. A buffer that is too small (`B_NO_MEMORY`) is grown to the size the back end
+reports. Packets are queued and returned one per `encode()` call. OBS pts (units of 1/fps_num s) are converted
+to the interface's microsecond timestamps and mapped back through a table of recent frames. This is one CPU copy
+per frame; GPU-texture input waits on surfaces importable from GPU buffers (O-10, O-11).
+
+**Bitstream format.** OBS wants Annex B packets and an Annex B SPS/PPS(/VPS) header from `get_extra_data()`
+(its flv/mp4 outputs convert it themselves); for AV1 the header is the sequence header OBU. The interface does not
+define the format (`GetExtradata()` says "avcC, ...", and nothing about packets), so `va-bitstream.cpp`
+accepts both: Annex B extradata is used as it is, an avcC/hvcC record is unpacked and its NAL length size is used
+to turn length-prefixed packets into Annex B, and an av1C record yields its configOBUs. With no extradata, the
+headers (and SEI) are taken out of the first packet with `obs_extract_avc_headers()` / `_hevc_` / `_av1_`, as
+`obs-ffmpeg-vaapi.c` does. Key frames come from the bitstream for H.264/HEVC/AV1 (`obs_*_keyframe()`) and from
+the back end's flag for VP9.
+
+**Settings.** Rate control "Target bitrate" (kbps; `VideoAccelEncoderSetup::bitRate`) or "Constant quality"
+(1-100, mapped to `quality` 0..1 with `bitRate` 0), keyframe interval in seconds (0 lets the back end choose)
+and the profiles the back end encodes. The interface has no CBR/VBR choice, maximum bitrate, buffer size,
+preset, B-frame count, colour signalling or reconfiguration, so none is offered; changes take effect at the next
+start (`update()` only logs). There are no B-frames: the interface returns one timestamp per packet and no decode
+timestamp, so `dts = pts`, and a back end that returns packets out of order is reported in the log.
+
+**Failure and teardown.** `create()` returns NULL, with a log line, when the size is above the back end's
+maximum or `CreateEncoder()` fails (busy device, unsupported setup). OBS then reports that the encoder could not
+start, as it does for other encoders. `destroy()` flushes with `SendSurface(NULL)`, takes out the remaining packets
+(bounded), and deletes the `VideoAccelEncoder`, which owns its surfaces. The accelerators belong to the roster
+and are never freed by OBS. Each OBS encoder is used by one thread at a time (libobs), and nothing is shared
+between encoders except the read-only type data.

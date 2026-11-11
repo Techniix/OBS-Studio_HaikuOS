@@ -32,6 +32,8 @@ that file are kept consistent.
 | O-11 | Hardware video encode behind the Media Kit (`VideoAcceleration.h`) | Encoding | 2 | Interface landed (`446221a6`); GPU back end waits on Q-3 | F-31 phase 5 |
 | O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Accepted (F-58) | F-31 |
 | O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Accepted (F-58) | F-15 |
+| O-14 | `VideoAccelEncoder` details: bitstream formats, dts/B-frames, rate control, colour, surface release, roster locking | Encoding | 2 | Proposed | F-31 phase 5 |
+| O-15 | H.264 (and HEVC/AV1) in the software reference back end | Encoding | 3 | Proposed | F-31 phase 5 |
 
 **Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
 Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
@@ -141,6 +143,8 @@ largest visible gains). Q-1 is independent of these and blocks hardware renderin
   supports them), offered only when the roster finds a hardware back end with an encode entry point for that
   codec. This fits OBS better than `BMediaEncoder`/`BMediaFile` (OBS needs raw packets, key frames and
   extradata for its own muxers and RTMP/SRT outputs), so **no libva request**.
+- **Done in OBS:** `plugins/haiku-video-accel` (H.264, HEVC, AV1, and VP9 for testing with the software back
+  end). Refinements requested in O-14 and O-15.
 - **Remaining need.** GPU-texture input without a CPU copy (surfaces importable from a GPU buffer), with O-10.
 
 ### O-12 Virtual camera
@@ -149,6 +153,30 @@ largest visible gains). Q-1 is independent of these and blocks hardware renderin
 - **Proposed interface.** A Media Kit producer add-on (global flavor, listed among cameras by
   `GetDormantNodes()`) fed by one client process through shared memory (memfd) with timestamps, so CodyCam,
   Chromium and others see it as an ordinary camera.
+
+### O-14 `VideoAccelEncoder` details
+
+OBS's encoder plug-in (`plugins/haiku-video-accel`) is written against `VideoAcceleration.h` as it is. These
+gaps make it guess or limit features:
+
+1. **Bitstream format.** Specify that packets are Annex B (H.264/HEVC) or low-overhead OBUs (AV1), and the
+   extradata format (avcC/hvcC/av1C or Annex B). OBS converts both ways today.
+2. **Decode timestamps and B-frames.** A `bFrames` field in the encoder setup and a decode timestamp from
+   `ReceivePacket()` (for example a `VideoAccelPacket` struct). Without dts, OBS cannot use B-frames.
+3. **Rate control.** Mode (CBR/VBR/CQP), maximum bit rate, buffer size, a latency/preset hint, and
+   `SetBitRate()` for OBS's dynamic bitrate while streaming.
+4. **Surfaces.** `ReleaseSurface()` to return an acquired but unsent surface; document who owns a surface when
+   `SendSurface()` returns `B_WOULD_BLOCK`.
+5. **Colour.** Primaries, matrix, transfer and range in the setup, so the stream's VUI is right for BT.709,
+   full range and HDR.
+6. **Threading.** `VideoAcceleratorRoster::_Load()` has no lock; document the threading rules (OBS loads the
+   roster once at module load to avoid it).
+
+### O-15 Software H.264 encoder for testing
+
+The software reference back end encodes VP8/VP9 only, so the H.264/HEVC/AV1 paths of hardware encoder
+clients cannot be tested without a GPU back end. An H.264 encoder in it (for example openh264), and HEVC/AV1
+if practical, would let OBS's main codecs be tested end to end. OBS tests with VP9 meanwhile.
 
 ### Planned Renga work OBS will use as it lands
 

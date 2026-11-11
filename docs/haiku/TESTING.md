@@ -354,6 +354,40 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
       Note the CPU usage and render time if frames are dropped.
 - [ ] Try "Advanced" output mode with "Hybrid MP4" as well.
 
+### Hardware encoders (haiku-video-accel)
+
+No hardware back end exists yet, so these steps test the plumbing with Renga's software reference back end. That
+back end encodes VP9 only (its FFmpeg has no H.264/HEVC/AV1 encoder), so the encoder to use is VP9.
+
+- [ ] Plain `./obs`: the log has `[haiku-video-accel] N video acceleration back end(s); choice "auto"`, lists
+      the `software` back end as "software", and says "no usable back end encodes ..." for h264, hevc, av1 and
+      vp9. *Settings → Output* (Advanced) lists no "Hardware ..." encoder.
+- [ ] `RENGA_VIDEO_ACCELERATION=software ./obs` (without the second variable): still nothing offered; the log
+      says to set `OBS_HAIKU_VA_ALLOW_SOFTWARE=1`.
+- [ ] `RENGA_VIDEO_ACCELERATION=software OBS_HAIKU_VA_ALLOW_SOFTWARE=1 ./obs`: the log has
+      `offering "VP9 via software (software test back end)" (haiku_va_vp9) ... SOFTWARE TEST BACK END` and the
+      profile `profile0`.
+- [ ] *Settings → Output*, Output Mode "Advanced", tab *Recording*: Type "Standard", Recording Format
+      "Matroska Video (.mkv)", Video Encoder "VP9 via software (software test back end)". The encoder's
+      properties show the back end line, the yellow software warning, Rate Control (switching it swaps Bitrate
+      and Quality), Keyframe Interval and Profile ("Profile 0 (8-bit)" only).
+- [ ] Record 10 seconds of a screen capture with Target bitrate 6000 Kbps and Keyframe Interval 2 s. The log has
+      `vp9 profile0 on software (...): WxH at F fps, bitrate 6000 kbps, keyframe every N frames, NV12 surfaces`
+      and no `[haiku-video-accel]` errors or warnings.
+- [ ] `ffprobe -v error -show_entries stream=codec_name,width,height,avg_frame_rate:format=duration file.mkv`
+      says `vp9`, the canvas output size, OBS's frame rate and a duration of about 10 s.
+- [ ] `ffprobe -v error -select_streams v -skip_frame nokey -show_entries frame=pts_time -of csv file.mkv` lists
+      a key frame at 0 and then about every 2 s. The file plays in MediaPlayer.
+- [ ] Same with Rate Control "Constant quality" (quality 70) and Keyframe Interval 0: the recording works.
+- [ ] Rescale the recording output to more than 4096x2304 (e.g. 5120x2880) and start recording: OBS shows its
+      normal "failed to start" error, the log has `... is larger than the software back end encodes ...`, and OBS
+      keeps running. Set the size back.
+- [ ] Start and stop a recording five times in a row: every file is valid and OBS does not crash on stop or quit.
+- [ ] Once a hardware back end is installed (Quasar Q-3), with plain `./obs`: "Hardware H.264 (<back end>)" etc.
+      are offered without either variable. Record to MP4 and stream with "Hardware H.264", and check with `ffprobe`
+      that the stream is `h264` with SPS/PPS (the file plays in another player). Note any log warning about
+      packets out of presentation order or unknown codec configuration formats.
+
 ## 9. Streaming (optional)
 
 - [ ] *Settings → Stream*: a service with a stream key (e.g. YouTube or Twitch, preferably an unlisted/test
