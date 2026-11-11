@@ -8,26 +8,34 @@ accepts it.
 
 States: **Proposed**, **Accepted**, **Landed** (with the commit), **Withdrawn**.
 
+Priority is OBS's view of the order to take them in: **1** fixes a limitation users meet in everyday use or
+removes a fragile workaround; **2** enables a visible new feature; **3** is an improvement or test coverage;
+**Roadmap** comes with work already planned in Renga or Quasar and needs nothing extra.
+
 Quasar records its side in `docs/APP-INTEGRATION.md` on its `renga` branch; the Quasar section below and
 that file are kept consistent.
 
 ## Renga
 
-| ID | Request | Area | State | Roadmap |
-| --- | --- | --- | --- | --- |
-| O-1 | Exclude applications from a loopback | Audio | Proposed | F-31 |
-| O-2 | "Loopback only" stream route | Audio, browser source | Proposed | F-31 |
-| O-3 | Loopback selection by team | Browser source | Proposed | F-31 |
-| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | Proposed | F-31, F-32 |
-| O-5 | Camera mode lists and frame rates | Webcam | Proposed | F-31 phase 2 |
-| O-6 | Screen capture permission without blocking the app_server link | Capture | Proposed | F-31 phase 3 |
-| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | Proposed | F-31 phase 3 |
-| O-8 | Frame notification instead of polling | Capture | Proposed | F-31 phase 3 |
-| O-9 | Window visibility in capture frames | Capture | Proposed | F-31 phase 3, F-33 |
-| O-10 | GPU buffers from capture (scanout, windows) | Capture | Proposed | F-47 (with Quasar R-2) |
-| O-11 | Hardware video encode behind the Media Kit | Encoding | Proposed | F-31 phase 5 |
-| O-12 | A virtual camera producer that applications can feed | Virtual camera | Proposed | F-31 |
-| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | Proposed | F-15 |
+| ID | Request | Area | Priority | State | Roadmap |
+| --- | --- | --- | --- | --- | --- |
+| O-1 | Exclude applications from a loopback | Audio | 1 | Proposed | F-31 |
+| O-2 | "Loopback only" stream route | Audio, browser source | 2 | Proposed | F-31 |
+| O-3 | Loopback selection by team | Browser source | 2 | Proposed | F-31 |
+| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | 1 | Proposed | F-31, F-32 |
+| O-5 | Camera mode lists and frame rates | Webcam | 2 | Proposed | F-31 phase 2 |
+| O-6 | Screen capture permission without blocking the app_server link | Capture | 1 | Proposed | F-31 phase 3 |
+| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | 1 | Proposed | F-31 phase 3 |
+| O-8 | Frame notification instead of polling | Capture | 3 | Proposed | F-31 phase 3 |
+| O-9 | Window visibility in capture frames | Capture | 3 | Proposed | F-31 phase 3, F-33 |
+| O-10 | GPU buffers from capture (scanout, windows) | Capture | Roadmap | Proposed | F-47 (with Quasar R-2) |
+| O-11 | Hardware video encode behind the Media Kit | Encoding | 2 | Proposed | F-31 phase 5 |
+| O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Proposed | F-31 |
+| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Proposed | F-15 |
+
+Suggested order: O-1 (the most noticeable everyday problem, a small change in the mixer's loopback), then
+O-7 with O-6 (removes a fragile workaround in OBS and a UI freeze), then O-4, then O-5 and O-12 (the
+largest visible gains). Q-1 is independent of these and blocks hardware rendering in OBS on NVIDIA cards.
 
 ### O-1 Exclude applications from a loopback
 
@@ -78,7 +86,9 @@ that file are kept consistent.
 
 - **Need.** `BScreenCapture::_Start()` waits for the user's answer (up to 2 minutes) while holding the
   process-wide `AppServerLink` lock between its 100 ms polls (`ScreenCapture.cpp`). Every other app_server
-  call in OBS waits meanwhile, including the UI's.
+  call in OBS waits meanwhile, including the UI's, so OBS's interface can stall for up to the full prompt
+  timeout (2 minutes by default) while the prompt is open. OBS asks in 1-second slices from a background
+  thread to bound this, which is part of the workaround O-7 would remove.
 - **Proposed interface.** Take the link per poll attempt, or (better, O-7) an asynchronous request.
 
 ### O-7 Permission timeout vs. denial; asynchronous request
@@ -128,6 +138,22 @@ that file are kept consistent.
   `GetDormantNodes()`) fed by one client process through shared memory (memfd) with timestamps, so CodyCam,
   Chromium and others see it as an ordinary camera.
 
+### Planned Renga work OBS will use as it lands
+
+No request needed; OBS adapts when these arrive:
+
+- **Multi-monitor (F-38).** Screen capture is main-screen only today. Once `BScreenCapture` can name a screen,
+  OBS adds a screen choice to Screen Capture; nothing extra is needed beyond F-38 itself.
+- **Compositor (F-33).** Window capture of covered windows; O-9 becomes unnecessary.
+- **Zero-copy presentation (F-47).** OBS's preview, projectors and multiview presented from the GPU instead
+  of a `glReadPixels` copy painted by Qt.
+- **futex (F-49).** No OBS change; Mesa and libstdc++ waits benefit once rebuilt.
+- **Crash logs (F-51).** Already used: the browser helper's crash report path is logged. OBS's own crashes
+  are covered by the system without changes.
+- **Hardware video (F-31 phase 5).** See O-11.
+- **Chromium port.** A Chromium-based browser source to replace the HaikuWebKit helper (WebGL, modern sites),
+  with shared GPU textures once Q-2 exists.
+
 ### O-13 SOCK_SEQPACKET tests
 
 - **Need.** The browser helper IPC would use `SOCK_SEQPACKET` (message boundaries for free) but the socket
@@ -136,12 +162,12 @@ that file are kept consistent.
 
 ## Quasar
 
-| ID | Request | State | Quasar reference |
-| --- | --- | --- | --- |
-| Q-1 | Fix the timeline-fence hang with OBS's Screen Capture load | Proposed | `docs/event-sync.md`, Open issues |
-| Q-2 | Shared GPU textures between processes | Proposed | external memory (`RENGA-STATUS.md`) |
-| Q-3 | Hardware video encode back end | Proposed | Video, Media Kit back end |
-| Q-4 | Quiet driver logging by default | Proposed | Power and system |
+| ID | Request | Priority | State | Quasar reference |
+| --- | --- | --- | --- | --- |
+| Q-1 | Fix the timeline-fence hang with OBS's Screen Capture load | 1 | Proposed | `docs/event-sync.md`, Open issues |
+| Q-2 | Shared GPU textures between processes | Roadmap | Proposed | external memory (`RENGA-STATUS.md`) |
+| Q-3 | Hardware video encode back end | 2 | Proposed | Video, Media Kit back end |
+| Q-4 | Quiet driver logging by default | 3 | Proposed | Power and system |
 
 ### Q-1 Screen Capture hang
 
