@@ -35,6 +35,20 @@ if(CMAKE_C_COMPILER_ID STREQUAL GNU)
   endif()
 endif()
 
+# Audio monitoring uses Renga's private, header-only AudioStreamControl.h (haiku_devel) to route OBS's streams in
+# the system mixer (3rdparty/ce/PORTING.md, "Per-application audio, routing and loopback").
+find_path(
+  RengaMediaPrivate_INCLUDE_DIR
+  NAMES AudioStreamControl.h
+  PATHS /boot/system/develop/headers/private/media
+  NO_DEFAULT_PATH
+  REQUIRED
+)
+set_source_files_properties(
+  audio-monitoring/haiku/haiku-sound-player.cpp
+  PROPERTIES INCLUDE_DIRECTORIES "${RengaMediaPrivate_INCLUDE_DIR}"
+)
+
 # libroot provides libc, libm, libdl and pthreads; libbe provides the Interface Kit (keyboard/mouse state);
 # libmedia provides BSoundPlayer for audio monitoring; libgame provides set_mouse_position(), used to keep the
 # screen saver from starting while recording/streaming (os_inhibit_sleep).

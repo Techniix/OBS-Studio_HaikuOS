@@ -23,12 +23,11 @@
  * realtime thread pulls frames out of it. The FIFO is kept short so monitoring latency stays bounded; on
  * underrun the player outputs silence and re-buffers a little before resuming.
  *
- * Devices: "default" (added by the frontend) is the system mixer, which mixes, resamples and follows the
- * output chosen in Media preferences. The other entries are physical outputs (e.g. a USB headset) played to
- * directly, bypassing the mixer: those dictate rate and channel count (resampled here) and sample format
- * (converted by the shared device player, which also mixes the monitored sources). A saved device that is
- * missing or busy falls back to the mixer (see haiku-sound-player.cpp). A device's clock isn't synchronised
- * to OBS's: drift is absorbed by the FIFO (dropping on overflow, re-buffering on underrun).
+ * Every player is a stream of Renga's system mixer, in OBS's own rate and channel layout (the mixer
+ * converts). Devices: "default" (added by the frontend) is the default output; the other entries are the
+ * mixer's output devices by name, and OBS's streams are routed to the chosen one with the mixer's per-stream
+ * routing (haiku-sound-player.cpp). The mixer's clock is the default output's; a stream routed to another
+ * device goes through the mixer's sink for it, which absorbs the drift between the two cards.
  */
 
 #include "../../media-io/audio-resampler.h"
@@ -73,7 +72,7 @@ bool obs_audio_monitoring_available(void)
 
 void obs_enum_audio_monitoring_devices(obs_enum_audio_device_cb cb, void *data)
 {
-	/* The system mixer ("default") is added by the caller; list the physical outputs. */
+	/* "Default" (the default output) is added by the caller; list the devices streams can be routed to. */
 	obs_haiku_enum_output_devices(cb, data);
 }
 
@@ -182,40 +181,35 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 	if (!id || !*id)
 		return false;
 
+	/* Sources that capture what plays are not monitored (Desktop Audio, plugins/haiku-media). Other
+	 * platforms skip them only when monitoring plays on the device they capture; on Renga the system
+	 * mixer's loopback records every stream whatever device it is routed to (MixerCore::_FeedTaps()), so
+	 * monitoring such a source anywhere would feed it back into itself. */
 	if (source->info.output_flags & OBS_SOURCE_DO_NOT_SELF_MONITOR) {
-		obs_data_t *s = obs_source_get_settings(source);
-		const char *s_dev_id = obs_data_get_string(s, "device_id");
-		bool match = devices_match(s_dev_id, id);
-		obs_data_release(s);
-
-		if (match) {
-			monitor->ignore = true;
-			return true;
-		}
+		monitor->ignore = true;
+		return true;
 	}
 
 	char name[128];
 	snprintf(name, sizeof(name), "OBS Monitor: %s", obs_source_get_name(source));
 
 	/* Not started yet, so fill_buffer can't run before the fields below are set. */
-	struct obs_haiku_output_format out;
-	monitor->player = obs_haiku_sound_player_create(id, name, rate, channels, (size_t)rate * BUFFER_MS / 1000,
-							fill_buffer, monitor, &out);
+	monitor->player = obs_haiku_sound_player_create(name, rate, channels, (size_t)rate * BUFFER_MS / 1000,
+							fill_buffer, monitor);
 	if (!monitor->player) {
 		blog(LOG_WARNING, "%s: Failed to create BSoundPlayer (is the media server running?)", __FUNCTION__);
 		return false;
 	}
 
-	monitor->channels = out.channels;
-	monitor->bytes_per_frame = sizeof(float) * out.channels;
-	monitor->prebuffer_bytes = monitor->bytes_per_frame * out.sample_rate * PREBUFFER_MS / 1000;
-	monitor->max_bytes = monitor->bytes_per_frame * out.sample_rate * MAX_LATENCY_MS / 1000;
+	monitor->channels = channels;
+	monitor->bytes_per_frame = sizeof(float) * channels;
+	monitor->prebuffer_bytes = monitor->bytes_per_frame * rate * PREBUFFER_MS / 1000;
+	monitor->max_bytes = monitor->bytes_per_frame * rate * MAX_LATENCY_MS / 1000;
 
-	/* 1-6 and 8 channels map directly onto speaker_layout values (checked by the player) */
+	/* only interleaving: the mixer takes OBS's rate and channel layout as they are (the player tells it
+	 * the layout with a channel mask, haiku-sound-player.cpp) */
 	struct resample_info from = {.samples_per_sec = rate, .speakers = info->speakers, .format = AUDIO_FORMAT_FLOAT_PLANAR};
-	struct resample_info to = {.samples_per_sec = out.sample_rate,
-				   .speakers = (enum speaker_layout)out.channels,
-				   .format = AUDIO_FORMAT_FLOAT};
+	struct resample_info to = {.samples_per_sec = rate, .speakers = info->speakers, .format = AUDIO_FORMAT_FLOAT};
 
 	monitor->resampler = audio_resampler_create(&to, &from);
 	if (!monitor->resampler) {
@@ -227,6 +221,12 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 		blog(LOG_WARNING, "%s: Failed to start BSoundPlayer", __FUNCTION__);
 		return false;
 	}
+
+	/* The stream exists now (BSoundPlayer connects when it is created). It inherits the route the mixer
+	 * saved for OBS's signature; set it anyway, on all of OBS's streams, so that a device change (which
+	 * resets every monitor, obs_set_audio_monitoring_device()) and a route changed in Media preferences
+	 * both end up on the device OBS is set to. Not fatal: the stream plays on the default output. */
+	obs_haiku_route_streams(id);
 
 	return true;
 }

@@ -16,24 +16,33 @@
 ******************************************************************************/
 
 /*
- * Two kinds of player:
+ * Audio monitoring through Renga's system mixer.
  *
- * - System mixer ("default"): one BSoundPlayer per monitored source, connected to the mixer, which mixes,
- *   resamples and plays to the output chosen in Media preferences.
+ * Every monitored source plays as a plain BSoundPlayer stream into the system mixer, which mixes, resamples
+ * and follows the default output. The monitoring device is chosen with the mixer's per-stream routing: each
+ * stream has a B_OUTPUT_MUX parameter "Output" (0 the default output, n the n-th output device), and the
+ * mixer plays a routed stream through a sink of its own on that device (AudioMixer::_RouteOnce()). Nothing
+ * here opens a sound card, so there is no direct-to-card player any more, no format conversion, and a device
+ * that is unplugged or busy just means the stream plays on the default output until it is back (the mixer
+ * handles that; PORTING.md "Sound cards and cameras that come and go").
  *
- * - Hardware output: the player connects straight to a physical output node, bypassing the mixer.
- *   multi_audio offers one input per bus (one for a stereo card) and accepts only its hardware format,
- *   so all monitored sources on a device share one BSoundPlayer (struct device_output); its buffer hook
- *   mixes the sources' float audio and converts to the device's sample format.
+ * How the mixer keys a route, read in the mixer add-on: the route is a property of each mixer input
+ * (MixerInput::SetRoute()), set through that input's "Output" parameter (AudioMixer::SetParameterValue()),
+ * and saved in the mixer's settings entry for the input's application signature
+ * (MixerSettings::SaveConnectionSettings() and _FindInputSetting()). A new input of the same application gets
+ * the saved route when it connects (AudioMixer::Connected() -> LoadConnectionSettings()). So:
+ *  - all of OBS's monitor streams share one route (they have one signature), which is what OBS wants;
+ *  - setting it on one stream does not move OBS's other streams that are already connected, so
+ *    obs_haiku_route_streams() sets it on every stream of OBS;
+ *  - a stream that appears later inherits the route the mixer last saved for OBS; it is set again anyway
+ *    after each player starts (haiku-output.c), so that a route changed elsewhere (Media preferences) is
+ *    brought back to OBS's setting.
  */
 
 #include "haiku-sound-player.h"
 
 #include "../../util/base.h"
 
-#include <algorithm>
-#include <condition_variable>
-#include <map>
 #include <mutex>
 #include <new>
 #include <string>
@@ -44,143 +53,53 @@
 #include <MediaAddOn.h>
 #include <MediaDefs.h>
 #include <MediaRoster.h>
+#include <OS.h>
+#include <Roster.h>
 #include <SoundPlayer.h>
 
-/* Ids of hardware outputs carry a prefix so a device can never collide with "default". */
-#define DEVICE_ID_PREFIX "node:"
-#define MAX_DEVICES 64
-/* Frames mixed per pass in a device's buffer hook */
-#define MIX_CHUNK_FRAMES 512
+/* Renga private header (headers/private/media; header-only on public Media Kit API): the system mixer's
+ * per-application streams */
+#include <AudioStreamControl.h>
 
-struct device_output;
+#define MAX_DEVICES 32
 
 struct obs_haiku_sound_player {
 	obs_haiku_fill_cb cb;
 	void *param;
-
-	/* exactly one of these */
-	BSoundPlayer *player;  /* system mixer */
-	device_output *device; /* shared hardware output */
-
-	uint32 channels; /* system mixer: the channel count cb produces */
+	BSoundPlayer *player;
+	uint32 channels; /* the channel count cb produces */
+	media_node mixer; /* our reference to the system mixer, for the player's lifetime */
+	bool have_mixer;
 };
-
-struct device_output {
-	std::string id;
-	BSoundPlayer *player = NULL;
-	media_node node;
-	bool release_node = false;
-	int refs = 0; /* players created on it (guarded by registry_mutex) */
-
-	/* negotiated connection format */
-	uint32 sample_format = 0;
-	uint32 channels = 0;
-	size_t sample_size = 0;
-
-	/* players currently started on it; the buffer hook holds clients_mutex while calling them */
-	std::mutex clients_mutex;
-	std::vector<obs_haiku_sound_player *> clients;
-	std::vector<float> mix, scratch; /* buffer hook only */
-};
-
-/* open_devices holds the usable entries by id. An entry found dead is removed from it but lives on until
- * its last player releases it (release_device() then closes it), so players never see it freed. */
-static std::mutex registry_mutex;
-static std::condition_variable registry_cv; /* signalled when an id leaves opening_ids */
-static std::vector<device_output *> open_devices;
-static std::vector<std::string> opening_ids; /* being opened by some thread, registry_mutex not held */
-
-static bool is_opening(const std::string &id)
-{
-	return std::find(opening_ids.begin(), opening_ids.end(), id) != opening_ids.end();
-}
 
 /* ------------------------------------------------------------------------- */
-/* Device list                                                               */
+/* Devices and routing                                                       */
 
-struct output_device {
-	dormant_node_info info;
-	std::string id;
-	std::string name;
-};
-
-/* The physical audio outputs, as listed by Haiku's Media preferences (dormant B_PHYSICAL_OUTPUT nodes that
- * consume raw audio), each with a stable id. */
-static std::vector<output_device> list_output_devices(BMediaRoster *roster)
+/* The devices exactly as the mixer lists them for routing: AudioMixer::_ScanOutputDevices() takes the
+ * dormant nodes that are B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT with a raw audio input, in the order
+ * GetDormantNodes() returns them, each name once. Renga numbers identical cards (" 2", " 3"), so names are
+ * unique and stable across plug-ins and boots, and they are what the mixer saves a route as. Reading them
+ * here rather than from the mixer's parameter web means the list is there even before any stream exists
+ * (only stream groups carry the "Output" parameter). */
+static std::vector<std::string> output_devices(BMediaRoster *roster)
 {
-	std::vector<output_device> devices;
-
+	std::vector<std::string> names;
+	dormant_node_info infos[MAX_DEVICES];
+	int32 count = MAX_DEVICES;
 	media_format format;
 	format.type = B_MEDIA_RAW_AUDIO;
 	format.u.raw_audio = media_raw_audio_format::wildcard;
-
-	std::vector<dormant_node_info> nodes(MAX_DEVICES);
-	int32 count = MAX_DEVICES;
-	if (roster->GetDormantNodes(nodes.data(), &count, &format, NULL, NULL, B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT) !=
-		    B_OK ||
-	    count < 0)
-		return devices;
-	count = std::min<int32>(count, MAX_DEVICES);
-
-	/* Node ids change on every boot; names don't. Number repeated names (two identical USB headsets) in
-	 * the order the add-ons report them. */
-	std::map<std::string, int> seen;
-	for (int32 i = 0; i < count; i++) {
-		output_device dev;
-		dev.info = nodes[i];
-		dev.name = nodes[i].name;
-		dev.id = DEVICE_ID_PREFIX + dev.name;
-
-		int n = ++seen[dev.name];
-		if (n > 1) {
-			dev.id += "#" + std::to_string(n);
-			dev.name += " (" + std::to_string(n) + ")";
-		}
-
-		devices.push_back(dev);
+	if (roster->GetDormantNodes(infos, &count, &format, NULL, NULL, B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT, 0) !=
+	    B_OK)
+		return names;
+	for (int32 i = 0; i < count && i < MAX_DEVICES; i++) {
+		bool seen = false;
+		for (const std::string &name : names)
+			seen = seen || name == infos[i].name;
+		if (!seen)
+			names.push_back(infos[i].name);
 	}
-
-	return devices;
-}
-
-/* Gets the running instance of a device node, if any. The caller must ReleaseNode() it. */
-static bool get_running_instance(BMediaRoster *roster, const dormant_node_info &info, media_node *node)
-{
-	media_node_id id;
-	int32 count = 1;
-	return roster->GetInstancesFor(info.addon, info.flavor_id, &id, &count) == B_OK && count > 0 &&
-	       roster->GetNodeFor(id, node) == B_OK;
-}
-
-/* The node the system mixer plays to (Media preferences' "Audio output"). */
-static bool is_system_output(BMediaRoster *roster, const media_node &node)
-{
-	media_node output;
-	if (roster->GetAudioOutput(&output) != B_OK)
-		return false;
-
-	bool same = output.node == node.node;
-	roster->ReleaseNode(output);
-	return same;
-}
-
-static bool has_free_input(BMediaRoster *roster, const media_node &node)
-{
-	media_input input;
-	int32 count = 0;
-	return roster->GetFreeInputsFor(node, &input, 1, &count, B_MEDIA_RAW_AUDIO) == B_OK && count > 0;
-}
-
-static bool device_is_open(const std::string &id)
-{
-	std::lock_guard<std::mutex> lock(registry_mutex);
-	if (is_opening(id))
-		return true;
-	for (device_output *d : open_devices) {
-		if (d->id == id)
-			return true;
-	}
-	return false;
+	return names;
 }
 
 extern "C" void obs_haiku_enum_output_devices(obs_haiku_device_cb cb, void *param)
@@ -188,315 +107,117 @@ extern "C" void obs_haiku_enum_output_devices(obs_haiku_device_cb cb, void *para
 	/* Without the media server every roster call would wait for its timeout; this check is local. */
 	if (!BMediaRoster::IsRunning())
 		return;
-
 	BMediaRoster *roster = BMediaRoster::Roster();
 	if (!roster)
 		return;
 
-	for (const output_device &dev : list_output_devices(roster)) {
-		/* A device nobody has opened is free, and one OBS already plays to stays listed. Another running
-		 * one is skipped when the mixer owns it (playing to one of its other inputs would hit a different
-		 * bus, e.g. the rear speakers) or when all of its inputs are taken (the connection would fail).
-		 * Dormant devices are not instantiated here, so listing never opens hardware. */
-		media_node node;
-		if (!device_is_open(dev.id) && get_running_instance(roster, dev.info, &node)) {
-			bool usable = (node.kind & B_BUFFER_CONSUMER) != 0 && !is_system_output(roster, node) &&
-				      has_free_input(roster, node);
-			roster->ReleaseNode(node);
-			if (!usable)
-				continue;
-		}
-
-		if (!cb(param, dev.name.c_str(), dev.id.c_str()))
+	for (const std::string &name : output_devices(roster))
+		if (!cb(param, name.c_str(), name.c_str()))
 			break;
-	}
 }
 
-/* ------------------------------------------------------------------------- */
-/* Fallback logging                                                          */
+/* The signature the mixer knows OBS's streams by: AudioMixer::_IdentifyApplication() asks the registrar for
+ * the application of the team that owns the stream's port. */
+static bool own_signature(std::string &signature)
+{
+	thread_info thread;
+	app_info app;
+	if (!be_roster || get_thread_info(find_thread(NULL), &thread) != B_OK ||
+	    be_roster->GetRunningAppInfo(thread.team, &app) != B_OK || !app.signature[0])
+		return false;
+	signature = app.signature;
+	return true;
+}
 
 static std::mutex warn_mutex;
 static std::string warned_id;
 
-/* Logs a fallback to the mixer once per device (until that device works again): every monitored source
- * and every monitoring reset would otherwise repeat it. */
-static void warn_fallback(const char *id, const char *reason)
+/* Logs a routing failure once per device until routing to it works again: every monitored source and
+ * every monitoring reset would otherwise repeat it. */
+static void warn_route(const char *id, const char *reason)
 {
 	std::lock_guard<std::mutex> lock(warn_mutex);
 	if (warned_id == id)
 		return;
-
 	warned_id = id;
-	blog(LOG_WARNING, "[audio monitoring] Device '%s' %s; monitoring through the system mixer instead", id,
+	blog(LOG_WARNING, "[audio monitoring] Cannot route monitoring to '%s': %s; it plays on the default output", id,
 	     reason);
 }
 
-static void device_ok(const char *id)
+static void route_ok()
 {
 	std::lock_guard<std::mutex> lock(warn_mutex);
-	if (warned_id == id)
-		warned_id.clear();
+	warned_id.clear();
 }
 
-/* ------------------------------------------------------------------------- */
-/* Hardware output (shared)                                                  */
-
-static inline float clamp_sample(float v)
+extern "C" bool obs_haiku_route_streams(const char *device_id)
 {
-	return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-}
+	if (!device_id || !*device_id || strcmp(device_id, OBS_HAIKU_MONITOR_DEFAULT_ID) == 0)
+		device_id = "";
+	const char *label = *device_id ? device_id : OBS_HAIKU_MONITOR_DEFAULT_ID;
 
-static void convert_samples(uint32 format, const float *src, size_t count, void *dst)
-{
-	size_t i;
+	if (!BMediaRoster::IsRunning())
+		return false;
 
-	switch (format) {
-	case media_raw_audio_format::B_AUDIO_FLOAT:
-		for (i = 0; i < count; i++)
-			((float *)dst)[i] = clamp_sample(src[i]);
-		break;
-	case media_raw_audio_format::B_AUDIO_INT:
-		/* 2147483647 isn't representable as a float; scale in double */
-		for (i = 0; i < count; i++)
-			((int32 *)dst)[i] = (int32)((double)clamp_sample(src[i]) * 2147483647.0);
-		break;
-	case media_raw_audio_format::B_AUDIO_SHORT:
-		for (i = 0; i < count; i++)
-			((int16 *)dst)[i] = (int16)(clamp_sample(src[i]) * 32767.0f);
-		break;
-	case media_raw_audio_format::B_AUDIO_UCHAR:
-		for (i = 0; i < count; i++)
-			((uint8 *)dst)[i] = (uint8)(clamp_sample(src[i]) * 127.0f + 128.0f);
-		break;
-	}
-}
-
-static void device_play_buffer(void *cookie, void *buffer, size_t size, const media_raw_audio_format &format)
-{
-	device_output *d = static_cast<device_output *>(cookie);
-	uint8 silence = d->sample_format == media_raw_audio_format::B_AUDIO_UCHAR ? 0x80 : 0;
-
-	/* The format is fixed at connection time; anything else would be a negotiation bug. */
-	if (format.format != d->sample_format || format.channel_count != d->channels) {
-		memset(buffer, silence, size);
-		return;
+	std::string self;
+	if (!own_signature(self)) {
+		/* the mixer then has no signature for OBS's streams either, and cannot be asked about them */
+		warn_route(label, "OBS has no application signature the system mixer could know its streams by");
+		return false;
 	}
 
-	const size_t frame_bytes = d->sample_size * d->channels;
-	size_t frames = size / frame_bytes;
-	uint8 *out = static_cast<uint8 *>(buffer);
-
-	std::lock_guard<std::mutex> lock(d->clients_mutex);
-
-	while (frames > 0) {
-		const size_t n = std::min<size_t>(frames, MIX_CHUNK_FRAMES);
-		const size_t samples = n * d->channels;
-
-		std::fill(d->mix.begin(), d->mix.begin() + samples, 0.0f);
-		for (obs_haiku_sound_player *c : d->clients) {
-			c->cb(c->param, d->scratch.data(), n);
-			for (size_t i = 0; i < samples; i++)
-				d->mix[i] += d->scratch[i];
-		}
-
-		convert_samples(d->sample_format, d->mix.data(), samples, out);
-		out += n * frame_bytes;
-		frames -= n;
+	/* one object per call: AudioStreamControl is not thread safe */
+	BPrivate::AudioStreamControl control;
+	if (control.Update() != B_OK) {
+		warn_route(label, "the system mixer's controls cannot be read");
+		return false;
 	}
 
-	/* a partial trailing frame (shouldn't happen) */
-	memset(out, silence, size % frame_bytes);
-}
-
-static size_t sample_size_for(uint32 format)
-{
-	switch (format) {
-	case media_raw_audio_format::B_AUDIO_FLOAT:
-	case media_raw_audio_format::B_AUDIO_INT:
-		return 4;
-	case media_raw_audio_format::B_AUDIO_SHORT:
-		return 2;
-	case media_raw_audio_format::B_AUDIO_UCHAR:
-		return 1;
-	default: /* B_AUDIO_DOUBLE, B_AUDIO_CHAR: not handled */
-		return 0;
-	}
-}
-
-static bool supported_channels(uint32 channels)
-{
-	/* What libobs' speaker layouts can express */
-	return (channels >= 1 && channels <= 6) || channels == 8;
-}
-
-static void close_device(device_output *d)
-{
-	/* See free_player() for why stopping without blocking and then deleting is safe. */
-	if (d->player) {
-		d->player->Stop(false, false);
-		delete d->player; /* disconnects from the device */
-		d->player = NULL;
-	}
-
-	/* Only now that nothing is connected: if this reference is the last one (we instantiated the node),
-	 * the media add-on server closes the device again. */
-	if (d->release_node) {
-		BMediaRoster *roster = BMediaRoster::CurrentRoster();
-		if (roster)
-			roster->ReleaseNode(d->node);
-		d->release_node = false;
-	}
-
-	delete d;
-}
-
-/* Connects to a hardware output. On failure returns NULL and a reason for the log. */
-static device_output *open_device(BMediaRoster *roster, const char *id, const char **reason)
-{
-	const output_device *dev = NULL;
-	std::vector<output_device> devices = list_output_devices(roster);
-	for (const output_device &o : devices) {
-		if (o.id == id) {
-			dev = &o;
-			break;
-		}
-	}
-	if (!dev) {
-		*reason = "was not found";
-		return NULL;
-	}
-
-	device_output *d = new (std::nothrow) device_output();
-	if (!d) {
-		*reason = "could not be opened";
-		return NULL;
-	}
-	d->id = id;
-
-	/* Reuse the running instance (e.g. opened by another app) rather than creating a second one; a
-	 * dormant one is instantiated globally, like Media preferences does, and released in close_device()
-	 * so it doesn't outlive OBS's use of it. */
-	if (!get_running_instance(roster, dev->info, &d->node) &&
-	    roster->InstantiateDormantNode(dev->info, &d->node, B_FLAVOR_IS_GLOBAL) != B_OK) {
-		*reason = "could not be opened";
-		delete d;
-		return NULL;
-	}
-	d->release_node = true;
-
-	if ((d->node.kind & B_BUFFER_CONSUMER) == 0) {
-		/* BSoundPlayer would call debugger() */
-		*reason = "does not accept audio";
-	} else if (is_system_output(roster, d->node)) {
-		*reason = "is the system audio output (used by the mixer)";
-	} else {
-		/* All wildcards: the device's AcceptFormat() fills in its own rate, channel count, sample format
-		 * and buffer size (multi_audio accepts nothing but its hardware format). */
-		media_multi_audio_format format = media_multi_audio_format::wildcard;
-		std::string name = "OBS Monitor: " + std::string(dev->name);
-		d->player = new (std::nothrow)
-			BSoundPlayer(d->node, &format, name.c_str(), NULL, device_play_buffer, NULL, d);
-
-		if (!d->player || d->player->InitCheck() != B_OK) {
-			/* GetFreeInputsFor()/Connect() failed: typically every input is already connected */
-			*reason = "could not be connected to (all of its inputs may be in use)";
-		} else {
-			const media_raw_audio_format fmt = d->player->Format();
-			d->sample_format = fmt.format;
-			d->channels = fmt.channel_count;
-			d->sample_size = sample_size_for(fmt.format);
-
-			if (d->sample_size == 0 || fmt.byte_order != B_MEDIA_HOST_ENDIAN ||
-			    !supported_channels(fmt.channel_count) || fmt.frame_rate < 1000.0f ||
-			    fmt.frame_rate > 768000.0f) {
-				*reason = "uses an audio format OBS can't produce";
-			} else {
-				d->mix.resize((size_t)MIX_CHUNK_FRAMES * d->channels);
-				d->scratch.resize(d->mix.size());
-
-				if (d->player->Start() == B_OK) {
-					d->player->SetHasData(true);
-					return d;
-				}
-				*reason = "could not be started";
-			}
+	/* index 0 is the default output; the device's index in the list the mixer offers its streams */
+	int32 index = 0;
+	if (*device_id) {
+		index = control.Outputs().IndexOf(device_id);
+		if (index <= 0) {
+			/* The parameter only takes devices that are there now; a stream routed to a device that
+			 * goes away later does come back to it by itself. */
+			warn_route(label, "the system mixer does not list this device now");
+			return false;
 		}
 	}
 
-	close_device(d);
-	return NULL;
-}
-
-/* Whether an open device can still play: its node may have gone away (USB output unplugged, media server
- * restarted), which leaves the player connected to nothing. One media server query. */
-static bool device_alive(BMediaRoster *roster, device_output *d)
-{
-	live_node_info info;
-	return d->player && d->player->InitCheck() == B_OK && roster->GetLiveNodeInfo(d->node, &info) == B_OK;
-}
-
-/* Gets (opening if needed) the shared output for id, taking a reference. */
-static device_output *acquire_device(BMediaRoster *roster, const char *id, const char **reason)
-{
-	std::unique_lock<std::mutex> lock(registry_mutex);
-
-	/* Another thread is opening this id: wait for it rather than opening a second connection, which a
-	 * single-input device would refuse. */
-	registry_cv.wait(lock, [id] { return !is_opening(id); });
-
-	for (auto it = open_devices.begin(); it != open_devices.end(); ++it) {
-		device_output *d = *it;
-		if (d->id != id)
+	int routed = 0, failed = 0;
+	for (int32 i = 0; i < control.CountStreams(); i++) {
+		const BPrivate::AudioStream *stream = control.StreamAt(i);
+		if (stream->signature != self.c_str() || !stream->hasOutput)
 			continue;
-		if (device_alive(roster, d)) {
-			d->refs++;
-			return d;
+		if (stream->output == index) {
+			routed++;
+			continue;
 		}
-		/* Dead: stop handing it out. Its current players keep it (silent) until they are destroyed;
-		 * refs > 0 here, since entries are closed and removed when refs drops to 0. */
-		blog(LOG_INFO, "[audio monitoring] Device '%s' went away; reopening it", id);
-		open_devices.erase(it);
-		break;
+		if (control.SetOutput(stream->id, index) == B_OK)
+			routed++;
+		else
+			failed++;
 	}
 
-	/* Instantiating and connecting a node can take a while (the add-on may open hardware); don't block
-	 * device listing and other players' teardown meanwhile. opening_ids keeps the id reserved. */
-	opening_ids.push_back(id);
-	lock.unlock();
-
-	device_output *d = open_device(roster, id, reason);
-
-	lock.lock();
-	opening_ids.erase(std::find(opening_ids.begin(), opening_ids.end(), std::string(id)));
-	if (d) {
-		d->refs = 1;
-		open_devices.push_back(d);
+	if (failed || !routed) {
+		warn_route(label, routed || failed ? "the system mixer refused the route"
+						   : "the system mixer has no stream of OBS (yet)");
+		return false;
 	}
-	lock.unlock();
-	registry_cv.notify_all();
-	return d;
-}
-
-static void release_device(device_output *d)
-{
-	std::lock_guard<std::mutex> lock(registry_mutex);
-
-	if (--d->refs > 0)
-		return;
-
-	open_devices.erase(std::remove(open_devices.begin(), open_devices.end(), d), open_devices.end());
-	close_device(d);
+	route_ok();
+	return true;
 }
 
 /* ------------------------------------------------------------------------- */
-/* System mixer                                                              */
+/* Players                                                                   */
 
-static void mixer_play_buffer(void *cookie, void *buffer, size_t size, const media_raw_audio_format &format)
+static void play_buffer(void *cookie, void *buffer, size_t size, const media_raw_audio_format &format)
 {
 	obs_haiku_sound_player *p = static_cast<obs_haiku_sound_player *>(cookie);
 
-	/* The mixer accepts the format we asked for (checked in open_mixer()); cb writes p->channels per frame,
-	 * so anything else would overrun the buffer. */
+	/* The format was checked in obs_haiku_sound_player_create(); cb writes p->channels per frame, so
+	 * anything else would overrun the buffer. */
 	if (format.format != media_raw_audio_format::B_AUDIO_FLOAT || format.channel_count != p->channels ||
 	    p->channels == 0) {
 		memset(buffer, 0, size);
@@ -524,49 +245,50 @@ static void free_player(obs_haiku_sound_player *p)
 		delete p->player;
 		p->player = NULL;
 	}
+	/* BSoundPlayer only releases a mixer it looked up itself (F_MUST_RELEASE_MIXER), not one it was
+	 * given, so this reference is ours to drop, after the player has disconnected */
+	if (p->have_mixer) {
+		if (BMediaRoster *roster = BMediaRoster::CurrentRoster())
+			roster->ReleaseNode(p->mixer);
+		p->have_mixer = false;
+	}
 }
 
-static bool open_mixer(obs_haiku_sound_player *p, const char *name, uint32_t sample_rate, uint32_t channels,
-		       size_t buffer_frames)
+/* The channel mask of OBS's layout for `channels` (speaker_layout values are channel counts), in Media Kit
+ * terms: channels are interleaved in mask bit order. The mixer keeps a mask with as many bits as channels
+ * (MixerUtils.cpp) and otherwise assumes its own defaults, which differ from OBS's for 3 to 5 channels
+ * (OBS 2.1 = FL FR LFE, 4.0 = FL FR FC RC, 4.1 = FL FR FC LFE RC). */
+static uint32 obs_channel_mask(uint32 channels)
 {
-	media_raw_audio_format format = media_raw_audio_format::wildcard;
-	format.frame_rate = (float)sample_rate;
-	format.channel_count = channels;
-	format.format = media_raw_audio_format::B_AUDIO_FLOAT;
-	format.byte_order = B_MEDIA_HOST_ENDIAN;
-	format.buffer_size = buffer_frames * channels * sizeof(float);
-
-	p->channels = channels;
-	p->player = new (std::nothrow) BSoundPlayer(&format, name, mixer_play_buffer, NULL, p);
-	if (!p->player || p->player->InitCheck() != B_OK) {
-		free_player(p);
-		return false;
+	const uint32 L = B_CHANNEL_LEFT, R = B_CHANNEL_RIGHT, C = B_CHANNEL_CENTER, S = B_CHANNEL_SUB,
+		     RL = B_CHANNEL_REARLEFT, RR = B_CHANNEL_REARRIGHT, BC = B_CHANNEL_BACK_CENTER;
+	switch (channels) {
+	case 2:
+		return L | R;
+	case 3:
+		return L | R | S;
+	case 4:
+		return L | R | C | BC;
+	case 5:
+		return L | R | C | S | BC;
+	case 6:
+		return L | R | C | S | RL | RR;
+	case 8:
+		return L | R | C | S | RL | RR | B_CHANNEL_SIDE_LEFT | B_CHANNEL_SIDE_RIGHT;
+	default:
+		return 0; /* mono, and anything OBS has no layout for: the mixer's default */
 	}
-
-	const media_raw_audio_format fmt = p->player->Format();
-	if (fmt.format != media_raw_audio_format::B_AUDIO_FLOAT || fmt.channel_count != channels) {
-		blog(LOG_WARNING, "[audio monitoring] The system mixer negotiated %u channels (format 0x%x) instead of "
-				  "%u float channels",
-		     (unsigned)fmt.channel_count, (unsigned)fmt.format, (unsigned)channels);
-		free_player(p);
-		return false;
-	}
-	return true;
 }
 
-/* ------------------------------------------------------------------------- */
-
-extern "C" obs_haiku_sound_player *obs_haiku_sound_player_create(const char *device_id, const char *name,
-								 uint32_t sample_rate, uint32_t channels,
-								 size_t buffer_frames, obs_haiku_fill_cb cb,
-								 void *param, obs_haiku_output_format *out)
+extern "C" obs_haiku_sound_player *obs_haiku_sound_player_create(const char *name, uint32_t sample_rate,
+								 uint32_t channels, size_t buffer_frames,
+								 obs_haiku_fill_cb cb, void *param)
 {
 	/* Fail fast instead of waiting for roster timeouts when the media server is down. */
-	if (!BMediaRoster::IsRunning())
-		return NULL;
-
-	BMediaRoster *roster = BMediaRoster::Roster();
+	BMediaRoster *roster = BMediaRoster::IsRunning() ? BMediaRoster::Roster() : NULL;
 	if (!roster)
+		return NULL;
+	if (channels < 1 || channels > 8 || channels == 7)
 		return NULL;
 
 	obs_haiku_sound_player *p = new (std::nothrow) obs_haiku_sound_player();
@@ -574,42 +296,52 @@ extern "C" obs_haiku_sound_player *obs_haiku_sound_player_create(const char *dev
 		return NULL;
 	p->cb = cb;
 	p->param = param;
+	p->channels = channels;
 
-	if (device_id && *device_id && strcmp(device_id, OBS_HAIKU_MONITOR_DEFAULT_ID) != 0) {
-		const char *reason = "is not a Haiku audio output";
-		if (strncmp(device_id, DEVICE_ID_PREFIX, strlen(DEVICE_ID_PREFIX)) == 0)
-			p->device = acquire_device(roster, device_id, &reason);
-
-		if (p->device) {
-			device_ok(device_id);
-			out->sample_rate = (uint32_t)(p->device->player->Format().frame_rate + 0.5f);
-			out->channels = p->device->channels;
-			return p;
-		}
-		warn_fallback(device_id, reason);
-	}
-
-	if (!open_mixer(p, name, sample_rate, channels, buffer_frames)) {
+	/* The node constructor, because only it takes a media_multi_audio_format, which has the channel
+	 * mask; given the system mixer it connects just as the plain constructor does. */
+	if (roster->GetAudioMixer(&p->mixer) != B_OK) {
 		delete p;
 		return NULL;
 	}
-	out->sample_rate = sample_rate;
-	out->channels = channels;
+	p->have_mixer = true;
+
+	media_multi_audio_format format = media_multi_audio_format::wildcard;
+	format.channel_mask = obs_channel_mask(channels);
+	format.frame_rate = (float)sample_rate;
+	format.channel_count = channels;
+	format.format = media_raw_audio_format::B_AUDIO_FLOAT;
+	format.byte_order = B_MEDIA_HOST_ENDIAN;
+	/* A fixed buffer length keeps monitoring latency independent of the device's period. Renga's
+	 * low-latency mode (switched on for OBS in Media preferences > Audio settings > Applications, or with
+	 * RENGA_AUDIO_LOW_LATENCY=1) still shortens the default output's period; only BSoundPlayer's own
+	 * one-period buffer choice is skipped because the size is given (SoundPlayer.cpp _Init()). */
+	format.buffer_size = buffer_frames * channels * sizeof(float);
+
+	/* The constructor connects to the system mixer: the stream exists once it returns. */
+	p->player = new (std::nothrow) BSoundPlayer(p->mixer, &format, name, NULL, play_buffer, NULL, p);
+	if (!p->player || p->player->InitCheck() != B_OK) {
+		free_player(p);
+		delete p;
+		return NULL;
+	}
+
+	const media_raw_audio_format fmt = p->player->Format();
+	if (fmt.format != media_raw_audio_format::B_AUDIO_FLOAT || fmt.channel_count != channels) {
+		blog(LOG_WARNING,
+		     "[audio monitoring] The system mixer negotiated %u channels (format 0x%x) instead of "
+		     "%u float channels",
+		     (unsigned)fmt.channel_count, (unsigned)fmt.format, (unsigned)channels);
+		free_player(p);
+		delete p;
+		return NULL;
+	}
 	return p;
 }
 
 extern "C" bool obs_haiku_sound_player_start(obs_haiku_sound_player *p)
 {
-	if (!p)
-		return false;
-
-	if (p->device) {
-		std::lock_guard<std::mutex> lock(p->device->clients_mutex);
-		p->device->clients.push_back(p);
-		return true;
-	}
-
-	if (p->player->Start() != B_OK)
+	if (!p || p->player->Start() != B_OK)
 		return false;
 	p->player->SetHasData(true);
 	return true;
@@ -619,18 +351,6 @@ extern "C" void obs_haiku_sound_player_destroy(obs_haiku_sound_player *p)
 {
 	if (!p)
 		return;
-
-	if (p->device) {
-		{
-			/* Waits for a buffer hook in progress; afterwards p's callback is never called again. */
-			std::lock_guard<std::mutex> lock(p->device->clients_mutex);
-			auto &c = p->device->clients;
-			c.erase(std::remove(c.begin(), c.end(), p), c.end());
-		}
-		release_device(p->device);
-		p->device = NULL;
-	}
-
 	free_player(p);
 	delete p;
 }
