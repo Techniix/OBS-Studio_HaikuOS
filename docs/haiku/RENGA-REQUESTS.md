@@ -19,19 +19,25 @@ that file are kept consistent.
 
 | ID | Request | Area | Priority | State | Roadmap |
 | --- | --- | --- | --- | --- | --- |
-| O-1 | Exclude applications from a loopback | Audio | 1 | Proposed | F-31 |
-| O-2 | "Loopback only" stream route | Audio, browser source | 2 | Proposed | F-31 |
-| O-3 | Loopback selection by team | Browser source | 2 | Proposed | F-31 |
-| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | 1 | Proposed | F-31, F-32 |
-| O-5 | Camera mode lists and frame rates | Webcam | 2 | Proposed | F-31 phase 2 |
-| O-6 | Screen capture permission without blocking the app_server link | Capture | 1 | Proposed | F-31 phase 3 |
-| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | 1 | Proposed | F-31 phase 3 |
-| O-8 | Frame notification instead of polling | Capture | 3 | Proposed | F-31 phase 3 |
-| O-9 | Window visibility in capture frames | Capture | 3 | Proposed | F-31 phase 3, F-33 |
-| O-10 | GPU buffers from capture (scanout, windows) | Capture | Roadmap | Proposed | F-47 (with Quasar R-2) |
-| O-11 | Hardware video encode behind the Media Kit | Encoding | 2 | Proposed | F-31 phase 5 |
-| O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Proposed | F-31 |
-| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Proposed | F-15 |
+| O-1 | Exclude applications from a loopback | Audio | 1 | Accepted (F-58) | F-31 |
+| O-2 | "Loopback only" stream route | Audio, browser source | 2 | Accepted (F-58) | F-31 |
+| O-3 | Loopback selection by team | Browser source | 2 | Accepted (F-58) | F-31 |
+| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | 1 | Accepted (F-58) | F-31, F-32 |
+| O-5 | Camera mode lists and frame rates | Webcam | 2 | Accepted (F-58) | F-31 phase 2 |
+| O-6 | Screen capture permission without blocking the app_server link | Capture | 1 | Accepted (F-58) | F-31 phase 3 |
+| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | 1 | Accepted (F-58) | F-31 phase 3 |
+| O-8 | Frame notification instead of polling | Capture | 3 | Accepted (F-58) | F-31 phase 3 |
+| O-9 | Window visibility in capture frames | Capture | 3 | Accepted (F-58) | F-31 phase 3, F-33 |
+| O-10 | GPU buffers from capture (scanout, windows) | Capture | Roadmap | Accepted (GPU stage, with R-2 and F-47) | F-47 (with Quasar R-2) |
+| O-11 | Hardware video encode behind the Media Kit (`VideoAcceleration.h`) | Encoding | 2 | Interface landed (`446221a6`); GPU back end waits on Q-3 | F-31 phase 5 |
+| O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Accepted (F-58) | F-31 |
+| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Accepted (F-58) | F-15 |
+
+**Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
+Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
+`BScreenCapture::RequestPermission(BMessenger, uint32)`); O-4; O-5 and O-12; O-2 and O-3; O-8 and O-9; O-13.
+Items land one commit at a time; each is marked Landed here with its commit, and any interface difference from
+the proposal is noted. O-10 is part of the GPU stage with Quasar's R-2 and F-47.
 
 Suggested order: O-1 (the most noticeable everyday problem, a small change in the mixer's loopback), then
 O-7 with O-6 (removes a fragile workaround in OBS and a UI freeze), then O-4, then O-5 and O-12 (the
@@ -126,10 +132,16 @@ largest visible gains). Q-1 is independent of these and blocks hardware renderin
 
 ### O-11 Hardware video encode
 
-- **Need.** OBS encodes in software today (x264). The Media Kit phase-5 hardware video API does not exist yet.
-- **Proposed interface.** What phase 5 defines; for OBS the best fit is VA-API (libva) as the roadmap plans,
-  because FFmpeg's `h264_vaapi`/`hevc_vaapi`/`av1_vaapi` encoders then work unchanged, with GPU-texture input
-  through dma-buf import (O-10). OBS would offer the encoders only after a runtime check.
+- **State.** The Media Kit's phase-5 interface has landed (`446221a6`): `headers/private/media/VideoAcceleration.h`,
+  shaped like VA-API but inside the Media Kit (no libva; FFmpeg's `*_vaapi` encoders are not available).
+  `VideoAcceleratorRoster` finds back-end add-ons; `VideoAccelerator::IsHardware()` tells hardware from the
+  software reference back end; `VideoAccelEncoder` takes NV12/P010 surfaces and returns packets with a key-frame
+  flag and the codec's extradata. No GPU back end exists yet; NVIDIA's is Quasar's Q-3.
+- **OBS plan.** An OBS encoder plug-in directly on `VideoAccelEncoder` (H.264, HEVC, AV1 as the back end
+  supports them), offered only when the roster finds a hardware back end with an encode entry point for that
+  codec. This fits OBS better than `BMediaEncoder`/`BMediaFile` (OBS needs raw packets, key frames and
+  extradata for its own muxers and RTMP/SRT outputs), so **no libva request**.
+- **Remaining need.** GPU-texture input without a CPU copy (surfaces importable from a GPU buffer), with O-10.
 
 ### O-12 Virtual camera
 
@@ -164,10 +176,10 @@ No request needed; OBS adapts when these arrive:
 
 | ID | Request | Priority | State | Quasar reference |
 | --- | --- | --- | --- | --- |
-| Q-1 | Fix the timeline-fence hang with OBS's Screen Capture load | 1 | Proposed | `docs/event-sync.md`, Open issues |
-| Q-2 | Shared GPU textures between processes | Roadmap | Proposed | external memory (`RENGA-STATUS.md`) |
-| Q-3 | Hardware video encode back end | 2 | Proposed | Video, Media Kit back end |
-| Q-4 | Quiet driver logging by default | 3 | Proposed | Power and system |
+| Q-1 | Fix the timeline-fence hang with OBS's Screen Capture load | 1 | Passed to Quasar | `docs/event-sync.md`, Open issues |
+| Q-2 | Shared GPU textures between processes | Roadmap | Passed to Quasar | external memory (`RENGA-STATUS.md`) |
+| Q-3 | Hardware video encode back end | 2 | Passed to Quasar | Video, Media Kit back end |
+| Q-4 | Quiet driver logging by default | 3 | Passed to Quasar | Power and system |
 
 ### Q-1 Screen Capture hang
 
