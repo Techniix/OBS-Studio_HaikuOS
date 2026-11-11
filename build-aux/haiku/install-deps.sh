@@ -9,15 +9,16 @@ REQUIRED=(
 	ffmpeg8_devel x264_devel jansson_devel curl_devel mbedtls3_devel zlib_devel uthash
 	qt6_base_devel qt6_svg_devel
 	haiku_devel
-	mesa_devel mesa_swpipe
+	mesa_devel
 	freetype_devel fontconfig_devel
 	nlohmann_json libdatachannel_devel
 )
 
 # Scripting (Lua/Python), the noise suppression filters, the VLC video source and the browser source/docks
-# (build.sh turns off whatever is missing)
+# (build.sh turns off whatever is missing). cmd:python3 is whichever Python HaikuPorts currently installs as
+# the default python3 (3.14 at the time of writing); its headers come with the main package.
 RECOMMENDED=(
-	luajit_devel swig python3.12
+	luajit_devel swig cmd:python3
 	speexdsp_devel rnnoise_devel
 	vlc_devel
 	haikuwebkit_devel
@@ -42,6 +43,10 @@ if ! pkgman install -y "${REQUIRED[@]}"; then
 		exit 1
 	fi
 fi
+
+# The Gallium software pipe renderer is a sub-package of the Mesa 22 recipe only (Mesa 25 replaces it with
+# mesa_eglvnd), so it is not required: asking for it on a system with Mesa 25 would fail the required list.
+pkgman install -y mesa_swpipe >/dev/null 2>&1 && echo "==> Mesa software pipe renderer (mesa_swpipe) installed"
 
 # Mesa 25 adds EGL for Haiku (mesa_eglvnd + libglvnd). It isn't published yet; OBS uses OSMesa from Mesa 22
 # until it is, and picks EGL up automatically once these packages exist.

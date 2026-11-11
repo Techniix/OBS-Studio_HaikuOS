@@ -1,0 +1,29 @@
+/*
+ * Haiku application resources of the OBS Studio executable, compiled with rc and added with xres by
+ * frontend/cmake/os-haiku.cmake (the same steps Haiku's own build uses, see ResComp and XRes in
+ * build/jam/BeOSRules). Generated from obs-studio.rdef.in by configure_file().
+ *
+ * The signature identifies OBS to the registrar. Renga remembers screen recording permission and
+ * per-application audio settings by signature, so it must not change between versions. Qt's Haiku
+ * platform plugin reads it from these resources (BAppFileInfo::GetSignature()) when it creates the
+ * BApplication; without them it would make one up from the application name.
+ */
+
+resource app_signature "@OBS_HAIKU_APP_SIGNATURE@";
+
+/* Not B_SINGLE_LAUNCH: OBS has its own "already running" check with a "Launch anyway" choice and the
+ * --multi option, and restarting (e.g. after changing the language) starts the new instance before the old
+ * one has quit. A single-launch signature would make the registrar refuse both. */
+resource app_flags B_MULTIPLE_LAUNCH;
+
+resource app_version {
+	major  = @OBS_VERSION_MAJOR@,
+	middle = @OBS_VERSION_MINOR@,
+	minor  = @OBS_VERSION_PATCH@,
+
+	variety = @OBS_HAIKU_APP_VARIETY@,
+	internal = @OBS_HAIKU_APP_INTERNAL@,
+
+	short_info = "OBS Studio",
+	long_info  = "OBS Studio @OBS_VERSION@, free and open source software for video recording and live streaming"
+};

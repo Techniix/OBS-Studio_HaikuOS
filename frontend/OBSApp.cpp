@@ -1765,7 +1765,7 @@ vector<pair<string, string>> GetLocaleNames()
 	return names;
 }
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__)
 #define BASE_PATH ".."
 #else
 #define BASE_PATH "../.."

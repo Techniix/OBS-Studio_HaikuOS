@@ -7,6 +7,14 @@ include_guard(GLOBAL)
 set(ENABLE_PULSEAUDIO OFF)
 set(ENABLE_WAYLAND OFF)
 
+# The "What's New" panel (frontend/cmake/feature-whatsnew.cmake, default ON elsewhere) downloads the upstream
+# release notes list from obsproject.com and opens the page for Windows/Linux builds of this version in a browser
+# window. That describes upstream builds, not this port, so it is off by default on Haiku. A cache entry is used,
+# so -DENABLE_WHATSNEW=ON still turns it on (option() leaves an existing cache entry alone).
+if(NOT DEFINED ENABLE_WHATSNEW)
+  set(ENABLE_WHATSNEW OFF CACHE BOOL "Enable WhatsNew dialog")
+endif()
+
 option(ENABLE_RELOCATABLE "Enable relocatable build" OFF)
 option(ENABLE_PORTABLE_CONFIG "Enable support for portable config file location" OFF)
 
