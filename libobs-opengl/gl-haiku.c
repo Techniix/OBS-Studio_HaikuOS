@@ -1145,7 +1145,10 @@ static void relaunch_obs(void)
 	int32 cookie = 0;
 	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &image) == B_OK) {
 		if (image.type == B_APP_IMAGE) {
-			snprintf(exe, sizeof(exe), "%s", image.name);
+			/* image.name is the path as exec()ed, relative for "./obs"; the shell below starts in this
+			 * team's working directory, which OBS may have changed since, so resolve it here */
+			if (!realpath(image.name, exe))
+				snprintf(exe, sizeof(exe), "%s", image.name);
 			break;
 		}
 	}

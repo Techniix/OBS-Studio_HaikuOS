@@ -322,7 +322,9 @@ BASELINE_PIDS=" "
 # started (tracked PIDs) or that appeared after the script began AND run from the tested bin directory
 # (helpers OBS spawns: obs-ffmpeg-mux, obs-haiku-gl-probe, an OBS restarted by its own GL watchdog).
 sweep_leftovers() {
-	local out="$1" pid args mine killed=0 p
+	local out="$1" pid args mine killed=0 p teams="$WORK/.teams.$$"
+	# a file rather than process substitution, which needs /dev/fd or named pipes
+	list_teams >"$teams"
 	while IFS=$'\t' read -r pid args; do
 		[ -n "$pid" ] || continue
 		[ "$pid" = "$$" ] && continue
@@ -345,7 +347,8 @@ sweep_leftovers() {
 		else
 			echo "left alone (not started by this run): $pid $args" >>"$out"
 		fi
-	done < <(list_teams)
+	done <"$teams"
+	rm -f "$teams"
 	return 0
 }
 
@@ -674,6 +677,7 @@ probe_on_timeout() { capture_stuck "$1" "$PROBE_DIR" "$PROBE_CUR-timeout"; }
 PROBE_TOTAL=0
 PROBE_OK=0
 PROBE_TIMEOUTS=0
+PROBE_NO_EGL=0 # runs that exited 2: no EGL display (e.g. HaikuPorts' Mesa 22), not a driver failure
 PROBE_BAD=""
 # probe_run <name> <args...>
 probe_run() {
@@ -694,6 +698,10 @@ probe_run() {
 	elif [ "$RT_EXIT" = 0 ]; then
 		status=OK
 		PROBE_OK=$((PROBE_OK + 1))
+	elif [ "$RT_EXIT" = 2 ]; then
+		status=NO-EGL
+		PROBE_NO_EGL=$((PROBE_NO_EGL + 1))
+		PROBE_BAD="$PROBE_BAD $name=no-EGL"
 	else
 		status=FAIL
 		PROBE_BAD="$PROBE_BAD $name=exit$RT_EXIT"
@@ -729,6 +737,9 @@ step_probe() {
 	[ -n "$PROBE_BAD" ] && detail="$detail;$PROBE_BAD"
 	if [ "$PROBE_TIMEOUTS" -gt 0 ]; then
 		result "3 gl-probe" HANG "$detail"
+	elif [ "$PROBE_NO_EGL" = "$PROBE_TOTAL" ]; then
+		# nothing to test: OBS uses OSMesa on such a system (gl-haiku.c), which step 4 covers
+		result "3 gl-probe" SKIPPED "no EGL display (exit 2 in every run), OBS renders with OSMesa; $detail"
 	elif [ "$PROBE_OK" = "$PROBE_TOTAL" ]; then
 		result "3 gl-probe" PASS "$detail"
 	else
@@ -955,6 +966,11 @@ obs_run() {
 	fi
 	wait "$pid" 2>/dev/null
 	exit_code=$?
+	# OBS keeps recording until it has handled SIGTERM and stopped the output, after the watch ended (the
+	# listimage above, the shutdown itself): frames up to here are legitimate, see the frame count check
+	local stop_end rec_ms_max=0
+	stop_end=$(now_ms)
+	[ "$rec_start" != 0 ] && rec_ms_max=$((stop_end - rec_start))
 	printf '%s\t0\t%s\t%s\t%s\tstopped\n' "$(($(now_ms) - t0))" "${last_cpu:-?}" "$(obs_log_bytes "$out" "$xdg")" \
 		"$rec_bytes" >>"$dir/samples.tsv"
 	if [ -n "$TONE_PID" ]; then
@@ -1001,7 +1017,8 @@ obs_run() {
 
 	# --- recording -----------------------------------------------------------------------------------
 	local recfile recsize=0 vcodec="" vdim="" frames="" dur="" acodec="" maxvol="" meanvol="" audio="no audio stream"
-	local expected=$((CFG_FPS * rec_ms / 1000)) probed=0
+	# expected: frames in the time recorded by the clock until the watch ended; expected_max: until OBS was gone
+	local expected=$((CFG_FPS * rec_ms / 1000)) expected_max=$((CFG_FPS * rec_ms_max / 1000)) probed=0
 	recfile="$(newest_recording "$rec")"
 	{
 		echo "recording directory: $rec"
@@ -1042,7 +1059,8 @@ obs_run() {
 			echo "file: $recfile"
 			echo "size: $recsize bytes"
 			echo "video: ${vcodec:-?} ${vdim:-?}, frames: ${frames:-?}, duration: ${dur:-?} s"
-			echo "expected frames: $expected ($CFG_FPS fps x $rec_ms ms of recording by the clock), accepted +-20%"
+			echo "expected frames: $expected ($CFG_FPS fps x $rec_ms ms of recording by the clock until SIGTERM)" \
+				"to $expected_max (until OBS had exited), accepted -20% / +20%"
 			echo "$audio"
 			[ "$tone" = 1 ] && echo "$TONE_NOTE"
 		} >>"$dir/recording.txt"
@@ -1094,7 +1112,7 @@ obs_run() {
 	elif [ -z "$vcodec" ]; then
 		status=FAIL
 		why="recording has no video stream"
-	elif [ -z "$frames" ] || [ "$frames" -lt $((expected * 80 / 100)) ] || [ "$frames" -gt $((expected * 120 / 100)) ]; then
+	elif [ -z "$frames" ] || [ "$frames" -lt $((expected * 80 / 100)) ] || [ "$frames" -gt $((expected_max * 120 / 100)) ]; then
 		status=FAIL
 		why="frame count off"
 	else
@@ -1157,6 +1175,11 @@ step_obs() {
 	if [ "$OPT_QUICK" = 1 ]; then
 		say "==> 4. OBS run 'egl-forced'"
 		result "4 obs-egl-forced" SKIPPED "--quick"
+	elif [ "$PROBE_TOTAL" -gt 0 ] && [ "$PROBE_NO_EGL" = "$PROBE_TOTAL" ]; then
+		# OBS_HAIKU_GL=egl without EGL ends in OBS's "failed to initialize video" box, which would be
+		# reported as a hang
+		say "==> 4. OBS run 'egl-forced'"
+		result "4 obs-egl-forced" SKIPPED "no EGL display (the self-test exited 2 in every run)"
 	else
 		obs_run egl-forced 0 OBS_HAIKU_GL=egl OBS_HAIKU_GL_WATCHDOG=0
 	fi
