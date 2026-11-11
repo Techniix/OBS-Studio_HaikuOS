@@ -27,15 +27,18 @@ extern "C" {
 struct gl_haiku_alert;
 
 #define GL_HAIKU_ALERT_PENDING (-1)
+#define GL_HAIKU_ALERT_ACTION 0 /* the left button */
+#define GL_HAIKU_ALERT_WAIT 1   /* the right button: the default one (Enter), also picked by Escape */
 
-/* Shows a warning alert with two buttons; button1 is the default (rightmost, Enter), Escape picks button0.
- * Returns NULL if there is no BApplication (be_app) or the alert could not be created. */
-struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const char *text, const char *button0,
-					   const char *button1);
+/* Shows a warning alert with two buttons without blocking. The alert is modal for the application's windows
+ * only. Returns NULL if there is no BApplication (be_app) or the alert could not be created. */
+struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const char *text, const char *action_button,
+					   const char *wait_button);
 
-/* Waits up to timeout_ms for an answer. Returns GL_HAIKU_ALERT_PENDING, or the index of the button pressed
- * (0 or 1), after which the alert is gone and must not be used again. */
-int gl_haiku_alert_wait(struct gl_haiku_alert *alert, int timeout_ms);
+/* Never blocks. Returns GL_HAIKU_ALERT_PENDING while the alert is open; otherwise the button pressed, after
+ * which the alert is gone and must not be used again. An alert that went away without an answer (closed by the
+ * system) counts as GL_HAIKU_ALERT_WAIT. */
+int gl_haiku_alert_poll(struct gl_haiku_alert *alert);
 
 /* Closes an alert that is still pending and releases it. */
 void gl_haiku_alert_close(struct gl_haiku_alert *alert);

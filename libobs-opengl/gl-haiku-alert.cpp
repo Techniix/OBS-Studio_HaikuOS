@@ -67,8 +67,8 @@ struct gl_haiku_alert {
 	AnswerInvoker *invoker;
 };
 
-extern "C" struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const char *text, const char *button0,
-						       const char *button1)
+extern "C" struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const char *text, const char *action_button,
+						       const char *wait_button)
 {
 	/* a BWindow needs the app_server link of a BApplication (the Qt Haiku platform plugin creates it) */
 	if (be_app == NULL)
@@ -80,7 +80,8 @@ extern "C" struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const c
 		return NULL;
 	}
 	gl_haiku_alert *alert = new (std::nothrow) gl_haiku_alert;
-	BAlert *window = new (std::nothrow) BAlert(title, text, button0, button1, NULL, B_WIDTH_AS_USUAL,
+	/* BAlert makes its rightmost button the default one (Enter): that is the harmless choice */
+	BAlert *window = new (std::nothrow) BAlert(title, text, action_button, wait_button, NULL, B_WIDTH_AS_USUAL,
 						   B_EVEN_SPACING, B_WARNING_ALERT);
 	if (!alert || !window) {
 		delete alert;
@@ -89,31 +90,45 @@ extern "C" struct gl_haiku_alert *gl_haiku_alert_show(const char *title, const c
 		return NULL;
 	}
 
-	window->SetShortcut(0, B_ESCAPE);
+	window->SetShortcut(GL_HAIKU_ALERT_WAIT, B_ESCAPE);
 	alert->invoker = invoker;
 	alert->window = BMessenger(window);
-	/* asynchronous: returns at once; the window runs in its own thread */
+	/* asynchronous: returns at once; the window runs in its own thread and deletes itself when it quits */
 	window->Go(invoker);
 	return alert;
 }
 
-extern "C" int gl_haiku_alert_wait(struct gl_haiku_alert *alert, int timeout_ms)
+extern "C" int gl_haiku_alert_poll(struct gl_haiku_alert *alert)
 {
 	if (!alert)
-		return GL_HAIKU_ALERT_PENDING;
+		return GL_HAIKU_ALERT_WAIT;
 
 	status_t status;
 	do {
-		status = acquire_sem_etc(alert->invoker->fSem, 1, B_RELATIVE_TIMEOUT, (bigtime_t)timeout_ms * 1000);
+		status = acquire_sem_etc(alert->invoker->fSem, 1, B_RELATIVE_TIMEOUT, 0);
 	} while (status == B_INTERRUPTED);
-	if (status != B_OK)
-		return GL_HAIKU_ALERT_PENDING;
+
+	if (status != B_OK) {
+		if (alert->window.IsValid())
+			return GL_HAIKU_ALERT_PENDING;
+		/* The window is gone. It invokes before it quits, so an answer given just now is in the semaphore
+		 * already; otherwise it was closed without one (the application is quitting, for instance). */
+		do {
+			status = acquire_sem_etc(alert->invoker->fSem, 1, B_RELATIVE_TIMEOUT, 0);
+		} while (status == B_INTERRUPTED);
+		if (status != B_OK) {
+			/* the window thread has ended: nobody can reach the invoker any more */
+			delete alert->invoker;
+			delete alert;
+			return GL_HAIKU_ALERT_WAIT;
+		}
+	}
 
 	const int answer = (int)atomic_get(&alert->invoker->fAnswer);
-	/* the alert quits itself after an answer */
+	/* the alert quits itself after an answer; Invoke() touches nothing after releasing the semaphore */
 	delete alert->invoker;
 	delete alert;
-	return answer < 0 ? 0 : answer;
+	return answer == GL_HAIKU_ALERT_ACTION ? GL_HAIKU_ALERT_ACTION : GL_HAIKU_ALERT_WAIT;
 }
 
 extern "C" void gl_haiku_alert_close(struct gl_haiku_alert *alert)
