@@ -222,13 +222,14 @@ extern "C" bool obs_haiku_route_streams(const char *device_id)
 /* The routing worker. It lives while there are players (or a request): it returns by itself when the last
  * player is gone and nothing is pending, so neither destroying a player nor creating one ever waits for a
  * round trip to the mixer. The state is never destroyed, so no joinable std::thread is left to a static
- * destructor at exit. */
+ * destructor at exit; route_worker_joiner (below) joins a worker that is still running then. */
 struct RouteWorker {
 	std::mutex mutex;
 	std::condition_variable cond;
 	std::thread thread;
 	bool running = false; /* the thread is in its loop: a request needs no new thread */
 	bool pending = false;
+	bool quit = false; /* exit(): no new request is carried out */
 	std::string device_id;
 	int players = 0;
 };
@@ -245,6 +246,8 @@ static void route_worker_run()
 	RouteWorker &w = route_worker();
 	std::unique_lock<std::mutex> lock(w.mutex);
 	for (;;) {
+		if (w.quit)
+			break;
 		if (!w.pending) {
 			if (w.players == 0)
 				break;
@@ -264,7 +267,7 @@ static void route_worker_run()
 /* With the lock held. A thread that has left its loop is joined first: it is returning, not waiting. */
 static void route_worker_ensure(RouteWorker &w)
 {
-	if (w.running)
+	if (w.running || w.quit)
 		return;
 	if (w.thread.joinable())
 		w.thread.join();
@@ -299,9 +302,38 @@ static void route_worker_player_removed()
 	std::lock_guard<std::mutex> lock(w.mutex);
 	if (w.players > 0)
 		w.players--;
+	/* With no player there is no stream of OBS left to route: a request still waiting would only fail
+	 * ("no stream of OBS"), so drop it and let the worker leave right after the round trip it may be in.
+	 * That keeps the time it runs after the last monitor is gone (obs_shutdown()) as short as possible. */
+	if (w.players == 0)
+		w.pending = false;
 	/* an idle worker leaves when it wakes and finds no players */
 	w.cond.notify_all();
 }
+
+/*
+ * A worker can still be in a round trip when the process exits: a monitor created or reset just before OBS
+ * quits, or monitors that were never destroyed. libmedia's own static destructor (MediaRosterUndertaker in
+ * src/kits/media/MediaRoster.cpp) quits the roster's looper and deletes the port pool every roster call uses,
+ * so the worker must be gone before it runs. libobs links libmedia, so libobs's static objects are destroyed
+ * first, and this one waits for the worker there: at most the round trip it is in (bounded by the Media Kit's
+ * timeouts); a waiting worker is woken and leaves at once.
+ */
+static struct RouteWorkerJoiner {
+	~RouteWorkerJoiner()
+	{
+		RouteWorker &w = route_worker();
+		std::thread thread;
+		{
+			std::lock_guard<std::mutex> lock(w.mutex);
+			w.quit = true;
+			thread = std::move(w.thread);
+		}
+		w.cond.notify_all();
+		if (thread.joinable())
+			thread.join();
+	}
+} route_worker_joiner;
 
 /* ------------------------------------------------------------------------- */
 /* Players                                                                   */

@@ -163,7 +163,8 @@ void *browser_create(obs_data_t *settings, obs_source_t *source)
 	 * pacing (ready_async_frame() in obs-source.c) only moves its clock on (last_frame_ts += sys_offset) while
 	 * frames are queued: after a static page, the first frame of a change and every frame after it would be
 	 * shown late by the length of the pause (up to MAX_TS_VAR, 2 s, after which it resynchronises). Frames
-	 * are stamped when the helper publishes them, so buffering has nothing to smooth out here.
+	 * are stamped when the I/O thread has copied them out of the helper's buffer (OutputFrame()), not with a
+	 * time of their own, so buffering has nothing to smooth out here.
 	 */
 	obs_source_set_async_unbuffered(source, true);
 	HaikuBrowserClient::Callbacks callbacks;

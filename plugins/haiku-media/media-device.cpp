@@ -27,6 +27,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <system_error>
 
 #include <Looper.h>
 #include <MediaAddOn.h>
@@ -857,7 +858,14 @@ HaikuCapture::HaikuCapture(obs_source_t *source_, const char *recorder_name_, me
 	  on_closed(std::move(on_closed_))
 {
 	register_capture(this);
-	thread = std::thread([this]() { Run(); });
+	/* An exception from here would leave through the source's create callback, a C function, and end in
+	 * std::terminate(). Without the thread the source stays silent (or black); ~HaikuCapture() copes. */
+	try {
+		thread = std::thread([this]() { Run(); });
+	} catch (const std::system_error &error) {
+		blog(LOG_ERROR, "[haiku-media] '%s': cannot start the capture thread: %s", obs_source_get_name(source),
+		     error.what());
+	}
 }
 
 HaikuCapture::~HaikuCapture()

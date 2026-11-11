@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <system_error>
 
 extern char **environ;
 
@@ -168,9 +169,19 @@ public:
 			waitpid(pid, nullptr, 0);
 			return;
 		}
+		if (!thread.joinable()) {
+			/* Called on a client's I/O thread: an exception would end in std::terminate() there */
+			try {
+				thread = std::thread([this]() { Run(); });
+			} catch (const std::system_error &) {
+				/* no reaper: end the helper now rather than leave it running unwaited */
+				lock.unlock();
+				kill(pid, SIGKILL);
+				waitpid(pid, nullptr, 0);
+				return;
+			}
+		}
 		pending.push_back({pid, system_time() + REAP_GRACE, false});
-		if (!thread.joinable())
-			thread = std::thread([this]() { Run(); });
 		cond.notify_one();
 	}
 
@@ -262,7 +273,13 @@ HaikuBrowserClient::HaikuBrowserClient(const char *log_name, Callbacks callbacks
 		BLOG(LOG_ERROR, "cannot set up the helper event loop (%s); this browser stays empty", strerror(errno));
 		return;
 	}
-	thread = std::thread([this]() { Run(); });
+	/* An exception from here would leave through a C callback (the source's create) and end in
+	 * std::terminate(); without the thread no helper is started and the browser stays empty. */
+	try {
+		thread = std::thread([this]() { Run(); });
+	} catch (const std::system_error &error) {
+		BLOG(LOG_ERROR, "cannot start the helper I/O thread (%s); this browser stays empty", error.what());
+	}
 }
 
 HaikuBrowserClient::~HaikuBrowserClient()
