@@ -15,7 +15,8 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
-/* Video capture devices (webcams via the usb_webcam add-on, TV tuners, ...) through the Media Kit. */
+/* Video capture devices through the Media Kit's producer nodes: UVC webcams (Renga's usb_webcam add-on
+ * delivers B_RGB32, converting YUY2 and decoding MJPEG itself), "Demo Video Producer", TV tuners, ... */
 
 #include "media-device.hpp"
 
@@ -156,8 +157,10 @@ void *video_input_create(obs_data_t *settings, obs_source_t *source)
 	VideoInput *vi = new VideoInput;
 	vi->source = source;
 	vi->capture = std::make_unique<HaikuCapture>(
-		source, "OBS Video Input", B_MEDIA_RAW_VIDEO,
-		[vi](const void *data, size_t size, const media_format &format) { vi->OnBuffer(data, size, format); },
+		source, "OBS Video Input", B_MEDIA_RAW_VIDEO, HaikuCaptureKind::Device,
+		[vi](const void *data, size_t size, const media_format &format, const media_header &) {
+			vi->OnBuffer(data, size, format);
+		},
 		[vi](const media_format &format, const HaikuOpenResult &result) { vi->OnOpened(format, result); },
 		[vi]() { obs_source_output_video(vi->source, nullptr); });
 	video_input_update(vi, settings);
@@ -209,19 +212,21 @@ obs_properties_t *video_input_properties(void *data)
 	VideoInput *vi = static_cast<VideoInput *>(data);
 	obs_properties_t *props = obs_properties_create();
 
-	obs_property_t *list = obs_properties_add_list(props, S_DEVICE_ID, T_("Device"), OBS_COMBO_TYPE_LIST,
-						       OBS_COMBO_FORMAT_STRING);
-	HaikuFillDeviceList(list, B_MEDIA_RAW_VIDEO);
-	obs_property_set_modified_callback(list, video_input_device_modified);
-
-	obs_property_t *sizes = obs_properties_add_list(props, S_RESOLUTION, T_("Resolution"), OBS_COMBO_TYPE_LIST,
-							OBS_COMBO_FORMAT_STRING);
 	std::string device_id = HAIKU_MEDIA_DEFAULT_DEVICE, resolution = HAIKU_MEDIA_DEFAULT_SIZE;
 	if (vi) {
 		std::lock_guard<std::mutex> lock(vi->settings_mutex);
 		device_id = vi->device_id;
 		resolution = vi->resolution;
 	}
+
+	/* reloaded whenever a camera is plugged in or removed (HaikuCapture::DevicesChanged()) */
+	obs_property_t *list = obs_properties_add_list(props, S_DEVICE_ID, T_("Device"), OBS_COMBO_TYPE_LIST,
+						       OBS_COMBO_FORMAT_STRING);
+	HaikuFillDeviceList(list, B_MEDIA_RAW_VIDEO, device_id.c_str());
+	obs_property_set_modified_callback(list, video_input_device_modified);
+
+	obs_property_t *sizes = obs_properties_add_list(props, S_RESOLUTION, T_("Resolution"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
 	HaikuFillVideoSizeList(sizes, device_id, resolution.c_str());
 	obs_property_set_long_description(sizes, T_("Resolution.Description"));
 

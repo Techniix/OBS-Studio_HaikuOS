@@ -17,6 +17,7 @@
 
 #include "media-device.hpp"
 
+#include <util/dstr.h>
 #include <util/threading.h>
 
 #include <algorithm>
@@ -33,15 +34,19 @@
 #include <Messenger.h>
 #include <OS.h>
 
+/* Renga private header (headers/private/media, header-only on public Media Kit API): the system mixer's
+ * per-application streams and the loopback flavor. PORTING.md, "Per-application audio, routing and loopback". */
+#include <AudioStreamControl.h>
+
 #define T_(text) obs_module_text(text)
 
 /* retry delays for a device that can't be opened */
 #define RETRY_FIRST_US 1000000
 #define RETRY_MAX_US 10000000
-/* how often an open device is checked */
-#define HEALTH_CHECK_US 1000000
-/* how often an open device's add-on is asked whether it still publishes the device */
-#define PUBLISH_CHECK_US 3000000
+/* an open device whose flavor was missing from the device list is looked up once more after this */
+#define RECHECK_US 1000000
+/* how long the supervisor sleeps when it has nothing scheduled; Configure() and Media Kit events wake it */
+#define IDLE_US 60000000
 /* a device open this long counts as working again: its next failure is logged and retried quickly */
 #define STABLE_US 10000000
 
@@ -69,13 +74,25 @@ static std::vector<dormant_node_info> dormant_capture_nodes(media_type type)
 
 	media_format format = raw_format(type);
 
+	/* Sound cards are the physical inputs with a raw audio output. Cameras are listed the way PORTING.md
+	 * says ("Sound cards and cameras that come and go", as CodyCam's Camera menu does): every producer with
+	 * a raw video output. That includes "Demo Video Producer", which is not a physical input
+	 * (video_producer_demo/AddOn.cpp) and is how a setup is tested without a camera. */
+	const uint64 kinds = type == B_MEDIA_RAW_AUDIO ? B_BUFFER_PRODUCER | B_PHYSICAL_INPUT : B_BUFFER_PRODUCER;
+
 	int32 count = 64;
 	nodes.resize((size_t)count);
-	err = roster->GetDormantNodes(nodes.data(), &count, NULL, &format, NULL, B_BUFFER_PRODUCER | B_PHYSICAL_INPUT);
+	err = roster->GetDormantNodes(nodes.data(), &count, NULL, &format, NULL, kinds);
 	if (err != B_OK || count < 0)
 		count = 0;
-
 	nodes.resize((size_t)std::min<int32>(count, 64));
+
+	/* the mixer's loopback is a physical input too (MixerAddOn.cpp); it has sources of its own */
+	nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+				   [](const dormant_node_info &info) {
+					   return strcmp(info.name, HAIKU_MEDIA_LOOPBACK_FLAVOR) == 0;
+				   }),
+		    nodes.end());
 	return nodes;
 }
 
@@ -97,27 +114,46 @@ std::vector<HaikuMediaDevice> HaikuEnumerateCaptureDevices(media_type type)
 	return devices;
 }
 
-void HaikuFillDeviceList(obs_property_t *list, media_type type)
+void HaikuFillDeviceList(obs_property_t *list, media_type type, const char *current)
 {
 	obs_property_list_clear(list);
 	obs_property_list_add_string(list, T_("Default"), HAIKU_MEDIA_DEFAULT_DEVICE);
 
-	for (const HaikuMediaDevice &device : HaikuEnumerateCaptureDevices(type))
+	bool found = !current || !*current || strcmp(current, HAIKU_MEDIA_DEFAULT_DEVICE) == 0;
+	for (const HaikuMediaDevice &device : HaikuEnumerateCaptureDevices(type)) {
 		obs_property_list_add_string(list, device.name.c_str(), device.id.c_str());
+		found = found || device.id == current;
+	}
+
+	if (!found) {
+		/* Devices are remembered by flavor name; one that is unplugged keeps its place in the list (the
+		 * capture uses the default device meanwhile and returns to it when it is back). */
+		struct dstr label = {0};
+		dstr_printf(&label, T_("DeviceNotConnected"), current);
+		const size_t index = obs_property_list_add_string(list, label.array, current);
+		obs_property_list_item_disable(list, index, true);
+		dstr_free(&label);
+	}
 }
 
 /* ------------------------------------------------------------------------------------------------------ */
 /* Frame sizes                                                                                            */
 
-/* Haiku's video producers have no way to list their frame sizes: the usb_webcam add-on's parameter web only
- * has picture controls, its FormatSuggestionRequested() answers only for B_MEDIA_ENCODED_VIDEO, and
- * BMediaRoster has no public call that reaches BBufferProducer::FormatProposal() except Connect(). What does
- * work is connecting with a specific size: usb_webcam's FormatProposal()/PrepareToConnect() pass it to the
- * camera driver, which accepts sizes the camera offers (UVC: exact matches of its uncompressed frame
- * descriptors) or adjusts it (older sensors clamp to their maximum, multiples of 16), and the format the
- * connection ends up with says which. So sizes are probed by connecting and disconnecting with each of
- * these, once per device and session, while the device is open for capture anyway. Larger sizes are left
- * out: Haiku's webcam drivers deliver uncompressed frames only, which USB cameras don't offer beyond this. */
+/* Renga's video producers still have no way to list their frame sizes or rates (checked in Renga's
+ * usb_webcam): the add-on's parameter web has an "Info" text and the camera's picture controls only
+ * (Producer.cpp NodeRegistered(), UVCCamDevice::AddParameters()), FormatSuggestionRequested() answers only
+ * for B_MEDIA_ENCODED_VIDEO and with one size (Producer.cpp), and BMediaRoster has no public call that
+ * reaches BBufferProducer::FormatProposal() except Connect(). The UVC driver does know the camera's frame
+ * descriptors (UVCCamDevice::fUncompressedFrames, fMJPEGFrames) but only uses them to accept or refuse a
+ * size: UVCCamDevice::AcceptVideoFrame() takes exact matches, YUY2 first, MJPEG (decoded by the add-on)
+ * otherwise; older sensors clamp or round the size instead. The frame interval is fixed at 30 fps
+ * (UVCCamDevice.cpp, request.frame_interval = 333333) while the format reports 5 (Producer.cpp FIELD_RATE),
+ * so there is no frame rate to choose or to trust.
+ *
+ * What does work is connecting with a specific size and looking at the format the connection ends up with.
+ * So sizes are probed by connecting and disconnecting with each of these, once per device and session,
+ * while the device is open for capture anyway. A list from the add-on would replace all of this; that is
+ * requested from Renga (docs/haiku/RENGA-REQUESTS.md). */
 static const HaikuVideoSize common_sizes[] = {
 	{160, 120},  {176, 144},  {320, 240},  {352, 288},   {640, 360},   {640, 480},  {800, 600},
 	{960, 540},  {1024, 576}, {1024, 768}, {1280, 720},  {1280, 800},  {1280, 960}, {1280, 1024},
@@ -248,10 +284,13 @@ bool own_port(port_id port)
 
 } // namespace
 
-HaikuRecorder::HaikuRecorder(const char *name, media_type type, BufferFunc func_)
-	: BMediaRecorder(name, type),
-	  func(std::move(func_))
+HaikuRecorder::HaikuRecorder(const char *name, media_type type_, HaikuCaptureKind kind_, BufferFunc func_)
+	: BMediaRecorder(name, type_),
+	  shared(new Shared),
+	  type(type_),
+	  kind(kind_)
 {
+	shared->func = std::move(func_);
 	if (InitCheck() != B_OK)
 		return; /* no node; MediaInput() would dereference it */
 	/* BMediaRecorderNode's input destination is its control port, set in its constructor */
@@ -263,11 +302,34 @@ HaikuRecorder::HaikuRecorder(const char *name, media_type type, BufferFunc func_
 
 HaikuRecorder::~HaikuRecorder()
 {
+	shared->delivering = false;
 	Close();
 	if (consumer_port >= 0) {
 		std::lock_guard<std::mutex> lock(own_ports_mutex);
 		own_ports[consumer_port] = system_time();
 	}
+}
+
+void HaikuRecorder::Deleter::operator()(HaikuRecorder *recorder) const
+{
+	if (!recorder)
+		return;
+	Shared *shared = recorder->shared;
+	/* ~BMediaRecorder() releases its node, whose DeleteHook (BMediaEventLooper) closes the control port and
+	 * joins the control thread, the only caller of BufferReceived(). Only then may `shared` go. */
+	delete recorder;
+	delete shared;
+}
+
+void HaikuRecorder::SetDelivering(bool on)
+{
+	shared->delivering = on;
+}
+
+void HaikuRecorder::SetConnectedFormat(const media_format &format)
+{
+	std::lock_guard<std::mutex> lock(shared->format_mutex);
+	shared->connected_format = format;
 }
 
 static void set_size(media_format &format, const HaikuVideoSize &size)
@@ -327,7 +389,108 @@ void HaikuRecorder::ProbeSizes(const std::string &key, media_output &output, con
 	size_cache[key] = std::move(accepted);
 }
 
-HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, media_type type, HaikuVideoSize size, bool probe,
+/* The rate to ask the loopback for. MixerTap converts the mix to whatever rate the connection has, but with
+ * a linear-interpolation resampler that runs in the mixer's mix thread with the mixer core locked
+ * (MixerTap::Push()). Asking for the rate the mixer mixes at makes that a plain copy, and libobs resamples
+ * to its own rate with its (better) resampler where the two differ. The mix rate is the rate of the mixer's
+ * output connection (MixerCore::_ApplyOutputFormat()). */
+static status_t mixer_rate(BMediaRoster *roster, float *rate)
+{
+	media_node mixer;
+	status_t err = roster->GetAudioMixer(&mixer);
+	if (err != B_OK)
+		return err;
+
+	media_output output;
+	int32 count = 0;
+	err = roster->GetConnectedOutputsFor(mixer, &output, 1, &count);
+	roster->ReleaseNode(mixer);
+	if (err != B_OK)
+		return err;
+	if (count < 1 || output.format.type != B_MEDIA_RAW_AUDIO)
+		return B_MEDIA_NOT_CONNECTED;
+
+	*rate = output.format.u.raw_audio.frame_rate;
+	return B_OK;
+}
+
+HaikuOpenResult HaikuRecorder::OpenLoopback(const std::string &signature)
+{
+	HaikuOpenResult result;
+	BMediaRoster *roster = BMediaRoster::CurrentRoster(); /* Open() made sure there is one */
+
+	/* The system mixer has to be there first: a loopback attaches itself to it when it is registered
+	 * (MixerTap::NodeRegistered() -> AudioMixer::AttachLoopback()) and is not picked up later if there was
+	 * none (after the media services were restarted, say); it would connect fine and stay silent. */
+	float rate = 0.0f;
+	status_t err = mixer_rate(roster, &rate);
+	if (err != B_OK) {
+		result.error = err;
+		result.reason = "the system mixer is not running (yet)";
+		return result;
+	}
+	/* what MixerTap accepts (format_supported() in MixerTap.cpp); a mixer without a sane rate gets OBS's */
+	if (!(rate >= 4000.0f && rate <= 384000.0f))
+		rate = (float)audio_output_get_sample_rate(obs_get_audio());
+
+	/* Finds the flavor among the physical inputs, instantiates it in the media add-on server
+	 * (B_FLAVOR_IS_GLOBAL; each instance is independent) and sets its text parameter
+	 * "renga:loopback_signature"; releases the node again if that fails. */
+	err = BPrivate::AudioStreamControl::StartLoopback(signature.c_str(), &node);
+	if (err != B_OK) {
+		result.error = err;
+		result.reason = "the system mixer's loopback (\"" RENGA_LOOPBACK_FLAVOR_NAME "\") is not available";
+		return result;
+	}
+	have_node = true;
+	have_dormant = roster->GetDormantNodeFor(node, &dormant) == B_OK;
+
+	media_output output;
+	int32 count = 0;
+	err = roster->GetFreeOutputsFor(node, &output, 1, &count, B_MEDIA_RAW_AUDIO);
+	if (err != B_OK || count < 1) {
+		result.error = err != B_OK ? err : B_BUSY;
+		result.reason = "the loopback has no free output";
+		Close();
+		return result;
+	}
+
+	/* Float stereo: the tap holds the mix as float and only ever fills two channels, whatever the
+	 * connection has (MixerTap::Push() zeroes the others and averages for mono), so this is the one format
+	 * that is copied as it is (memcpy in MixerTap::_SendBuffers()) and that OBS takes without conversion.
+	 * The buffer size stays a wildcard: the tap fills in its preferred 1024 frames. */
+	media_format format = raw_format(B_MEDIA_RAW_AUDIO);
+	format.u.raw_audio.format = media_raw_audio_format::B_AUDIO_FLOAT;
+	format.u.raw_audio.channel_count = 2;
+	format.u.raw_audio.byte_order = B_MEDIA_HOST_ENDIAN;
+	format.u.raw_audio.frame_rate = rate;
+
+	SetAcceptedFormat(format);
+	err = BMediaRecorder::Connect(node, &output, &format);
+	if (err != B_OK) {
+		result.error = err;
+		result.reason = "connecting to the loopback failed";
+		Close();
+		return result;
+	}
+	/* MediaInput() carries the format that was actually negotiated */
+	SetConnectedFormat(MediaInput().format);
+
+	/* The loopback is no time source, so this is BMediaRoster::StartNode(); MixerTap::Start() runs at once
+	 * whatever the time given, and the mixer mixes silence for a loopback while nothing plays. */
+	err = Start();
+	if (err != B_OK) {
+		result.error = err;
+		result.reason = "starting the loopback failed";
+		Close();
+		return result;
+	}
+
+	opened = true;
+	return result;
+}
+
+HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, HaikuVideoSize size, bool probe,
 				    bool allow_fallback)
 {
 	HaikuOpenResult result;
@@ -346,6 +509,9 @@ HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, media_type typ
 		result.reason = "no media roster";
 		return result;
 	}
+
+	if (kind == HaikuCaptureKind::Loopback)
+		return OpenLoopback(device_id);
 
 	err = acquire_node(device_id, type, &node, &result.used_fallback, allow_fallback);
 	if (err != B_OK) {
@@ -434,12 +600,11 @@ HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, media_type typ
 		return result;
 	}
 
-	{
-		std::lock_guard<std::mutex> lock(format_mutex);
-		/* MediaInput() carries the format that was actually negotiated */
-		connected_format = MediaInput().format;
-	}
+	/* MediaInput() carries the format that was actually negotiated */
+	SetConnectedFormat(MediaInput().format);
 
+	/* Buffers only arrive from here on: the connection is made muted (B_CONNECT_MUTED in
+	 * BMediaRecorder::_Connect()) and Start() enables the data. */
 	err = Start();
 	if (err != B_OK) {
 		result.error = err;
@@ -460,7 +625,9 @@ void HaikuRecorder::Close()
 		Disconnect();
 
 	if (have_node) {
-		BMediaRoster::Roster()->ReleaseNode(node);
+		/* For a loopback this is the only reference: the media add-on server deletes the instance. */
+		if (BMediaRoster *roster = BMediaRoster::CurrentRoster())
+			roster->ReleaseNode(node);
 		have_node = false;
 	}
 	have_dormant = false;
@@ -470,8 +637,8 @@ void HaikuRecorder::Close()
 
 media_format HaikuRecorder::ConnectedFormat()
 {
-	std::lock_guard<std::mutex> lock(format_mutex);
-	return connected_format;
+	std::lock_guard<std::mutex> lock(shared->format_mutex);
+	return shared->connected_format;
 }
 
 bool HaikuRecorder::NodeAlive() const
@@ -504,24 +671,34 @@ bool HaikuRecorder::DevicePublished() const
 	return false;
 }
 
-void HaikuRecorder::BufferReceived(void *buffer, size_t size, const media_header &)
+/* recorder thread; touches nothing but `shared` (see the class comment) */
+void HaikuRecorder::BufferReceived(void *buffer, size_t size, const media_header &header)
 {
+	Shared *const s = shared;
+	if (!s->func || !s->delivering)
+		return;
+
 	media_format format;
 	{
-		std::lock_guard<std::mutex> lock(format_mutex);
-		format = connected_format;
+		std::lock_guard<std::mutex> lock(s->format_mutex);
+		format = s->connected_format;
 	}
-
-	if (func && delivering)
-		func(buffer, size, format);
+	s->func(buffer, size, format, header);
 }
 
 /* ------------------------------------------------------------------------------------------------------ */
 /* Media Kit notifications                                                                                */
 
 /* One looper for the module receives the notifications that tell us a device may have come or gone, and
- * wakes every HaikuCapture. They only speed things up: HaikuCapture also checks on its own, because not
- * every Haiku release sends every notification (B_MEDIA_DEFAULT_CHANGED, for one, is never sent). */
+ * wakes every HaikuCapture. On Renga they are what device handling relies on (there is no polling):
+ *  - B_MEDIA_FLAVORS_CHANGED: an add-on's devices changed. multi_audio's device watcher and usb_webcam call
+ *    BMediaAddOn::NotifyFlavorChange() when a sound card or camera is plugged in or removed
+ *    (MultiAudioAddOn.cpp, usb_webcam/AddOn.cpp CameraAdded()/CameraRemoved()); the media add-on server
+ *    rescans the add-on and sends the notification (MediaAddonServer.cpp, end of _ScanAddOnFlavors()).
+ *  - B_MEDIA_NODE_DELETED: a node was unregistered, or the media server cleaned up after a team that died,
+ *    such as a crashed media add-on server (NodeManager::CleanupTeam(), which also reports the flavors).
+ *  - B_MEDIA_SERVER_QUIT / B_MEDIA_SERVER_STARTED: from this team's own BMediaRoster.
+ *  - B_MEDIA_CONNECTION_BROKEN: some connection ended; a busy device may be free. */
 namespace {
 
 std::mutex captures_mutex;
@@ -539,6 +716,13 @@ void wake_captures(bool retry, bool server_quit, bool broken = false)
 		capture->Wake(retry, server_quit, broken);
 }
 
+void devices_changed()
+{
+	std::lock_guard<std::mutex> lock(captures_mutex);
+	for (HaikuCapture *capture : captures)
+		capture->DevicesChanged();
+}
+
 /* a broken connection whose consumer is one of our recorders: we disconnected it ourselves */
 bool own_connection(BMessage *msg)
 {
@@ -553,7 +737,7 @@ bool own_connection(BMessage *msg)
 
 /* posted by register_capture(): StartWatching() waits on the media server (up to its timeouts), which the
  * thread creating a source (often the UI thread) must not */
-#define MSG_WATCH 'hmWa'
+#define MSG_WATCH 0x686d5761 /* 'hmWa' */
 
 class MediaWatcher : public BLooper {
 public:
@@ -605,6 +789,7 @@ public:
 			return;
 		case B_MEDIA_FLAVORS_CHANGED: /* a device was plugged in or removed */
 			wake_captures(true, false);
+			devices_changed();
 			return;
 		case B_MEDIA_NODE_DELETED:
 			/* only a reason to check open devices: retrying on it would wake on our own recorders */
@@ -629,7 +814,8 @@ void register_capture(HaikuCapture *capture)
 		/* can't happen short of running out of threads or ports; a looper whose Run() failed half-way
 		 * can't be deleted safely, so it is left alone (it is tiny) */
 		watcher = nullptr;
-		blog(LOG_WARNING, "[haiku-media] no Media Kit notifications; devices are checked by polling only");
+		blog(LOG_ERROR, "[haiku-media] cannot start the Media Kit notification looper; devices that are "
+				"unplugged or plugged in will not be noticed");
 		return;
 	}
 	watcher->PostMessage(MSG_WATCH);
@@ -660,10 +846,12 @@ void unregister_capture(HaikuCapture *capture)
 /* HaikuCapture                                                                                           */
 
 HaikuCapture::HaikuCapture(obs_source_t *source_, const char *recorder_name_, media_type type_,
-			   HaikuRecorder::BufferFunc on_buffer_, OpenedFunc on_opened_, ClosedFunc on_closed_)
+			   HaikuCaptureKind kind_, HaikuRecorder::BufferFunc on_buffer_, OpenedFunc on_opened_,
+			   ClosedFunc on_closed_)
 	: source(source_),
 	  recorder_name(recorder_name_),
 	  type(type_),
+	  kind(kind_),
 	  on_buffer(std::move(on_buffer_)),
 	  on_opened(std::move(on_opened_)),
 	  on_closed(std::move(on_closed_))
@@ -716,6 +904,15 @@ void HaikuCapture::Wake(bool retry, bool server_quit, bool broken)
 	cv.notify_all();
 }
 
+/* Watcher looper thread, with the list of captures locked (so this capture is not being destroyed). The
+ * signal only tells listeners to reload the properties; the frontend's handlers queue that to the UI thread,
+ * as they must for every source that updates its properties from a worker thread. */
+void HaikuCapture::DevicesChanged()
+{
+	if (kind == HaikuCaptureKind::Device)
+		obs_source_update_properties(source);
+}
+
 void HaikuCapture::Run()
 {
 	os_set_thread_name(type == B_MEDIA_RAW_VIDEO ? "haiku-video-capture" : "haiku-audio-capture");
@@ -754,6 +951,14 @@ void HaikuCapture::CloseRecorder(bool notify)
 		on_closed();
 }
 
+/* what is being captured, for the log */
+static std::string target_label(HaikuCaptureKind kind, const std::string &device_id)
+{
+	if (kind == HaikuCaptureKind::Loopback)
+		return device_id.empty() ? "the system mixer's loopback" : "the loopback of '" + device_id + "'";
+	return "'" + device_id + "'";
+}
+
 void HaikuCapture::StartStreak(const char *what, const Config &want, const HaikuOpenResult *result)
 {
 	if (in_streak)
@@ -762,20 +967,20 @@ void HaikuCapture::StartStreak(const char *what, const Config &want, const Haiku
 	recovery_logged = false;
 	broken_pulled = false;
 	if (result)
-		blog(LOG_WARNING, "[haiku-media] '%s': %s '%s': %s (%s); retrying in the background",
-		     obs_source_get_name(source), what, want.device_id.c_str(), result->reason.c_str(),
-		     strerror(result->error));
+		blog(LOG_WARNING, "[haiku-media] '%s': %s %s: %s (%s); retrying in the background",
+		     obs_source_get_name(source), what, target_label(kind, want.device_id).c_str(),
+		     result->reason.c_str(), strerror(result->error));
 	else
-		blog(LOG_WARNING, "[haiku-media] '%s': %s '%s'; reconnecting when it is back",
-		     obs_source_get_name(source), what, want.device_id.c_str());
+		blog(LOG_WARNING, "[haiku-media] '%s': %s %s; reconnecting when it is back",
+		     obs_source_get_name(source), what, target_label(kind, want.device_id).c_str());
 }
 
 /* After a successful open: logging and bookkeeping shared by Step() and SwitchFromFallback(). */
 void HaikuCapture::Opened(const Config &want, const HaikuOpenResult &result)
 {
 	if (in_streak && !recovery_logged) {
-		blog(LOG_INFO, "[haiku-media] '%s': '%s' is open again", obs_source_get_name(source),
-		     want.device_id.c_str());
+		blog(LOG_INFO, "[haiku-media] '%s': %s is open again", obs_source_get_name(source),
+		     target_label(kind, want.device_id).c_str());
 		recovery_logged = true;
 	}
 	if (result.used_fallback) {
@@ -787,7 +992,6 @@ void HaikuCapture::Opened(const Config &want, const HaikuOpenResult &result)
 		switch_failed_logged = false;
 	}
 	opened_at = system_time();
-	last_publish_check = opened_at;
 	unpublished_seen = 0;
 	using_fallback = result.used_fallback;
 
@@ -800,10 +1004,9 @@ void HaikuCapture::Opened(const Config &want, const HaikuOpenResult &result)
  * opened the fallback stays, and the switch is tried again later with the usual backoff. */
 bool HaikuCapture::SwitchFromFallback(const Config &want)
 {
-	auto candidate = std::make_unique<HaikuRecorder>(recorder_name.c_str(), type, on_buffer);
+	HaikuRecorderPtr candidate(new HaikuRecorder(recorder_name.c_str(), type, kind, on_buffer));
 	candidate->SetDelivering(false);
-	const HaikuOpenResult result =
-		candidate->Open(want.device_id, type, want.size, type == B_MEDIA_RAW_VIDEO, false);
+	const HaikuOpenResult result = candidate->Open(want.device_id, want.size, type == B_MEDIA_RAW_VIDEO, false);
 	if (result.error != B_OK) {
 		if (!switch_failed_logged) {
 			blog(LOG_WARNING, "[haiku-media] '%s': '%s' is available but cannot be opened: %s (%s); "
@@ -834,7 +1037,7 @@ bigtime_t HaikuCapture::Step(const Config &want, uint64_t gen, bool retry, bool 
 		in_streak = false;
 		backoff = 0;
 		applied_generation = UINT64_MAX; /* reactivating starts afresh */
-		return 60000000;                 /* Configure() wakes us */
+		return IDLE_US;                  /* Configure() wakes us */
 	}
 
 	if (gen != applied_generation) {
@@ -846,34 +1049,49 @@ bigtime_t HaikuCapture::Step(const Config &want, uint64_t gen, bool retry, bool 
 	}
 
 	if (recorder && recorder->IsOpen()) {
+		/* Checked when the Media Kit reports something (see the watcher above), not periodically. */
 		bool lost = server_quit || !recorder->NodeAlive();
-		if (!lost &&
-		    (check || retry || broken || unpublished_seen > 0 || now - last_publish_check >= PUBLISH_CHECK_US)) {
-			last_publish_check = now;
+		if (!lost && (check || retry || broken || unpublished_seen > 0)) {
 			/* twice in a row, so a list read while the add-on server rescans can't drop the device */
 			if (recorder->DevicePublished())
 				unpublished_seen = 0;
 			else
 				lost = ++unpublished_seen >= 2;
-
-			if (!lost && using_fallback && now >= switch_next && device_listed(want.device_id, type)) {
-				if (SwitchFromFallback(want))
-					return HEALTH_CHECK_US;
+		}
+		/* On the default device because the named one was missing: switch when a device arrives, and
+		 * again (with backoff) after a switch that failed. */
+		if (!lost && using_fallback && (retry || switch_backoff) && now >= switch_next) {
+			if (!device_listed(want.device_id, type)) {
+				/* not there (any more): nothing to retry until the devices change again */
+				switch_backoff = 0;
+			} else if (SwitchFromFallback(want)) {
+				return in_streak ? STABLE_US : IDLE_US;
+			} else {
 				switch_backoff = switch_backoff ? std::min<bigtime_t>(switch_backoff * 2, RETRY_MAX_US)
 								: RETRY_FIRST_US;
 				switch_next = system_time() + switch_backoff;
 			}
 		}
 		if (!lost) {
-			/* open long enough: a device that fails again starts a new streak (logged, quick retry) */
-			if (in_streak && now - opened_at >= STABLE_US) {
-				in_streak = false;
-				backoff = 0;
+			bigtime_t wait = IDLE_US;
+			if (unpublished_seen > 0)
+				wait = RECHECK_US;
+			if (in_streak) {
+				/* open long enough: a device that fails again starts a new streak (logged, quick
+				 * retry) */
+				if (now - opened_at >= STABLE_US) {
+					in_streak = false;
+					backoff = 0;
+				} else {
+					wait = std::min(wait, opened_at + STABLE_US - now);
+				}
 			}
-			return HEALTH_CHECK_US;
+			if (using_fallback && switch_backoff)
+				wait = std::min(wait, std::max<bigtime_t>(switch_next - system_time(), 0));
+			return wait;
 		}
 
-		StartStreak("lost the capture device", want, nullptr);
+		StartStreak("lost", want, nullptr);
 		CloseRecorder();
 		backoff = backoff ? std::min<bigtime_t>(backoff * 2, RETRY_MAX_US) : RETRY_FIRST_US;
 		next_attempt = now + backoff;
@@ -893,9 +1111,9 @@ bigtime_t HaikuCapture::Step(const Config &want, uint64_t gen, bool retry, bool 
 		return next_attempt - now;
 
 	last_attempt = now;
-	recorder = std::make_unique<HaikuRecorder>(recorder_name.c_str(), type, on_buffer);
+	recorder.reset(new HaikuRecorder(recorder_name.c_str(), type, kind, on_buffer));
 	/* Open() probes only a device that hasn't been probed yet */
-	const HaikuOpenResult result = recorder->Open(want.device_id, type, want.size, type == B_MEDIA_RAW_VIDEO);
+	const HaikuOpenResult result = recorder->Open(want.device_id, want.size, type == B_MEDIA_RAW_VIDEO);
 	if (result.error != B_OK) {
 		StartStreak("cannot open", want, &result);
 		recorder.reset();
@@ -905,5 +1123,5 @@ bigtime_t HaikuCapture::Step(const Config &want, uint64_t gen, bool retry, bool 
 	}
 
 	Opened(want, result);
-	return HEALTH_CHECK_US;
+	return in_streak ? STABLE_US : IDLE_US;
 }

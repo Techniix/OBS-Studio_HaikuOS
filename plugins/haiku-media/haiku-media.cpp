@@ -22,17 +22,20 @@ OBS_MODULE_USE_DEFAULT_LOCALE("haiku-media", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Haiku Media Kit audio and video capture";
+	return "Media Kit audio and video capture for Renga: sound card inputs, cameras, desktop audio and "
+	       "per-application audio through the system mixer's loopback";
 }
 
 extern void haiku_register_audio_input(void);
 extern void haiku_register_video_input(void);
 extern void haiku_register_desktop_audio(void);
+extern void haiku_register_application_audio(void);
 
 bool obs_module_load(void)
 {
 	haiku_register_audio_input();
 	haiku_register_video_input();
 	haiku_register_desktop_audio();
+	haiku_register_application_audio();
 	return true;
 }

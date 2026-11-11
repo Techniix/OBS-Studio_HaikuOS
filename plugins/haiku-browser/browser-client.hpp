@@ -16,25 +16,32 @@
 ******************************************************************************/
 
 /*
- * OBS-process side of one HaikuWebKit page: owns the shared frame area, starts (and restarts) the
- * obs-haiku-browser helper, sends it configuration and input, and reads frames. Used by both the browser
- * source and the browser docks. Thread-safe: input usually comes from the UI thread while another thread
- * polls frames.
+ * OBS-process side of one HaikuWebKit page: starts (and restarts) the obs-haiku-browser helper, sends it
+ * configuration and input, and receives its frames and page information. Used by both the browser source and
+ * the browser docks. See browser-ipc.hpp for the protocol.
+ *
+ * Threads: every public method may be called from any thread and never waits for the helper; it queues a
+ * message and returns. One I/O thread per client owns the helper process, its socket and the mapped frame
+ * buffer, and sleeps in epoll_wait() on {socket, frame eventfd, wake-up eventfd}. The callbacks run on that
+ * thread.
  */
 
 #pragma once
 
-#include "browser-shm.h"
+#include "browser-ipc.hpp"
 
 #include <Message.h>
-#include <Messenger.h>
 #include <OS.h>
 
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/types.h>
+#include <time.h>
 
 struct HaikuBrowserConfig {
 	std::string url;
@@ -45,8 +52,9 @@ struct HaikuBrowserConfig {
 	bool transparent = true;
 };
 
+/* Only valid during the frame callback */
 struct HaikuBrowserFrame {
-	std::vector<uint8_t> pixels; /* BGRA, `stride` bytes per row */
+	const uint8_t *pixels = nullptr; /* BGRA, `stride` bytes per row */
 	uint32_t width = 0;
 	uint32_t height = 0;
 	uint32_t stride = 0;
@@ -55,30 +63,30 @@ struct HaikuBrowserFrame {
 
 class HaikuBrowserClient {
 public:
-	/* storage_path: WebKit persistent storage (local storage, databases) for this page; empty = shared default */
-	explicit HaikuBrowserClient(const char *log_name, const std::string &storage_path = std::string());
+	/* Called on the client's I/O thread, never after Stop() or the destructor returned. They must not call
+	 * back into the client's Stop() or destroy it. */
+	struct Callbacks {
+		/* a new complete frame */
+		std::function<void(const HaikuBrowserFrame &)> frame;
+		/* the page's title or URL changed (may be empty) */
+		std::function<void(const std::string &title, const std::string &url)> info;
+	};
+
+	/* storage_path: WebKit persistent storage (cookies, local storage) for this page; empty = shared default */
+	HaikuBrowserClient(const char *log_name, Callbacks callbacks, const std::string &storage_path = std::string());
 	~HaikuBrowserClient();
 
 	HaikuBrowserClient(const HaikuBrowserClient &) = delete;
 	HaikuBrowserClient &operator=(const HaikuBrowserClient &) = delete;
 
-	/* Applies a configuration; starts the helper on first use. Resizing reallocates the area if needed. */
+	/* Applies a configuration and remembers it for helpers started later. The first call starts the helper
+	 * (unless the client is stopped). */
 	void Configure(const HaikuBrowserConfig &config);
 
-	/* Stops the helper (e.g. "shutdown when not visible"); the next Configure()/Poll() after Start() brings
-	 * it back with the last configuration. */
+	/* Stop() ends the helper (e.g. "shutdown when not visible") and keeps it down; when it returns no
+	 * callback is running and none follows. Start() brings the helper back with the last configuration. */
 	void Stop();
 	void Start();
-	bool Running() const;
-
-	/* Heartbeat, crash detection/restart and pending configuration. Call regularly (every frame or so). */
-	void Poll();
-
-	/* Copies the newest complete frame if it is newer than the last one returned. */
-	bool ReadFrame(HaikuBrowserFrame &frame);
-
-	/* Page information (for docks); returns true when it changed since the last call. */
-	bool ReadInfo(std::string &title, std::string &url);
 
 	void Reload(bool nocache);
 	void ExecuteJavaScript(const std::string &script);
@@ -97,56 +105,85 @@ public:
 	void Focus(bool focus);
 
 private:
-	bool CreateArea(uint32_t width, uint32_t height);
-	void DestroyArea();
-	void RetireArea();
-	bool TrySendAttach();
-	bool AttachInFlight() const;
-	bool NeedsBiggerArea() const;
-	obs_browser_shm *HelperShm() const;
-	bool SpawnHelper();
+	/* any thread */
+	void Post(const BMessage &message, bool mouse_move = false);
+	void Wake();
+
+	/* I/O thread */
+	void Run();
+	bool Spawn(bigtime_t now);
 	void ScheduleRestart(bigtime_t now);
-	void StopHelper();
-	bool HelperAlive() const;
-	bool SendLocked(BMessage &message);
-	void SendConfigLocked();
+	void CloseHelper();
+	void HelperDied(bigtime_t now);
+	void KillHelper(bigtime_t now, const char *why, const std::string &crash_report = std::string());
+	void Housekeeping(bigtime_t now);
+	void ReadSocket(bigtime_t now);
+	bool HandleEvent(const uint8_t *payload, size_t size, bigtime_t now);
+	bool MapBuffer(int fd);
+	void UnmapBuffer();
+	void ReadFrame();
+	void Flush(bigtime_t now);
+	void WatchSocket(bool writable);
+	void HelperExited(bigtime_t now, pid_t pid, int status);
+	template<typename Call> void Deliver(Call &&call);
+	bool EnqueueLocked(std::vector<uint8_t> &&bytes, bool mouse_move);
+	void QueueConfigLocked();
 
-	mutable std::mutex mutex;
-	std::string name;
-	std::string storage;
+	const std::string name;
+	const std::string storage;
+	const Callbacks callbacks;
 
+	/* --- shared, under `mutex` --- */
+	std::mutex mutex;
 	HaikuBrowserConfig config;
-	bool config_dirty = false;
+	bool have_config = false;
+	std::string startup_script;
 	bool stopped = false;
+	bool quit = false;
+	bool reset_backoff = false;
+	bool connected = false; /* a helper is running: messages are queued for it */
+	std::deque<std::vector<uint8_t>> queue;
+	size_t queue_bytes = 0;
+	bool queue_tail_is_move = false;
+	bool queue_overflow_logged = false;
 
-	area_id area = -1;
-	obs_browser_shm *shm = nullptr;
-	uint32_t area_width = 0, area_height = 0;
+	/* Held by the I/O thread around a callback; Stop() passes through it so that it returns only once a
+	 * callback that was already running is done. Never held together with `mutex` by the same thread while
+	 * waiting for the other. */
+	std::mutex deliver_mutex;
 
-	/* false once a helper was started on (or told to attach) the current area: a new helper then gets a
-	 * fresh area, so a previous one that is still shutting down can never write into the same frames */
-	bool area_fresh = false;
-
-	/* Until the helper confirms a switch to a bigger area (it writes its team into the new header), it keeps
-	 * using the previous one: keep that mapped, read the helper's state from it and keep its heartbeat
-	 * going. attach_pending: the switch has not been sent yet. */
-	area_id retired_area = -1;
-	obs_browser_shm *retired_shm = nullptr;
-	bool attach_pending = false;
-	bigtime_t attach_sent = 0;
-	bool resize_deferred = false; /* a bigger area is needed but a switch is still in flight */
-
-	BMessenger messenger;
-
+	/* --- I/O thread only (after construction) --- */
+	std::thread thread;
+	int epoll_fd = -1;
+	int wake_fd = -1;  /* eventfd: queue or state changed */
+	int frame_fd = -1; /* eventfd: the helper finished a frame; one per helper */
+	int sock = -1;
+	bool sock_writable_watched = false;
 	pid_t helper = -1;
+
 	bigtime_t helper_started = 0;
+	time_t helper_started_wall = 0;
+	bigtime_t last_alive = 0; /* start, hello or the last answered ping */
+	bigtime_t last_ping = 0;
+	bigtime_t last_crash_check = 0;
+	int32 ping_serial = 0;
+	bool ping_outstanding = false;
+	bool hello = false;
 	bigtime_t next_restart = 0;
 	int restarts = 0;
 	bool spawn_failing = false; /* logged once per streak of failed starts */
-	bool ready = false;
 
-	std::string startup_script;
-	int64_t last_frame = -1;
-	int32_t last_info = -1;
-	int32_t pending_buttons = 0;
+	std::vector<uint8_t> rx;
+	std::deque<int> rx_fds; /* descriptors received, in order, for the buffer events being parsed */
+	std::vector<uint8_t> sending;
+	size_t sending_offset = 0;
+
+	const uint8_t *map = nullptr; /* read-only mapping of the helper's current frame memfd */
+	size_t map_size = 0;
+	uint64_t last_frame = 0;
+	bool have_last_frame = false;
+	std::vector<uint8_t> copy;
 };
+
+/* Waits for helpers that are still shutting down; call from obs_module_unload(). */
+void haiku_browser_shutdown(void);
