@@ -94,8 +94,8 @@ cmake --build build
 
 AJA, DeckLink, NVENC/QSV/VA-API and the Linux capture plugins have no Haiku drivers and are skipped.
 
-The build produces two helper programs next to `obs` in `bin/`: `obs-haiku-audio-tap` (desktop audio) and
-`obs-haiku-browser` (browser rendering). OBS starts them itself; they must stay in the same directory as `obs`
+The build produces helper programs next to `obs` in `bin/`, including `obs-haiku-browser` (browser rendering).
+OBS starts them itself; they must stay in the same directory as `obs`
 (or be installed to `/boot/home/config/non-packaged/bin`).
 
 ## 4. Run
@@ -125,7 +125,6 @@ cmake --install build
 | `HaikuWebKit not found` | `pkgman install haikuwebkit_devel`, or `-DENABLE_BROWSER=OFF`. |
 | `plugins/obs-browser submodule missing` warning | Browser docks are skipped; fetch `plugins/obs-browser` (step 1). |
 | Log says `[haiku-browser] ... helper ... is missing` | `obs-haiku-browser` isn't next to `obs`; rebuild or reinstall. |
-| No sound at all after OBS crashed while capturing desktop audio | Run `obs-haiku-audio-tap --repair` (in OBS's `bin` directory), or restart the media services in the Media preferences. |
 | `Could NOT find FFmpeg (... minimum required is "8.0")` | Install `ffmpeg8_devel` (and remove older FFmpeg devel packages). |
 | `Could NOT find OpenGL (missing: EGL)` | Install `mesa_devel`. |
 | `Could not find a package configuration file provided by "Qt6"` | Install `qt6_base_devel qt6_svg_devel`. |

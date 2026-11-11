@@ -21,6 +21,19 @@ Every step has a time limit; hangs are recorded with a thread listing and `listi
 Each OBS run uses a throwaway configuration in a temporary directory (`XDG_CONFIG_HOME`), so your own OBS
 settings, profiles and scenes are not touched. See `build-aux/haiku/test/make-config.sh` for what it contains.
 
+**Screen recording permission.** The first capture of an application shows the *Screen recording* prompt and waits
+up to 2 minutes for an answer, which would stall an unattended run. On this branch `test.sh` therefore runs the step
+`screen-permission` first: it saves the current decisions (`screen-recording-before.txt` and
+`screen-recording-after.txt` in the archive) and allows OBS with
+
+```sh
+ScreenRecording --set application/x-vnd.obs-studio allow
+```
+
+The permission stays granted afterwards, as if the prompt had been answered. To undo it, run
+`ScreenRecording --set application/x-vnd.obs-studio ask` (the next capture asks again) or use the *ScreenRecording*
+preferences. The step is skipped when the `ScreenRecording` command is missing.
+
 The last line printed is the archive on the Desktop (`obs-test-<branch>-<commit>-<time>.zip`). Send that file;
 `SUMMARY.txt` inside it has one PASS/FAIL/HANG/SKIPPED line per step. The manual checklist below is still
 needed for things the script cannot judge (preview, dialogs, docks, audio monitoring).
@@ -34,12 +47,17 @@ text and log lines are the most useful thing to send back.
 
 ## 0. What was verified before this test
 
+> **Renga branch.** This checklist is for the `renga` branch on Renga. Nothing changed for Renga (screen and
+> window capture, desktop and application audio, audio monitoring routing, hot-plug, the browser helper IPC and
+> crash-log lines) has been built with GCC or run yet; those sections are the first real test of that code. The
+> status paragraph below describes the earlier build on stock Haiku.
+
 **Status (2026-11-07):** on the maintainer's machine (x86-64, RTX 5070) the port builds, starts and records an MP4
 with Screen Capture, using the OSMesa renderer (`OBS_HAIKU_GL=osmesa`; before the driver self-test was added, the nvidia-haiku Zink path hung on a fence
-wait, a driver issue being fixed there). Desktop audio tap insertion works; the rest of this list is still open.
+wait, a driver issue being fixed there). The rest of this list is still open.
 
 Before that first build, it was checked with a harness
-(`build-aux/haiku/crosscheck/`), which now also covers the desktop audio helper, the browser helper and the browser
+(`build-aux/haiku/crosscheck/`), which also covers the browser helper and the browser
 dock code (HaikuWebKit's installed API headers are part of the harness sysroot):
 
 - CMake configures the whole project as `CMAKE_SYSTEM_NAME=Haiku` against Haiku-layout dependencies.
@@ -63,7 +81,7 @@ build-aux/haiku/build.sh           # fetches the submodules it needs
       plugins are disabled. Expected enabled on Haiku: obs-websocket, the new MPEG-TS output, `obs-browser`
       ("Browser docks (HaikuWebKit)"), `haiku-capture`, `haiku-media`.
 - [ ] The build finishes.
-- [ ] `build/rundir/RelWithDebInfo/bin/` contains `obs`, `obs-haiku-audio-tap` and `obs-haiku-browser`.
+- [ ] `build/rundir/RelWithDebInfo/bin/` contains `obs` and `obs-haiku-browser`.
 
 If configure or the build fails, send `build/haiku-build.log` (or just everything from the first
 `error:`/`CMake Error` onward). The build script keeps going after errors (`-k 0`) so one log shows all
@@ -161,18 +179,34 @@ Add each with the **+** button under *Sources*.
 - [ ] **Color Source**: fills the canvas with the chosen color.
 - [ ] **Image**: load a PNG/JPEG.
 - [ ] **Text (FreeType 2)**: text renders. Changing the font in its properties works (uses fontconfig).
-- [ ] **Screen Capture** (haiku-capture): shows the desktop and updates live.
+- [ ] **Screen Capture** (haiku-capture). The screen recording permission applies; if `test.sh` ran earlier on
+      this machine, OBS is already allowed (see "Screen recording permission" below). To test the prompt, first run
+      `ScreenRecording --set application/x-vnd.obs-studio ask`.
+  - [ ] Adding the source shows the *Screen recording* prompt and the properties say it is waiting; OBS's UI stays
+        responsive meanwhile apart from app_server calls (known: O-6). *Allow* starts the capture and the desktop
+        shows in the preview.
+  - [ ] *Deny* (or let the prompt time out): the properties explain it and show *Try again*; pressing it asks again.
+  - [ ] While capturing, the Screen recording indicator is shown. *Stop* from the indicator ends the capture; the
+        properties show the "stopped" message with *Start capture*, and it does not restart by itself. *Start capture*
+        resumes.
+  - [ ] *Capture* = *Region*: set Left/Top/Width/Height; the source shows exactly that part of the screen and
+        follows changes to the numbers. A region outside the screen shows the "outside the screen" message.
   - [ ] Toggling *Capture Cursor* shows/hides the mouse pointer.
-  - [ ] At 1920×1080 and 30 fps, ProcessController shows reasonable CPU usage. Try 60 fps as well.
+  - [ ] An idle desktop produces no new frames (the 10 s `LOG_DEBUG` line, with `--verbose`, shows few changed
+        frames); moving a window produces them. Note polls, changed frames and `NextFrame()` average/max times.
+  - [ ] At 1920×1080 and 30 fps, ProcessController shows reasonable CPU usage, and the desktop and pointer stay
+        smooth while recording. Try 60 fps as well.
 - [ ] **Window Capture (screen region)** (haiku-capture):
   - [ ] The *Window* list shows open windows as "[Application] Title"; OBS's own windows are not listed.
         *Refresh window list* updates it.
   - [ ] Pick a Terminal window: the source shows exactly that window. Move and resize the window: the source
         follows.
-  - [ ] Minimize the window or switch to another workspace: the source pauses (keeps the last frame) and the log
-        says so; restoring it resumes.
-  - [ ] Put another window over it: the covering window appears in the capture (expected, documented) and the log
-        mentions the window is covered.
+  - [ ] Minimize the window or switch to another workspace: the source pauses (keeps the last frame); restoring
+        it resumes.
+  - [ ] Close the window: the picture is cleared and the properties say the window isn't open. Open it again
+        (same application and title): the capture resumes without touching the source.
+  - [ ] Put another window over it: the covering window appears in the capture (expected until the compositor,
+        F-33).
   - [ ] *Include window border and tab* on/off changes whether the tab and border are captured.
   - [ ] Quit and restart OBS: the source finds the same window again.
 - [ ] **Audio Input Capture (Media Kit)**:
@@ -181,40 +215,54 @@ Add each with the **+** button under *Sources*.
   - [ ] The Terminal shows `[haiku-media] '<name>': capturing from 'default' (2 ch, 48000 Hz, format 0x...)`.
         Note the format value for the report.
   - [ ] Switching to a specific device in the list works.
+  - [ ] Hot-plug: with a USB microphone selected, unplug it. The list shows "<name> (not connected)" and the source
+        goes silent without errors in a loop. Plug it in again: capture resumes without re-saving the source. A microphone plugged in later appears in the list.
 - [ ] **Video Capture Device (Media Kit)** (only with a webcam supported by Haiku):
   - [ ] The device appears in the list and video shows in the preview.
   - [ ] Note the `capturing from ... (WxH, color space 0x...)` log line.
+  - [ ] Hot-plug: unplug the camera while it is shown. The entry stays as "(not connected)"; plug it in again and the
+        picture returns. A camera plugged in later appears in the list. The list also contains Demo Video Producer.
   - [ ] *Deactivate when not showing*: hide the source with the eye icon; the camera LED should go off.
 - [ ] **Media Source** (FFmpeg): plays a local video file with sound.
 - [ ] **VLC Video Source** (only if `vlc_devel` was installed): plays a playlist.
 
-## 4. Desktop audio
+## 4. Desktop audio and application audio
 
-**Before this test, note how to restore sound if something goes wrong:** run
-`build/rundir/RelWithDebInfo/bin/obs-haiku-audio-tap --repair`, or open *Media* preferences and click
-*Restart media services*.
+Both record the system mixer through a loopback; nothing is inserted into the playback path, so no repair step
+is needed if OBS crashes.
 
 1. Play something (MediaPlayer, or a video in WebPositive).
-2. *Settings → Audio → Global Audio Devices → Desktop Audio*: choose "System mixer output".
+2. *Settings → Audio → Global Audio Devices → Desktop Audio*: choose "System mixer (everything that plays)".
 
 - [ ] You **still hear** the playback normally, without new crackling or added delay.
-- [ ] The *Desktop Audio* meter in the Audio Mixer moves with the playback.
-- [ ] The Terminal shows `obs-haiku-audio-tap: tap inserted (48000 Hz, 2 channels, format 0x...)` and
-      `[haiku-media] 'Desktop Audio': attached to the desktop audio tap`. Note the format.
-- [ ] If the Cortex app is installed (`pkgman install cortex`), it shows "OBS Desktop Audio Tap" between the system mixer and
-      the sound card while OBS runs.
+- [ ] The *Desktop Audio* meter in the Audio Mixer moves with the playback, also with the master volume low.
 - [ ] Record 30 s with only desktop audio: the recording has the played sound, in sync, without gaps or
-      doubled/sped-up audio.
-- [ ] Set *Desktop Audio* to "Disabled" (or quit OBS): within a second, the tap disappears from the media
-      routing and playback continues normally (`obs-haiku-audio-tap: ...` lines in the Terminal). ProcessController
-      no longer lists `obs-haiku-audio-tap`.
-- [ ] Crash recovery: with desktop audio active, kill OBS from ProcessController (Kill). Within ~10 s the helper
-      exits and sound continues. Then kill `obs-haiku-audio-tap` itself with Kill while OBS is running: OBS logs
-      that the helper died, starts a new one and capture resumes; sound keeps working.
+      doubled/sped-up audio. If the sync is off, note the offset (the buffers are stamped from the mixer's time source).
+- [ ] Setting *Desktop Audio* to "Disabled" (or quitting OBS) leaves playback unaffected. Killing OBS from
+      ProcessController does the same.
 - [ ] Settings → Audio: the *Sample Rate* setting (44.1 or 48 kHz) different from the mixer's rate still gives
       correct pitch in recordings.
+- [ ] Changing the default output in Media preferences while capturing: capture keeps working (the loopback
+      records every output).
+- [ ] **Known limitation (O-1).** Add a Media Source and set it to *Monitor and Output*. The recording contains
+      that source **twice** (echo): once directly, once through Desktop Audio. Expected until O-1 lands. Note it,
+      do not report it as a bug.
+- [ ] **Application Audio Capture**: add the source. The *Application* list shows applications that play audio
+      ("(playing audio)") and running GUI applications; OBS itself is not listed. *Refresh* updates it.
+  - [ ] Select MediaPlayer: its sound is captured and the meter moves; a second application playing at the same
+        time is **not** in the recording.
+  - [ ] Quit and start MediaPlayer again: the capture continues without touching the source.
+  - [ ] Quit OBS and start it again with MediaPlayer closed: the source shows "<name> (not running)" and starts
+        capturing when the application plays.
+  - [ ] Monitoring Application Audio Capture of another application (*Monitor and Output*) gives no echo.
+  - [ ] The captured level does not change with the master volume.
+- [ ] OBS has an application signature: `ScreenRecording --list` shows (after the first capture) or the log shows `application/x-vnd.obs-studio`
+      (needed for routing, self-exclusion and the screen permission). Note if it does not.
 
 ## 5. Audio monitoring
+
+Monitoring plays through the system mixer (one `BSoundPlayer` per source); the chosen device is applied with the
+mixer's per-stream *Output* routing.
 
 1. *Settings → Audio → Advanced → Monitoring Device*: "Default".
 2. In the Audio Mixer, open the gear menu of the mic source → *Advanced Audio Properties* →
@@ -224,9 +272,16 @@ Add each with the **+** button under *Sources*.
 - [ ] Volume changes on the source's fader change the monitored volume.
 - [ ] Switching back to *Monitor Off* stops it. No crash when switching repeatedly.
 - [ ] A Media Source with *Monitor Only (mute output)* is audible but its meter in the recording is silent.
-- [ ] With Desktop Audio enabled, set *Monitor and Output* on Desktop Audio itself: there must be **no** echo or
-      feedback (OBS skips monitoring of Desktop Audio). Monitoring another source is heard and is also captured by
-      Desktop Audio (same as other platforms when monitoring and desktop audio use the same device).
+- [ ] **Monitoring device routing.** The list contains the mixer's output names. Choose a device other than the
+      default output (for example a USB headset): the monitored sound moves there while other applications stay on
+      the default output; Media preferences or Cortex show the OBS stream routed to that output. Choose "Default"
+      again and the sound comes back.
+- [ ] Choose a device, unplug it, then plug it in: note where monitoring plays meanwhile (default output) and
+      whether it returns to the device. It returns only after monitoring is reset (O-4); resetting means switching
+      the source's monitoring off and on.
+- [ ] If the log says OBS has no application signature the mixer could know its streams by, routing cannot work;
+      send the log line.
+- [ ] Desktop Audio is never monitored (no echo or feedback when *Monitor and Output* is chosen on it).
 
 ## 6. Browser source and docks
 
@@ -246,8 +301,20 @@ Add each with the **+** button under *Sources*.
       showing it starts one and the page comes back.
 - [ ] *Interact* (right-click the source → Interact): clicking links, scrolling with the wheel, typing into a text
       field (letters, Backspace, arrows, Enter) all work.
-- [ ] Crash recovery: kill an `obs-haiku-browser` process in ProcessController. OBS logs `browser helper ... exited
-      unexpectedly` and the page comes back within a few seconds.
+- [ ] Helper death is detected immediately: kill an `obs-haiku-browser` process in ProcessController (Kill). The
+      log shows the helper's exit at that moment (not 10 s later) and the page comes back within a few seconds.
+      Quitting OBS ends every helper at once (ProcessController shows none).
+- [ ] Crash report line: make a helper crash (for example `kill -SEGV <team>` from a Terminal, or Debugger's
+      *Save report* on one). The log shows one line `browser helper (team N) crashed (...); crash report:
+      /boot/system/var/log/crash/app-obs-haiku-browser-....txt`, the file exists and its header names that team,
+      and the line is also shown in OBS's System logs. The page is back within about 5-10 s. Note what the
+      line says if no report is found.
+- [ ] Hung helper: stop one with `kill -STOP <team>` and leave it. After the 30 s ping timeout OBS logs a stall,
+      restarts the helper and the page comes back.
+- [ ] A page whose size grows (change Width/Height while the page is shown) keeps rendering with no flicker to a
+      stale size.
+- [ ] "Control audio via OBS" is unavailable/disabled (expected, O-2 and O-3); the page's sound reaches recordings through
+      Desktop Audio only.
 - [ ] Twitch/StreamElements-style alert page or a chat overlay URL you normally use: note whether it renders and
       animates (HaikuWebKit has no WebGL, so WebGL-based overlays won't).
 - [ ] **Custom browser docks**: *Docks → Custom Browser Docks...*, add one with `https://obsproject.com`. The dock
@@ -321,8 +388,7 @@ settings (the same key Haiku's own shortcuts use). OBS's "Alt" is Haiku's Contro
 - [ ] Quitting doesn't crash or hang. A clean exit doesn't trigger the "OBS didn't shut down properly"
       dialog on the next start.
 - [ ] Logs exist in `~/config/settings/obs-studio/logs/`.
-- [ ] After quitting, ProcessController shows no leftover `obs-haiku-audio-tap` or `obs-haiku-browser` (allow ~10 s),
-      and system sound works.
+- [ ] After quitting, ProcessController shows no leftover `obs-haiku-browser`, and system sound works.
 
 ## 14. Reporting back
 

@@ -1,5 +1,9 @@
 # Testing the app_server `ReadBitmap()` patch on your machine
 
+> **Stock Haiku only.** The `renga` branch of OBS does not use `BScreen::ReadBitmap()`: it captures through Renga's
+> `BScreenCapture` sessions (see `ARCHITECTURE.md`, section 9). This document applies to the `main` branch on stock
+> Haiku, where the *Capture method* setting and the read throttle it mentions still exist.
+
 This builds Haiku's system package (`haiku.hpkg`) from the same revision you're running, with the patch applied,
 and installs it. If anything goes wrong, Haiku's boot menu can return you to the system exactly as it was. Read the
 recovery section before you start.

@@ -1,5 +1,9 @@
 # app_server: `BScreen::ReadBitmap()` stalls the desktop and the mouse pointer
 
+> **Stock Haiku only.** The `renga` branch of OBS does not use `BScreen::ReadBitmap()`: it captures through Renga's
+> `BScreenCapture` sessions (see `ARCHITECTURE.md`, section 9). This document applies to the `main` branch on stock
+> Haiku, where the *Capture method* setting and the read throttle it mentions still exist.
+
 **Report for the Haiku developers**
 
 > **Disclosure.** The analysis and the patch below were written by an AI assistant (Claude, by Anthropic). Dalton

@@ -1,7 +1,9 @@
 # Haiku port architecture
 
-This document explains how each part of OBS Studio was adapted to Haiku, why it was done that way, and where
-the code lives. Read it before changing Haiku-specific code.
+This document explains how each part of OBS Studio was adapted to Renga (the Haiku-based OS in `Techniix/haiku`,
+branch `ce/main`), why it was done that way, and where the code lives. This branch (`renga`) relies on Renga
+features that stock Haiku lacks; stock Haiku is supported on `main`. Read this before changing Haiku-specific code.
+What OBS still needs from Renga is tracked in `RENGA-REQUESTS.md` (request ids O-n, Q-n are used below).
 
 All Haiku code is either in new files with `haiku` in the name or in `#if defined(__HAIKU__)` /
 `OS_HAIKU` / `$<PLATFORM_ID:Haiku>` blocks inside upstream files, so `git log`/`git diff 33.0.1` shows the
@@ -16,7 +18,7 @@ whole port and rebasing onto a new upstream release stays manageable.
 5. [Qt frontend](#5-qt-frontend)
 6. [Audio monitoring](#6-audio-monitoring)
 7. [haiku-media: audio and video capture](#7-haiku-media-audio-and-video-capture)
-8. [Desktop audio capture](#8-desktop-audio-capture)
+8. [Desktop and application audio capture](#8-desktop-and-application-audio-capture)
 9. [haiku-capture: screen and window capture](#9-haiku-capture-screen-and-window-capture)
 10. [Browser source and docks](#10-browser-source-and-docks)
 11. [Bundled dependencies: obs-websocket, SRT, RIST](#11-bundled-dependencies-obs-websocket-srt-rist)
@@ -293,16 +295,23 @@ The plugin manager reuses the BSD loader, which only uses POSIX/libobs APIs.
 
 `libobs/audio-monitoring/haiku/`.
 
-Each monitored source gets a `BSoundPlayer` connected to the system mixer, asking for float32 interleaved
-audio at OBS's sample rate and channel count, so the mixer handles conversion to the sound card.
+Each monitored source gets one `BSoundPlayer` connected to the system mixer, asking for float32 interleaved
+audio at OBS's sample rate and channel count, with a channel mask matching OBS's speaker layout. The mixer
+converts to the sound card, applies the master volume and mixes OBS's players with every other application.
 
 - libobs's audio thread converts the source's planar float audio to interleaved (`audio_resampler`), applies
   the source volume and appends it to a FIFO.
 - The player's realtime thread (`haiku-sound-player.cpp`) pulls 10 ms buffers out of it.
-- The FIFO waits for 40 ms of audio before starting and after an underrun, and drops the oldest audio
-  beyond 200 ms, so monitoring latency stays bounded.
-
-Haiku routes all application audio through the system mixer, so "Default" is the only monitoring device.
+- **Monitoring device.** The device list is the mixer's output names, which are stable across restarts. Renga's
+  mixer routes each stream with its "Output" parameter (default output, or a device); routes are stored per
+  application signature and per mixer input. After a player starts, `obs_haiku_route_streams()` applies the chosen
+  device to every OBS stream, because setting it on one stream does not move streams that are already
+  connected. "Default" leaves the streams on the default output.
+- The route is applied once per player start. A device that appears later is not used until monitoring is reset
+  (O-4). OBS needs an application signature for the mixer to identify its streams by; if none is found the
+  player stays on the default output and a warning is logged.
+- Sources flagged `OBS_SOURCE_DO_NOT_SELF_MONITOR` (Desktop Audio) are not monitored: the loopback records every
+  output, so monitoring them would feed back into themselves.
 
 ## 7. haiku-media: audio and video capture
 
@@ -319,6 +328,11 @@ Haiku routes all application audio through the system mixer, so "Default" is the
   producer, and forwards every buffer to a callback.
 - If the device has no free output (another program is recording from it), the source logs a warning and
   stays silent/black; re-saving the source properties retries.
+- **Hot-plug.** The input and camera lists reload on `B_MEDIA_FLAVORS_CHANGED`, which Renga's media add-on server,
+  `usb_webcam` and `multi_audio` send when devices come and go, so there is no health polling. A saved device that
+  is unplugged stays listed as "(not connected)" and is taken up again when it returns (the recorder supervisor
+  retries with backoff). Cameras list every raw-video producer, including Demo Video Producer. Resolutions are
+  found by probing, since Renga's UVC driver lists no modes (O-5).
 
 **Audio Input Capture** (`haiku_audio_input_capture`): float, 32-bit, 16-bit and 8-bit PCM, 1–8
 channels, host byte order. Channels are mapped to an OBS speaker layout from the stream's `channel_mask`
@@ -331,109 +345,95 @@ disconnects the device while the source isn't visible.
 The frontend uses `haiku_audio_input_capture` for the global Mic/Aux devices in *Settings → Audio* and
 `haiku_desktop_audio_capture` (section 8) for the Desktop Audio devices (`frontend/OBSApp.cpp`).
 
-## 8. Desktop audio capture
+## 8. Desktop and application audio capture
 
-Haiku has no loopback device: the system mixer has one output, connected to the sound card's input. Capturing what
-is played therefore means getting into that connection.
+Renga's Media Kit keeps every application's stream apart in the system mixer and offers loopbacks as ordinary
+Media Kit sources: a loopback flavor of the mixer add-on produces "what you hear", or the streams of selected
+applications. OBS records one like any other input, so no node is inserted into the playback path and nothing
+has to be restored if OBS dies.
 
 ```
-before:  system mixer ──────────────────────────────► sound card
-after:   system mixer ──► TapNode ──► sound card
-                            │ copy
-                            ▼
-                 area "obs-studio desktop audio tap" ──► Desktop Audio source(s) in OBS
+application streams ──► system mixer ──► output(s) ──► sound card
+                              │
+                              └─► loopback flavor ──► BMediaRecorder ──► Desktop Audio / Application Audio source
 ```
 
-**Helper process** `obs-haiku-audio-tap` (`plugins/haiku-media/audio-tap/`). It is a separate program so that a fault
-in the real-time media path cannot take OBS down, and so the original routing is restored even when OBS crashes:
+**Desktop Audio** (`haiku_desktop_audio_capture`, `plugins/haiku-media/loopback-audio.cpp`; the source id is
+unchanged, so scene collections and the frontend's desktop channels keep working). Each source instantiates its
+own loopback flavor of the mixer add-on and records it through the plugin's recorder and supervisor (the same
+ones Audio Input Capture uses, including reconnecting with backoff). It asks for float stereo at the mixer's own
+rate, so the loopback is a plain copy (`MixerTap`) and libobs resamples.
 
-1. Takes a single-instance `flock()` on `/tmp/obs-haiku-audio-tap.lock` (waiting up to 5 s, so a helper started
-   while the previous one is still restoring the routing just runs after it), then creates the cloneable area
-   (`audio-tap-shm.h`: header + 4 MiB ring; the header carries a protocol version, so a reader rejects a helper
-   from another build). The mixer format, including its `channel_mask`, is published seqlock-style; positions and
-   serials are accessed with acquire/release atomics on both sides.
-2. Saves the mixer's connected output (`GetConnectedOutputsFor`), registers `TapNode`, slaves it to the mixer's
-   time source, disconnects mixer → card, connects tap → card (with the format the mixer and card were already
-   using), then mixer → tap, and starts the node. On any failure the original connection is restored; this also
-   copes with a `Disconnect()` that reported an error after only one side let go (the link is checked from both
-   ends and re-made or left alone as needed). The helper
-   keeps its reference to the mixer's time source object until the node is deleted: `SetTimeSourceFor()` only
-   posts a message, and dropping the reference at once could let libmedia delete the object just as the node's
-   control thread picked it up (a use-after-free in `BTimeSource::GetTime()`, seen on real hardware). The node's
-   control thread is also stopped explicitly before its last reference is released.
-3. `TapNode` (`tap-node.cpp`, structured after Haiku's MIT-licensed Equalizer add-on) is a `BBufferConsumer` +
-   `BBufferProducer` + `BMediaEventLooper`. Each buffer is `memcpy`'d into the ring and forwarded unchanged with
-   `SendBuffer` (no copy on the way to the card). If a downstream node offers its own buffers with
-   `SetOutputBuffersFor()`, `SetBufferGroup` passes them on to the mixer; Haiku's multi_audio output does not, so
-   in practice the mixer keeps its own buffers. The real-time path only uses the compile-time ring size and a
-   write counter kept in the node: readers map the area read-write, so nothing read back from it is trusted. What
-   you hear is not modified.
-4. A watchdog quits when no reader has written a heartbeat for 10 s, or when the mixer is no longer connected to
-   the tap (rerouted in Media preferences or Cortex); the helper also quits when the media services quit, which
-   is also how a new default audio output takes effect (the Media Kit never sends `B_MEDIA_DEFAULT_CHANGED`).
-   Quitting, `SIGINT`/`SIGTERM`/`SIGHUP` and the last OBS source going away all restore mixer → card. If the
-   helper was killed with `SIGKILL`, the next start (or `obs-haiku-audio-tap --repair`, which does nothing while
-   a helper holds the lock) reconnects the mixer's free output to the card's free input.
+- **Timestamps.** A buffer's `start_time` is converted from the mixer's time source to real time and then to
+  `os_gettime_ns()` (`MixerClock`). If there is no usable time source, buffers are stamped on arrival.
+- **Double recording.** The loopback records every output, including OBS's own monitoring playback. A source set
+  to "Monitor and Output" is recorded twice (once directly, once through the loopback), with an echo. The source
+  carries `OBS_SOURCE_DO_NOT_SELF_MONITOR`, and its properties say that Application Audio Capture should be used
+  while monitoring. Excluding applications from a loopback (O-1) removes the limitation.
 
-**OBS source** "Desktop Audio (Media Kit)" (`plugins/haiku-media/desktop-audio.cpp`). A reader thread finds the area
-(starting the helper with `posix_spawn` if needed), clones it, and every 10 ms converts new ring data to
-`obs_source_audio` in the mixer's format (float/int/short/8-bit, 1–8 channels). The format is cached when its
-serial changes and validated before use. Haiku interleaves channels in `channel_mask` bit order, which matches
-OBS for the usual 1, 2, 6 and 8 channels; other layouts (e.g. the mixer's 3 = L R C, 4 = L R RL RR,
-5 = L R C RL RR) are repacked into the smallest OBS layout that has a slot for each channel, with silence in the
-rest (`audio-channels.hpp`, also used by Audio Input Capture). It detaches and reconnects if the helper exits or
-dies, skips ahead if it falls more than half a ring behind (the most the helper can be copying unpublished), and
-stops and reaps the helper when the last desktop audio source is destroyed. The source has `OBS_SOURCE_DO_NOT_SELF_MONITOR`: monitoring plays into the very
-mixer the tap captures, so monitoring Desktop Audio would feed back into itself.
+**Application Audio Capture** (`haiku_application_audio_capture`, same file). The source selects one
+application:
 
-Helpers are marked as background apps (`B_BACKGROUND_APP` via `BAppFileInfo`, set on first use) so they don't show
-in the Deskbar, with `B_MULTIPLE_LAUNCH`: the helper's own lock, not the registrar, keeps it single-instance.
+- The list holds applications playing audio (read from the mixer's parameter web through Renga's
+  `AudioStreamControl.h`) and running GUI applications. OBS's own signature is excluded, and a *Refresh* button
+  rebuilds the list. A saved application that is not running stays selected as "(not running)".
+- The selection is written to the loopback's `renga:loopback_signature` parameter. The mixer compares
+  signatures every cycle, so the capture follows the application across restarts.
+- The recorded sound is taken before the master volume, so it does not change with the speaker volume.
+- Per-source audio of a browser source is not available (section 10; O-2, O-3).
 
 ## 9. haiku-capture: screen and window capture
 
-**Screen capture** (`screen-capture.cpp`). A thread calls `BScreen::ReadBitmap()` into a `B_RGB32` bitmap at the
-configured rate (1–60 fps, default 30) and outputs it as an async BGRX source, so the app_server copy never blocks
-rendering. It captures the main screen with the cursor optional. The source only runs while it is shown.
+Renga's app_server has a capture API (roadmap F-31 phase 3, `BPrivate::BScreenCapture`): sessions for the screen,
+a region or a window, with a per-application permission, a recording indicator, and damage tracking so a frame
+copies only what changed. Both sources are built on it (`capture-source.{hpp,cpp}`, shared by
+`screen-capture.cpp` and `window-capture.cpp`). Renga behaviour relied on is cited in the code comments.
 
-**Reading the screen without freezing the desktop** (`capture-throttle.hpp`, used by both sources).
-`BScreen::ReadBitmap()` runs in the app_server under its exclusive drawing lock. The software cursor is moved
-under the same lock, and reading a frame buffer in video memory is slow (~25–30 ms for 2560×1080 on the
-nvidia-haiku driver), so capturing stops the pointer for the length of each read. Two things limit the impact:
+**Frame path.** One capture thread per source calls `NextFrame()` at the source's frame rate (1–60 fps, default
+30) with a single grow-only `B_RGB32` bitmap. The app_server copies into the bitmap only what changed since it
+was last filled (it keeps a per-bitmap missing region), so one bitmap is enough for an asynchronous source. A
+frame reported as unchanged is not output. The thread hands changed frames to libobs with
+`obs_source_output_video()`; libobs copies the whole frame (the damage region is not used because libobs has no
+partial update for asynchronous sources). Timestamps come from the frame's `system_time()`. The source is
+unbuffered (`obs_source_set_async_unbuffered`): libobs' buffered pacing would stall later frames by the length of
+any gap, and an idle screen produces long gaps. Frames are polled; a push notification would remove an idle
+round trip per frame and up to one frame of latency (O-8). A `LOG_DEBUG` line every 10 s reports polls, changed
+frames and the average and maximum `NextFrame()` time.
 
-- A duty-cycle throttle keeps reads to at most 25% of wall time and lowers the capture rate (logging it) when
-  the hardware can't keep up.
-- A per-source **Capture method** setting. *Tear-free* (default) reads each frame in one piece: every frame is a
-  consistent snapshot, and the pointer pauses briefly during each read. *Smooth pointer* reads in horizontal
-  bands that hold the lock for ~2 ms each with a 1 ms yield in between: the pointer stays smooth, but something
-  that moves during a read can show a seam in that frame.
+**Permission.** The first `Start` of an application blocks until the user answers the *Screen recording* prompt
+(up to 120 s). A single process-wide helper thread asks once with a 1-pixel region; sources start with a zero
+timeout only after permission is granted, so hide, show and destroy on the graphics thread never wait on the
+prompt. While the prompt is open the app_server link lock of the process is held between polls, so other
+app_server calls of OBS wait (O-6), and a timeout is reported like a denial (O-7). Permission is remembered by
+the application signature (`application/x-vnd.obs-studio`, `frontend/cmake/haiku/obs-studio.rdef.in`).
 
-Retrace synchronization (`BScreen::WaitForRetrace()`) doesn't help here: the seams come from the app_server
-drawing between bands, not from the monitor's refresh. A complete fix would be in the app_server. It keeps a
-copy of the screen in system memory (it is double-buffered with accelerant drivers), and serving `ReadBitmap()`
-from that copy instead of from video memory would make a full-frame read take a few milliseconds. Patches that do
-this are in `docs/haiku/upstream/` (not yet in Haiku).
+- A denial or a stop from the recording indicator (`B_CANCELED`) is shown in the source's properties with a
+  *Try again* / *Start capture* button. A user stop is not undone automatically.
+- Permission can be set outside OBS with the `ScreenRecording` preferences or
+  `ScreenRecording --set application/x-vnd.obs-studio allow|ask`.
 
-With accelerant drivers that use the **software** cursor, the app_server composites it into the frame buffer, so it
-can appear in the capture even with *Capture Cursor* off. With a **hardware** cursor (for example the nvidia-haiku
-driver's `rtx5070-hw-cursor` branch), it isn't in the frame buffer, and `ReadBitmap(drawCursor)` adds it only when
-asked, so the toggle works. The app_server patches in `docs/haiku/upstream/` make the toggle work with software
-cursors too, except where the cursor is over a direct window or a window that is being redrawn (those areas are
-read from the frame buffer).
+**Screen Capture** (`screen-capture.cpp`). The whole main screen or a region (`StartRegion`), with an optional
+cursor. Changing either restarts the session. The capture API has no screen parameter until multi-monitor
+support (F-38) exists. The source only runs while it is shown.
 
-**Window capture** (`window-capture.cpp`). The app_server composes windows straight into the frame buffer and keeps
-no per-window backing store another team could read, so isolated window capture (like PipeWire or
-`CGWindowListCreateImage`) is not possible on Haiku. The source is therefore a clearly labelled screen-region
-capture that follows one window:
+**Window Capture** (`window-capture.cpp`). `StartWindow(token)` captures the area of the screen at one window's
+frame, with `SCREEN_CAPTURE_WINDOW_BORDER` for the border and tab option.
 
-- Windows are listed with the private window-list API Deskbar and the Switcher use (`get_token_list()`,
-  `get_window_info()`, `BPrivate::get_window_order()`; declarations copied in `haiku-window-info.h`). OBS's own
-  windows are skipped.
-- The selected window is remembered as "application name + title" and found again after restarts.
-- Every frame, the window's current frame (optionally with border and tab) is read from the screen. Moving and
-  resizing are followed; the source pauses while the window is hidden, minimized or on another workspace, and logs
-  when other windows cover it (their pixels are captured too).
+- Windows are listed with Renga's `WindowInfo.h` (`get_token_list()`, `get_window_info()`); OBS's own windows are
+  skipped. The selected window is remembered as "application name + title" and found again after restarts.
+- The session follows the window when it moves or is resized.
+- The server copies whatever is at the window's frame without a visibility check, so OBS calls
+  `get_window_info()` on changed frames and pauses (keeping the last picture) while the window is minimised,
+  hidden or on another workspace (O-9).
+- When the window is gone (`B_ENTRY_NOT_FOUND`) the picture is cleared and the window is looked up again until
+  it reappears.
+- Still not isolated: without a compositor (F-33), windows in front of the captured one are captured too.
 
-`BScreen` needs a connection to the app_server, which exists because Qt's Haiku plugin creates a
+**Cost.** The copy happens inside the app_server per changed frame and libobs uploads it again; GPU buffers
+from capture would remove both (O-10, Quasar Q-2, F-47). Quasar's Q-1 (a fence hang with Screen Capture running)
+is described in `RENGA-REQUESTS.md`.
+
+`BScreenCapture` needs a connection to the app_server, which exists because Qt's Haiku plugin creates a
 `BApplication`.
 
 ## 10. Browser source and docks
@@ -442,13 +442,13 @@ CEF (Chromium) has not been ported to Haiku, and obs-browser is built on it. The
 `plugins/haiku-browser/`, using HaikuWebKit, the WebKit port behind WebPositive.
 
 ```
-OBS process                                               obs-haiku-browser (one per page)
-┌──────────────────────────────┐   BMessage: config,     ┌────────────────────────────────────┐
-│ browser_source / dock widget │   input, JS, reload ──► │ BApplication (WebCore main thread) │
-│   HaikuBrowserClient         │                         │ BWebWindow parked off-screen       │
-│   area "obs browser <pid>.n" │ ◄── frames (seqlock) ── │   BWebView → offscreen BBitmap     │
-└──────────────────────────────┘                         │ pump thread copies at source fps   │
-                                                         └────────────────────────────────────┘
+OBS process                                                obs-haiku-browser (one per page)
+┌──────────────────────────────┐  AF_UNIX socketpair,     ┌────────────────────────────────────┐
+│ browser_source / dock widget │  length-framed:          │ BApplication (WebCore main thread) │
+│   HaikuBrowserClient         │  BMessages ────────────► │ BWebWindow parked off-screen       │
+│   I/O thread (epoll)         │ ◄── event records        │   BWebView → offscreen BBitmap     │
+│                              │ ◄── sealed memfd (frames,│ pump thread copies at source fps   │
+└──────────────────────────────┘     SCM_RIGHTS) + eventfd└────────────────────────────────────┘
 ```
 
 - **Module identity.** The module is built under the name `obs-browser` and registers `browser_source` with
@@ -457,12 +457,33 @@ OBS process                                               obs-haiku-browser (one
   frontend finds the dock implementation through `obs_get_module("obs-browser")` → `obs_browser_create_qcef()`
   exactly as with CEF.
 - **One helper per page** (`helper/browser-helper.cpp`): a hung or crashing page only affects its own process.
-  `HaikuBrowserClient` restarts it with backoff, and restarts it if its heartbeat stops for 10 s. The helper quits
-  when OBS's heartbeat stops for 5 s.
+  `HaikuBrowserClient` restarts it with backoff.
+- **IPC** (`browser-ipc.hpp`), built on the Linux primitives Renga provides (`memfd_create` with sealing,
+  `eventfd`, `epoll`, `SCM_RIGHTS` over `AF_UNIX`):
+  - *Channel.* One `AF_UNIX` `SOCK_STREAM` socketpair per helper, length-framed (a `SOCK_SEQPACKET` pair would
+    give message boundaries, but the socket tests do not cover it with descriptor passing; O-13). OBS to helper:
+    flattened `BMessage`s handled by the existing handlers; messages sent before the helper's looper runs wait in
+    the socket. Helper to OBS: a fixed binary event record, so OBS never unflattens data a page could shape.
+  - *Spawn.* `posix_spawn` without file actions (with file actions Haiku's `posix_spawn` forks OBS instead of using
+    `load_image`); the helper's descriptors are made inheritable only for the call, under a lock.
+  - *Frames.* For each buffer size the helper creates a memfd, seals it (shrink, grow, future write, seal) and
+    sends it with `SCM_RIGHTS`. OBS checks the seals, maps it read-only and validates every header field. The
+    hand-off uses a sequence lock; a torn copy is dropped because the next frame wakes the reader again. An
+    `eventfd` wakes OBS for each frame. A page that grows simply gets a new memfd; there is no area switching.
+  - *OBS side.* One I/O thread per client waits in `epoll_wait` on the socket, the frame eventfd and a stop
+    eventfd. Sources output frames directly; docks receive them through a one-slot mailbox and a queued
+    `invokeMethod` (no polling timer, no `QSocketNotifier`).
+  - *Liveness.* Helper death is end-of-file on its socket and is seen at once. OBS death is end-of-file in the
+    helper, which quits. Stalls are found with a ping every 5 s that must be answered on WebCore's main thread
+    within 30 s. One module-wide reaper joins finished helpers and is joined in `obs_module_unload`.
+- **Crash reports** (Renga F-51). When a helper dies or stops answering, OBS looks in `/boot/system/var/log/crash`
+  for an `app-obs-haiku-browser-*.txt` newer than the helper's start whose header names its team, and logs one
+  line with the report path (shown in System logs). A crashed helper stays stopped in `debug_server` with its
+  socket open, so the check also runs on each missed ping, and the helper is restarted within about 5-10 s.
 - **Rendering.** HaikuWebKit renders every page into the `BWebView`'s offscreen bitmap (it is built without
   accelerated compositing, so that bitmap is the complete page). The helper reads it with
   `WebCore::DumpRenderTreeClient::getOffscreen()`, the exported accessor HaikuWebKit's test runner uses, and copies it
-  into the shared area under a sequence lock. The window must stay *shown*: hiding a `BWebView` marks the page
+  into the current memfd under a sequence lock. The window must stay *shown*: hiding a `BWebView` marks the page
   invisible and WebCore stops its timers. It is borderless, avoids focus and sits at (-30000, -30000).
 - **Header constraints.** `haikuwebkit_devel` installs `WebFrame.h`, but that header includes WebCore internals that
   aren't shipped, so it can't be used outside WebKit (WebPositive doesn't use it either). `helper/webkit-abi.h`
@@ -480,9 +501,13 @@ OBS process                                               obs-haiku-browser (one
   `BWebPage` inherits `BHandler` privately; the C-style cast in `PageHandler()` is the conversion C++ allows to an
   inaccessible base. The Haiku frontend passes Haiku raw key codes in `obs_key_event.native_vkey`
   (`OBSBasicInteraction.cpp`) so navigation keys can be translated to Haiku's control bytes.
+- **Audio.** There is no per-source audio: the mixer keys streams by signature, `B_MUTE` also silences a stream in
+  the loopback, and there is no "loopback only" route, so "Control audio via OBS" would play the page on the
+  speakers and into Desktop Audio. It stays unavailable until O-2 and O-3 land; page audio is recorded by Desktop
+  Audio.
 - **Docks** (`browser-panel.cpp`) implement `QCef`/`QCefWidget` from obs-browser's `panel/browser-panel.hpp` (the
   only file used from that submodule). The widget paints the latest frame and forwards Qt input; title and URL
-  changes come back through the shared area and are emitted as `titleChanged`/`urlChanged`. Cookie managers map to a
+  changes come back as helper events and are emitted as `titleChanged`/`urlChanged`. Cookie managers map to a
   per-panel WebKit storage directory.
 
 ## 11. Bundled dependencies: obs-websocket, SRT, RIST
@@ -515,20 +540,21 @@ snippet changed, so updating a submodule can't silently drop a fix.
 
 ## 13. Known limitations and ideas
 
-- **Window capture isolation**: windows in front of the captured one are captured too. True per-window capture
-  would need an app_server extension (e.g. letting a privileged client read a window's drawing), which is outside
-  OBS.
-- **Per-application audio capture**: the tap sees only the final mix. Per-application capture would need a tap per
-  mixer input; the same node could be inserted there, but the mixer's input side has no stable public routing API.
+- **Window capture isolation**: windows in front of the captured one are captured too until Renga has a compositor
+  (F-33); visibility is not reported with the frame (O-9).
+- **Capture permission**: the wait for the prompt holds the app_server link (O-6) and a timeout looks like a denial
+  (O-7); frames are polled (O-8).
+- **Desktop audio**: monitored sources are recorded twice (O-1). Use Application Audio Capture while monitoring.
 - **Browser**: no WebGL (HaikuWebKit is built without it), page audio is not routed to the source ("Control audio via
-  OBS" is shown disabled; the sound reaches recordings through Desktop Audio), cookies aren't persisted between
-  helper runs. JavaScript calls that need the frontend (`obsstudio.getCurrentScene`, `setCurrentScene`, …) are not
+  OBS" is shown disabled; the sound reaches recordings through Desktop Audio; O-2, O-3). JavaScript calls that need the frontend (`obsstudio.getCurrentScene`, `setCurrentScene`, …) are not
   implemented yet; `pluginVersion`, `getStatus`, `getControlLevel` and the visibility/activity events are.
-- **Webcam formats**: the device's current format is used; a resolution/format picker could use the node's
-  `BParameterWeb` or format negotiation.
+- **Webcam formats**: sizes are found by probing and the frame rate is fixed (O-5).
 - **Preview performance**: if `glReadPixels` is a bottleneck with llvmpipe at high preview resolutions, the readback
   could be made asynchronous with a PBO ring.
-- **Hardware encoding**: none on Haiku today (x264/FFmpeg software encoders only).
+- **Hardware encoding**: none today (x264/FFmpeg software encoders only); needs the Media Kit hardware video API
+  (O-11) and Quasar's back end (Q-3).
+- **Virtual camera**: not implemented; needs a feedable Media Kit producer (O-12).
+- **Zero-copy preview and capture**: needs GPU buffers from capture and shared GPU textures (O-10, Q-2, F-47).
 
 ## 14. Design decisions
 
@@ -537,11 +563,14 @@ Decisions taken during the port, with the reasons, so they can be revisited:
 | Decision | Reason |
 | --- | --- |
 | Render every display into its own offscreen buffer (EGL pbuffer or OSMesa) and read it back | Haiku EGL window surfaces belong to BViews driven by their window thread; OBS renders all displays from one graphics thread into Qt widgets. |
-| Desktop audio and browser rendering in helper processes | Crash isolation (WebKit, real-time media path) and guaranteed restoration of the audio routing. Shared memory keeps the per-frame cost at one copy. |
+| Browser rendering in a helper process | Crash isolation (WebKit). A sealed memfd per buffer size keeps the per-frame cost at one copy and lets OBS trust nothing a page could shape. |
+| Desktop audio as a mixer loopback, not a node in the playback path | Renga's mixer offers loopbacks as Media Kit sources; nothing has to be restored if OBS dies. |
+| Monitoring through the system mixer with its per-stream routing | The mixer already mixes, converts and routes; OBS only chooses the output. |
+| Capture through `BScreenCapture` sessions | Permission, indicator and damage tracking are in the app_server; no throttling of reads is needed. |
 | Helpers started on demand by the plugins, not by the frontend | No frontend changes; works for any OBS profile and for headless use of libobs. |
 | HaikuWebKit instead of porting CEF | CEF/Chromium is not available for Haiku and porting it is a project of its own; HaikuWebKit ships with every Haiku install. |
 | Keep obs-browser's module name, source id and settings | Scene collections and the frontend's dock code work unchanged. |
-| Window capture as a labelled screen-region capture | No per-window buffers exist in the app_server; this is the closest faithful behavior. |
+| Window capture as a labelled screen-region capture | No per-window buffers exist in the app_server until the compositor (F-33); this is the closest faithful behavior. |
 | Bundle libraries missing from HaikuPorts, patching copies at configure time | No feature has to be disabled, the submodules stay pristine, and system packages win as soon as they exist. |
 | Haiku modifier convention (Ctrl = Command) | Matches Haiku's Qt plugin, so hotkeys captured in the UI are the ones polled. |
 | EGL first, OSMesa fallback, OSMesa loaded at runtime | The Mesa HaikuPorts ships today (22.0.5) has EGL disabled; Mesa 25 has working EGL but no OSMesa. Supporting both means OBS works now and keeps working after the Mesa update. |
