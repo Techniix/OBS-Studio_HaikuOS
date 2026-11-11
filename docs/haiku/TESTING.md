@@ -186,9 +186,17 @@ Add each with the **+** button under *Sources*.
         responsive meanwhile apart from app_server calls (known: O-6). *Allow* starts the capture and the desktop
         shows in the preview.
   - [ ] *Deny* (or let the prompt time out): the properties explain it and show *Try again*; pressing it asks again.
+        *Deny* without "Remember my decision" shows the prompt only once (no second prompt right after it).
+  - [ ] Quit OBS while the prompt is still open: OBS quits normally, without a crash dialog (the permission thread
+        is stopped within about a second at module unload).
+  - [ ] Known: the Screen recording indicator appears as soon as the permission is known (granted), a moment
+        before the sources start, because the permission is asked through a one-pixel session of its own. Note if it
+        flashes (appears, disappears and appears again) rather than staying up.
   - [ ] While capturing, the Screen recording indicator is shown. *Stop* from the indicator ends the capture; the
         properties show the "stopped" message with *Start capture*, and it does not restart by itself. *Start capture*
         resumes.
+  - [ ] With two or more capture sources (Screen and Window Capture) running, *Stop* from the indicator stops all of
+        them. *Start capture* in the properties of any one of them restarts all of them.
   - [ ] *Capture* = *Region*: set Left/Top/Width/Height; the source shows exactly that part of the screen and
         follows changes to the numbers. A region outside the screen shows the "outside the screen" message.
   - [ ] Toggling *Capture Cursor* shows/hides the mouse pointer.
@@ -243,12 +251,16 @@ is needed if OBS crashes.
 - [ ] Settings → Audio: the *Sample Rate* setting (44.1 or 48 kHz) different from the mixer's rate still gives
       correct pitch in recordings.
 - [ ] Changing the default output in Media preferences while capturing: capture keeps working (the loopback
-      records every output).
+      records every output), and the audio stays in sync with the video (no audible jump). The log may show
+      "time stamps from the mixer's time source, as last converted" and then "... the mixer's time source" again.
 - [ ] **Known limitation (O-1).** Add a Media Source and set it to *Monitor and Output*. The recording contains
       that source **twice** (echo): once directly, once through Desktop Audio. Expected until O-1 lands. Note it,
       do not report it as a bug.
 - [ ] **Application Audio Capture**: add the source. The *Application* list shows applications that play audio
-      ("(playing audio)") and running GUI applications; OBS itself is not listed. *Refresh* updates it.
+      ("(playing audio)") and running GUI applications; OBS itself is not listed. The list is read in the
+      background: on the first opening it may fill in a moment after the dialog appears. *Refresh* updates it
+      (shortly after the click), and with the dialog open an application that starts or stops playing shows up
+      within a few seconds without pressing *Refresh*. The dialog opens without delay.
   - [ ] Select MediaPlayer: its sound is captured and the meter moves; a second application playing at the same
         time is **not** in the recording.
   - [ ] Quit and start MediaPlayer again: the capture continues without touching the source.
@@ -275,7 +287,8 @@ mixer's per-stream *Output* routing.
 - [ ] **Monitoring device routing.** The list contains the mixer's output names. Choose a device other than the
       default output (for example a USB headset): the monitored sound moves there while other applications stay on
       the default output; Media preferences or Cortex show the OBS stream routed to that output. Choose "Default"
-      again and the sound comes back.
+      again and the sound comes back. The route is set in the background, so the sound may start on the default
+      output and move within a moment; the Settings dialog applies without a pause.
 - [ ] Choose a device, unplug it, then plug it in: note where monitoring plays meanwhile (default output) and
       whether it returns to the device. It returns only after monitoring is reset (O-4); resetting means switching
       the source's monitoring off and on.
@@ -297,6 +310,8 @@ mixer's per-stream *Output* routing.
 - [ ] *Refresh cache of current page* reloads it.
 - [ ] Animation: a page with a CSS animation or a clock (e.g. `https://time.is`) updates continuously at the source
       frame rate.
+- [ ] A page that stays still and then changes (type into a text field after a few seconds without input): the
+      change shows in the preview at once, not a second or two late.
 - [ ] *Shutdown source when not visible*: hiding the source (eye icon) ends its `obs-haiku-browser` process;
       showing it starts one and the page comes back.
 - [ ] *Interact* (right-click the source → Interact): clicking links, scrolling with the wheel, typing into a text

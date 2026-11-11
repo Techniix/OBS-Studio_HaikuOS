@@ -110,6 +110,10 @@ private:
  * first Start consumes the answer, the second one asks again: ScreenCaptureManager::_Start()). So the question
  * is asked once, by a helper thread of its own, and the sources' capture threads only start sessions once it
  * is answered, with a zero timeout: they never block on the prompt and can always be stopped at once.
+ *
+ * The helper thread itself asks in slices of one second (see permission_thread() in capture-source.cpp), so
+ * that obs_module_unload() can stop and join it: a thread left inside a two-minute Start() would keep making
+ * app_server round trips after the frontend has deleted be_app, and AppServerLink calls debugger() then.
  */
 enum class CapturePermission {
 	Unknown,
@@ -124,6 +128,9 @@ CapturePermission capture_permission_poll();
 void capture_permission_invalidate();
 /* The user wants to be asked again after a denial. */
 void capture_permission_retry();
+/* From obs_module_unload(): stops the helper thread and waits for it (at most about a second). No question is
+ * asked afterwards. */
+void capture_permission_shutdown();
 
 class CaptureSource {
 public:
@@ -144,7 +151,9 @@ public:
 	void Show();
 	void Hide();
 
-	/* The "Try again"/"Start capture" button. */
+	/* The "Try again"/"Start capture" button. "Start capture" restarts every source of this module that the
+	 * user stopped, not only this one: one Stop in the Screen recording indicator stops all of OBS's sessions,
+	 * so one click undoes it. */
 	void Restart();
 
 	/* Reads the settings both sources have (frame rate, cursor). */
@@ -198,6 +207,9 @@ private:
 
 	std::atomic<State> state = State::Idle;
 	std::atomic_bool user_stopped = false;
+	/* restart_generation (capture-source.cpp) when user_stopped was set: the source starts again once any
+	 * source's "Start capture" button has moved the module-wide counter on */
+	std::atomic_uint32_t stopped_generation = 0;
 	std::atomic_bool capture_cursor = true;
 	std::atomic_int fps = 30;
 	std::atomic_uint32_t session_generation = 0;

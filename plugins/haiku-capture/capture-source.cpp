@@ -35,7 +35,11 @@ namespace {
 
 /* How long the user gets to answer the prompt (the API's default). After that the state is "denied" and the
  * properties offer "Try again"; a late answer in the prompt still counts then (the app_server keeps the request). */
-const bigtime_t kPermissionTimeout = 120000000;
+const uint64_t kPermissionTimeout = 120000000000ULL;
+/* The permission thread asks in slices of this length, so that it can be stopped within about this time */
+const bigtime_t kPermissionSlice = 1000000;
+/* See prompt_on_screen() */
+const uint64_t kPromptSettle = 250000000ULL;
 
 const uint64_t kStatePoll = 250000000ULL;      /* how often a thread that waits for the user looks again */
 const uint64_t kPermissionPoll = 100000000ULL; /* ... and while the prompt is up */
@@ -46,9 +50,13 @@ const uint64_t kStatsInterval = 10000000000ULL;
 struct PermissionGate {
 	std::mutex mutex;
 	CapturePermission state = CapturePermission::Unknown;
+	std::thread thread;
+	StopSignal stop;
+	bool shut_down = false;
 };
 
-/* Never destroyed: the helper thread is detached and may still be inside Start() when the process exits. */
+/* Never destroyed: obs_module_unload() joins the thread, but a static destructor running after that (or
+ * without it, at exit()) must not find a joinable std::thread. */
 PermissionGate &permission_gate()
 {
 	static PermissionGate *gate = new PermissionGate;
@@ -65,17 +73,89 @@ std::string application_signature()
 }
 
 /*
+ * Whether a Screen recording prompt ("ScreenRecording --prompt <request>", launched by the app_server:
+ * ScreenCaptureManager::_LaunchAgent()) is running.
+ *
+ * Needed because BScreenCapture::_Start() returns B_NOT_ALLOWED both when the user said no and when its own
+ * timeout ran out while the app_server still answered B_WOULD_BLOCK (src/kits/interface/ScreenCapture.cpp).
+ * A timeout leaves the request on the app_server, so asking again just goes on waiting for it. But a "no"
+ * without "Remember my decision" is consumed by the Start that returned it (ScreenCaptureManager::_Start()),
+ * and asking again would show a second prompt. A slice that ends at its timeout can also have read such a no
+ * (the reply to its last round trip, which starts after the deadline), so the return value alone can't tell.
+ * The prompt quits as soon as it is answered (PromptWindow in src/preferences/screenrecording), so: prompt
+ * still up after a short settle time -> the request is pending; gone -> it was answered, and the answer was
+ * the B_NOT_ALLOWED we got. (In the unlikely case that the user answers in the few milliseconds between that
+ * reply and this check, the answer is still on the app_server and "Try again" picks it up.)
+ *
+ * Any application's prompt counts (the request id isn't returned to the client): with two applications asking
+ * at once this can take another application's prompt for ours and ask once more. Renga request: a way for
+ * Start() to report "still pending" distinctly (B_WOULD_BLOCK for a zero timeout) would replace this.
+ */
+bool prompt_running()
+{
+	static const char kPrompt[] = SCREEN_CAPTURE_AGENT_PATH " --prompt";
+	int32 cookie = 0;
+	team_info info;
+	while (get_next_team_info(&cookie, &info) == B_OK) {
+		/* args: the command line, cut to 63 characters; the prefix fits */
+		if (strncmp(info.args, kPrompt, sizeof(kPrompt) - 1) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool prompt_on_screen(StopSignal &stop)
+{
+	if (!prompt_running()) {
+		return false;
+	}
+	/* Answered just now: give the prompt the time to quit (it posts B_QUIT_REQUESTED right after answering) */
+	stop.WaitFor(kPromptSettle);
+	return prompt_running();
+}
+
+/*
  * Asks through a session of its own for one pixel, which is stopped again at once: the permission belongs to
  * the application, not to a session, so the sources' own sessions start without a prompt afterwards.
- * B_NOT_ALLOWED stands for "Don't allow" as well as for no answer within the timeout.
+ * B_NOT_ALLOWED stands for "Don't allow" as well as for no answer within kPermissionTimeout.
+ *
+ * Starting that session shows the Screen recording indicator for a moment (ScreenCaptureManager::_Start() ->
+ * _EnsureIndicator()); the sources' sessions start right after it, so it normally just stays up.
  */
 void permission_thread()
 {
 	os_set_thread_name("haiku-capture-permission");
 
+	PermissionGate &gate = permission_gate();
 	BScreenCapture probe;
-	const status_t status = probe.StartRegion(BRect(0, 0, 0, 0), 0, kPermissionTimeout);
-	probe.Stop();
+	const uint64_t deadline = os_gettime_ns() + kPermissionTimeout;
+	status_t status = B_NOT_ALLOWED;
+
+	while (!gate.stop.Stopped()) {
+		/* Every BScreenCapture call goes through be_app's app_server connection (AppServerLink) */
+		if (!be_app) {
+			status = B_NO_INIT;
+			break;
+		}
+		const uint64_t before = os_gettime_ns();
+		status = probe.StartRegion(BRect(0, 0, 0, 0), 0, kPermissionSlice);
+		const bool slice_ran_out = os_gettime_ns() - before >= (uint64_t)kPermissionSlice * 1000ULL;
+		if (status != B_NOT_ALLOWED || !slice_ran_out || os_gettime_ns() >= deadline) {
+			break;
+		}
+		if (!prompt_on_screen(gate.stop)) {
+			break;
+		}
+	}
+	/* Only a running session costs a round trip */
+	if (be_app) {
+		probe.Stop();
+	}
+
+	if (gate.stop.Stopped()) {
+		return; /* unloading: nobody reads the state any more */
+	}
 
 	const std::string signature = application_signature();
 	if (status == B_OK) {
@@ -89,10 +169,12 @@ void permission_thread()
 		     strerror(status), signature.c_str());
 	}
 
-	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
 	gate.state = status == B_OK ? CapturePermission::Granted : CapturePermission::Denied;
 }
+
+/* Moved on by any source's "Start capture" button: see CaptureSource::Restart() */
+std::atomic_uint32_t restart_generation = 0;
 
 /* Bitmaps only grow, in steps: a window being resized doesn't get a new one every frame. */
 int32 round_up(int32 value)
@@ -115,10 +197,15 @@ CapturePermission capture_permission_poll()
 {
 	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
-	if (gate.state == CapturePermission::Unknown) {
+	if (gate.state == CapturePermission::Unknown && !gate.shut_down) {
+		/* A thread from an earlier question has set the state (its last action) and is returning or has
+		 * returned: this join doesn't wait for anything that needs the lock held here */
+		if (gate.thread.joinable()) {
+			gate.thread.join();
+		}
 		gate.state = CapturePermission::Asking;
 		try {
-			std::thread(permission_thread).detach();
+			gate.thread = std::thread(permission_thread);
 		} catch (const std::system_error &error) {
 			blog(LOG_ERROR, "[haiku-capture] Unable to start the permission thread: %s", error.what());
 			gate.state = CapturePermission::Denied;
@@ -142,6 +229,22 @@ void capture_permission_retry()
 	std::lock_guard<std::mutex> lock(gate.mutex);
 	if (gate.state == CapturePermission::Denied) {
 		gate.state = CapturePermission::Unknown;
+	}
+}
+
+void capture_permission_shutdown()
+{
+	PermissionGate &gate = permission_gate();
+	std::thread thread;
+	{
+		std::lock_guard<std::mutex> lock(gate.mutex);
+		gate.shut_down = true;
+		thread = std::move(gate.thread);
+	}
+	/* The thread returns after the round trip it is in, at most one slice (kPermissionSlice) */
+	gate.stop.Stop();
+	if (thread.joinable()) {
+		thread.join();
 	}
 }
 
@@ -203,6 +306,8 @@ void CaptureSource::Hide()
 
 void CaptureSource::Restart()
 {
+	/* Also every other source that the user stopped: their capture threads see the new generation */
+	restart_generation++;
 	user_stopped = false;
 	capture_permission_retry();
 }
@@ -349,6 +454,9 @@ void CaptureSource::Run()
 	while (!stop.Stopped()) {
 		/* The user said stop: only the button in the properties starts a capture again, not hiding and
 		 * showing the source (a scene switch) or a settings change. */
+		if (user_stopped && stopped_generation != restart_generation) {
+			user_stopped = false; /* "Start capture" on another source */
+		}
 		if (user_stopped) {
 			SetState(State::StoppedByUser);
 			stop.WaitFor(kStatePoll);
@@ -465,6 +573,7 @@ void CaptureSource::Run()
 				 * button; the picture goes too, the user doesn't expect it to stay on stream. */
 				capture.Stop();
 				ClearOutput();
+				stopped_generation = restart_generation.load();
 				user_stopped = true;
 				continue;
 			}

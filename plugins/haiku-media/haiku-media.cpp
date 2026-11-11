@@ -30,6 +30,7 @@ extern void haiku_register_audio_input(void);
 extern void haiku_register_video_input(void);
 extern void haiku_register_desktop_audio(void);
 extern void haiku_register_application_audio(void);
+extern void haiku_application_audio_shutdown(void);
 
 bool obs_module_load(void)
 {
@@ -38,4 +39,13 @@ bool obs_module_load(void)
 	haiku_register_desktop_audio();
 	haiku_register_application_audio();
 	return true;
+}
+
+/* Joins the thread that lists the applications for Application Audio Capture (loopback-audio.cpp). The
+ * sources' own threads go with the sources, which the frontend releases before obs_shutdown(); a source that
+ * is still destroyed later (obs_free_data() runs after the modules are unloaded) only unregisters from the list,
+ * and no new thread is started then. */
+void obs_module_unload(void)
+{
+	haiku_application_audio_shutdown();
 }

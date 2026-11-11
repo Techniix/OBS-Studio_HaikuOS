@@ -225,8 +225,10 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 	/* The stream exists now (BSoundPlayer connects when it is created). It inherits the route the mixer
 	 * saved for OBS's signature; set it anyway, on all of OBS's streams, so that a device change (which
 	 * resets every monitor, obs_set_audio_monitoring_device()) and a route changed in Media preferences
-	 * both end up on the device OBS is set to. Not fatal: the stream plays on the default output. */
-	obs_haiku_route_streams(id);
+	 * both end up on the device OBS is set to. Not fatal: the stream plays on the default output until the
+	 * route is set. On the routing thread (haiku-sound-player.cpp): this runs on the thread that creates or
+	 * resets the monitor, often the UI thread, which must not wait for the mixer. */
+	obs_haiku_route_streams_async(id);
 
 	return true;
 }

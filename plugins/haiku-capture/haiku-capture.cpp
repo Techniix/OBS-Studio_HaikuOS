@@ -27,10 +27,21 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 extern void haiku_register_screen_capture(void);
 extern void haiku_register_window_capture(void);
+extern void capture_permission_shutdown(void);
 
 bool obs_module_load(void)
 {
 	haiku_register_screen_capture();
 	haiku_register_window_capture();
 	return true;
+}
+
+/*
+ * Joins the thread that asks for the screen recording permission (capture-source.cpp). libobs calls this from
+ * obs_shutdown() (free_module()), which the frontend runs in OBSApp's destructor body (applicationShutdown()),
+ * that is before ~QApplication and so while be_app, which every BScreenCapture call needs, still exists.
+ */
+void obs_module_unload(void)
+{
+	capture_permission_shutdown();
 }

@@ -37,15 +37,25 @@
  *  - a stream that appears later inherits the route the mixer last saved for OBS; it is set again anyway
  *    after each player starts (haiku-output.c), so that a route changed elsewhere (Media preferences) is
  *    brought back to OBS's setting.
+ *
+ * Setting a route reads the mixer's whole parameter web and sets a parameter on the mixer: round trips that
+ * audio_monitor_init() would otherwise make on whatever thread creates or resets a monitor (the UI thread,
+ * for a source added or a monitoring device changed). So obs_haiku_route_streams_async() hands them to one
+ * worker thread, which does the latest request only: a device change resets every monitor, and the requests
+ * that come in meanwhile all ask for the same thing.
  */
 
 #include "haiku-sound-player.h"
 
 #include "../../util/base.h"
+#include "../../util/threading.h"
 
+#include <condition_variable>
 #include <mutex>
 #include <new>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #include <string.h>
@@ -209,6 +219,90 @@ extern "C" bool obs_haiku_route_streams(const char *device_id)
 	return true;
 }
 
+/* The routing worker. It lives while there are players (or a request): it returns by itself when the last
+ * player is gone and nothing is pending, so neither destroying a player nor creating one ever waits for a
+ * round trip to the mixer. The state is never destroyed, so no joinable std::thread is left to a static
+ * destructor at exit. */
+struct RouteWorker {
+	std::mutex mutex;
+	std::condition_variable cond;
+	std::thread thread;
+	bool running = false; /* the thread is in its loop: a request needs no new thread */
+	bool pending = false;
+	std::string device_id;
+	int players = 0;
+};
+
+static RouteWorker &route_worker()
+{
+	static RouteWorker *worker = new RouteWorker;
+	return *worker;
+}
+
+static void route_worker_run()
+{
+	os_set_thread_name("obs-haiku-monitor-route");
+	RouteWorker &w = route_worker();
+	std::unique_lock<std::mutex> lock(w.mutex);
+	for (;;) {
+		if (!w.pending) {
+			if (w.players == 0)
+				break;
+			w.cond.wait(lock);
+			continue;
+		}
+		w.pending = false;
+		const std::string id = w.device_id;
+		lock.unlock();
+		obs_haiku_route_streams(id.c_str());
+		lock.lock();
+	}
+	/* Under the lock, so that a request after this point starts a new thread */
+	w.running = false;
+}
+
+/* With the lock held. A thread that has left its loop is joined first: it is returning, not waiting. */
+static void route_worker_ensure(RouteWorker &w)
+{
+	if (w.running)
+		return;
+	if (w.thread.joinable())
+		w.thread.join();
+	try {
+		w.thread = std::thread(route_worker_run);
+		w.running = true;
+	} catch (const std::system_error &error) {
+		blog(LOG_WARNING, "[audio monitoring] Cannot start the routing thread: %s", error.what());
+	}
+}
+
+extern "C" void obs_haiku_route_streams_async(const char *device_id)
+{
+	RouteWorker &w = route_worker();
+	std::lock_guard<std::mutex> lock(w.mutex);
+	w.device_id = device_id ? device_id : "";
+	w.pending = true;
+	route_worker_ensure(w);
+	w.cond.notify_all();
+}
+
+static void route_worker_player_added()
+{
+	RouteWorker &w = route_worker();
+	std::lock_guard<std::mutex> lock(w.mutex);
+	w.players++;
+}
+
+static void route_worker_player_removed()
+{
+	RouteWorker &w = route_worker();
+	std::lock_guard<std::mutex> lock(w.mutex);
+	if (w.players > 0)
+		w.players--;
+	/* an idle worker leaves when it wakes and finds no players */
+	w.cond.notify_all();
+}
+
 /* ------------------------------------------------------------------------- */
 /* Players                                                                   */
 
@@ -336,6 +430,7 @@ extern "C" obs_haiku_sound_player *obs_haiku_sound_player_create(const char *nam
 		delete p;
 		return NULL;
 	}
+	route_worker_player_added();
 	return p;
 }
 
@@ -353,4 +448,5 @@ extern "C" void obs_haiku_sound_player_destroy(obs_haiku_sound_player *p)
 		return;
 	free_player(p);
 	delete p;
+	route_worker_player_removed();
 }

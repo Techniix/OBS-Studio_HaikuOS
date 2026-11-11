@@ -157,6 +157,15 @@ void *browser_create(obs_data_t *settings, obs_source_t *source)
 {
 	BrowserSource *bs = new BrowserSource;
 	bs->source = source;
+	/*
+	 * Show each frame at the next render instead of pacing frames by their timestamps, as the capture sources
+	 * do (plugins/haiku-capture). Only frames the page repainted are output (OutputFrame()), and libobs's
+	 * pacing (ready_async_frame() in obs-source.c) only moves its clock on (last_frame_ts += sys_offset) while
+	 * frames are queued: after a static page, the first frame of a change and every frame after it would be
+	 * shown late by the length of the pause (up to MAX_TS_VAR, 2 s, after which it resynchronises). Frames
+	 * are stamped when the helper publishes them, so buffering has nothing to smooth out here.
+	 */
+	obs_source_set_async_unbuffered(source, true);
 	HaikuBrowserClient::Callbacks callbacks;
 	callbacks.frame = [bs](const HaikuBrowserFrame &frame) { bs->OutputFrame(frame); };
 	bs->client = std::make_unique<HaikuBrowserClient>(obs_source_get_name(source), std::move(callbacks));

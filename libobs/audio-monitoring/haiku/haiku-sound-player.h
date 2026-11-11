@@ -64,6 +64,10 @@ void obs_haiku_sound_player_destroy(struct obs_haiku_sound_player *player);
  * failure is logged once per device. */
 bool obs_haiku_route_streams(const char *device_id);
 
+/* The same on a worker thread of its own; returns at once. Requests made while one is being carried out are
+ * coalesced: only the latest one runs next. */
+void obs_haiku_route_streams_async(const char *device_id);
+
 #ifdef __cplusplus
 }
 #endif

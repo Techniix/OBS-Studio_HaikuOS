@@ -85,7 +85,10 @@ that file are kept consistent.
 
 - **Need.** A timeout returns `B_NOT_ALLOWED`, like a "no"; OBS cannot tell the user which happened. OBS needs
   a helper thread and a 1-pixel probe session to ask without blocking.
-- **Proposed interface.** `B_TIMED_OUT` for an unanswered prompt; `BScreenCapture::RequestPermission(
+- **Also:** a timeout and a non-remembered "Don't allow" both return `B_NOT_ALLOWED`, so OBS, which asks in
+  1-second slices so it can stop at quit, checks whether the `ScreenRecording --prompt` process is still running
+  to tell them apart. That check can mistake another application's prompt for OBS's.
+- **Proposed interface.** `B_TIMED_OUT` for an unanswered prompt (or `B_WOULD_BLOCK` while still pending); `BScreenCapture::RequestPermission(
   BMessenger target, uint32 sources)` that returns at once and sends the answer as a message.
 
 ### O-8 Frame notification

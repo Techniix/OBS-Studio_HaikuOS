@@ -39,13 +39,17 @@
 
 #include <util/dstr.h>
 #include <util/platform.h>
+#include <util/threading.h>
 #include <util/util_uint64.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #include <List.h>
@@ -139,7 +143,7 @@ private:
 /* The signature of this program, as the system mixer sees it: the mixer names a stream's application with
  * be_roster->GetRunningAppInfo() of the team that owns the stream's port
  * (AudioMixer::_IdentifyApplication()). */
-std::string own_signature()
+std::string lookup_own_signature()
 {
 	thread_info thread;
 	app_info app;
@@ -149,6 +153,21 @@ std::string own_signature()
 	return app.signature;
 }
 
+/* A registrar round trip, so only once; the signature doesn't change while the program runs. Not cached
+ * while there is no be_roster yet (nothing to compare with then). */
+std::string own_signature()
+{
+	static std::mutex mutex;
+	static std::string signature;
+	static bool known = false;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (!known) {
+		signature = lookup_own_signature();
+		known = be_roster != nullptr;
+	}
+	return signature;
+}
+
 struct LoopbackAudio {
 	obs_source_t *source;
 	const bool per_application; /* Application Audio Capture; false: Desktop Audio */
@@ -156,7 +175,10 @@ struct LoopbackAudio {
 
 	/* recorder thread */
 	MixerClock clock;
-	int clock_state = -1; /* last logged: 1 mixer time source, 0 arrival time */
+	int clock_state = -1; /* last logged: 2 mixer time source, 1 last offset, 0 arrival time */
+	/* real time of the last buffer converted through the time source minus its arrival (system_time()) */
+	bool have_offset = false;
+	int64_t last_offset_us = 0;
 
 	/* opens the loopback and keeps it open, retrying while the media services are down (media-device.hpp).
 	 * Declared last: it is destroyed first, which stops the threads that call into this object. */
@@ -198,16 +220,29 @@ void LoopbackAudio::OnBuffer(const void *data, size_t size, const media_format &
 	if (exact) {
 		/* usually a little ahead of now: the mixer mixes a buffer its downstream latency before the
 		 * sound card plays it */
-		const int64_t offset_ns = (int64_t)(real - now) * 1000;
-		audio.timestamp = offset_ns >= 0 ? now_ns + (uint64_t)offset_ns : now_ns - (uint64_t)(-offset_ns);
-	} else {
-		/* no usable time source (yet): stamped on arrival, like a sound card input */
-		audio.timestamp = now_ns - util_mul_div64(audio.frames, 1000000000ULL, audio.samples_per_sec);
+		last_offset_us = (int64_t)(real - now);
+		have_offset = true;
 	}
-	if (clock_state != (int)exact) {
-		clock_state = (int)exact;
-		blog(LOG_INFO, "[haiku-media] '%s': time stamps from %s", obs_source_get_name(source),
-		     exact ? "the mixer's time source" : "the arrival time of the buffers");
+	int state;
+	if (have_offset) {
+		/* Not exact: the time source is being looked up again (the default output changed, so the mixer's
+		 * time source did; MixerClock tries once a second) or gave an implausible time. Keep the last
+		 * offset instead of switching to arrival stamps, which lie about a latency earlier and would make
+		 * the stamps jump back and forth by that much; the next good conversion corrects it. */
+		const int64_t offset_ns = last_offset_us * 1000;
+		audio.timestamp = offset_ns >= 0 ? now_ns + (uint64_t)offset_ns : now_ns - (uint64_t)(-offset_ns);
+		state = exact ? 2 : 1;
+	} else {
+		/* no usable time source yet: stamped on arrival, like a sound card input */
+		audio.timestamp = now_ns - util_mul_div64(audio.frames, 1000000000ULL, audio.samples_per_sec);
+		state = 0;
+	}
+	if (clock_state != state) {
+		clock_state = state;
+		static const char *const names[] = {"the arrival time of the buffers",
+						    "the mixer's time source, as last converted",
+						    "the mixer's time source"};
+		blog(LOG_INFO, "[haiku-media] '%s': time stamps from %s", obs_source_get_name(source), names[state]);
 	}
 
 	obs_source_output_audio(source, &audio);
@@ -253,6 +288,10 @@ void loopback_destroy(void *data)
 	delete static_cast<LoopbackAudio *>(data);
 }
 
+/* The list of applications for the properties (below) */
+void application_list_register(obs_source_t *source);
+void application_list_unregister(obs_source_t *source);
+
 /* ------------------------------------------------------------------------------------------------------ */
 /* Desktop Audio                                                                                          */
 
@@ -297,7 +336,15 @@ const char *application_audio_get_name(void *)
 
 void *application_audio_create(obs_data_t *settings, obs_source_t *source)
 {
-	return loopback_create(settings, source, true);
+	void *data = loopback_create(settings, source, true);
+	application_list_register(source);
+	return data;
+}
+
+void application_audio_destroy(void *data)
+{
+	application_list_unregister(static_cast<LoopbackAudio *>(data)->source);
+	loopback_destroy(data);
 }
 
 void application_audio_defaults(obs_data_t *settings)
@@ -305,78 +352,236 @@ void application_audio_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, S_APPLICATION, "");
 }
 
-/* The choices: applications that play something now (the system mixer's streams, by name), the other running
+/*
+ * The choices: applications that play something now (the system mixer's streams, by name), the other running
  * applications (they may start playing later; the loopback follows an application by its signature, also
  * across the application quitting and starting again: the mix thread compares every stream's signature with
- * the loopback's each cycle, MixerCore::_InputFade()), and the saved application if it is neither. */
+ * the loopback's each cycle, MixerCore::_InputFade()), and the saved application if it is neither.
+ *
+ * Reading them takes round trips to the mixer (AudioStreamControl::Update() fetches its whole parameter web)
+ * and to the registrar, which libobs's get_properties and button callbacks would make on the UI thread. So a
+ * thread of this file keeps the list: it reads it when asked (a properties dialog opening with an old list,
+ * the Refresh button) and every few seconds while an Application Audio source exists, and reloads the
+ * sources' properties (obs_source_update_properties(), queued to the UI thread by the frontend) when the list
+ * changed or Refresh was pressed. The properties are built from the last list, without waiting.
+ */
+struct ApplicationEntry {
+	std::string signature;
+	std::string name;
+	bool playing; /* name: the stream's display name; else the application's file name */
+
+	bool operator==(const ApplicationEntry &other) const
+	{
+		return signature == other.signature && name == other.name && playing == other.playing;
+	}
+};
+
+/* Every few seconds while a source exists: streams come and go without a dialog being reopened */
+const uint64_t kListRefreshInterval = 3000000000ULL;
+/* A dialog opened within this time of the last read uses that list without asking for another */
+const uint64_t kListFreshFor = 2000000000ULL;
+
+class ApplicationList {
+public:
+	void Register(obs_source_t *source)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		sources.push_back(source);
+		if (!stop && !thread.joinable()) {
+			try {
+				thread = std::thread([this]() { Run(); });
+			} catch (const std::system_error &error) {
+				blog(LOG_ERROR, "[haiku-media] cannot start the application list thread: %s",
+				     error.what());
+			}
+		}
+		requested = true;
+		cond.notify_all();
+	}
+
+	/* Before the source goes away: afterwards the thread doesn't reload its properties any more */
+	void Unregister(obs_source_t *source)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		sources.erase(std::remove(sources.begin(), sources.end(), source), sources.end());
+	}
+
+	/* From get_properties: the list as it is; asks for a new one if it is old. */
+	std::vector<ApplicationEntry> Get()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!have_list || os_gettime_ns() - read_at >= kListFreshFor) {
+			requested = true;
+			cond.notify_all();
+		}
+		return entries;
+	}
+
+	/* The Refresh button: read now, and reload the properties when done even if nothing changed */
+	void Refresh()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		requested = true;
+		notify_always = true;
+		cond.notify_all();
+	}
+
+	/* obs_module_unload(): every source is gone by then; waits for at most one read */
+	void Shutdown()
+	{
+		std::thread worker;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			stop = true;
+			worker = std::move(thread);
+		}
+		cond.notify_all();
+		if (worker.joinable())
+			worker.join();
+	}
+
+private:
+	void Run()
+	{
+		os_set_thread_name("haiku-app-audio-list");
+		/* The object is not thread safe: this thread is its only user */
+		BPrivate::AudioStreamControl control;
+
+		std::unique_lock<std::mutex> lock(mutex);
+		while (!stop) {
+			if (!requested) {
+				if (sources.empty())
+					cond.wait(lock);
+				else
+					cond.wait_for(lock, std::chrono::nanoseconds(kListRefreshInterval));
+				if (stop)
+					break;
+				if (!requested && sources.empty())
+					continue;
+			}
+			requested = false;
+			const bool always = notify_always;
+			notify_always = false;
+
+			lock.unlock();
+			std::vector<ApplicationEntry> fresh = Read(control);
+			lock.lock();
+
+			const bool changed = !have_list || fresh != entries;
+			entries = std::move(fresh);
+			have_list = true;
+			read_at = os_gettime_ns();
+			if (changed || always) {
+				/* Under the lock: Unregister() can't let a source go meanwhile. The frontend queues the
+				 * reload to the UI thread, so this doesn't call back into Get(). */
+				for (obs_source_t *source : sources)
+					obs_source_update_properties(source);
+			}
+		}
+	}
+
+	static std::vector<ApplicationEntry> Read(BPrivate::AudioStreamControl &control)
+	{
+		const std::string self = own_signature();
+		std::vector<ApplicationEntry> list;
+
+		auto wanted = [&](const char *signature) {
+			return signature && *signature && self != signature &&
+			       std::find_if(list.begin(), list.end(), [&](const ApplicationEntry &entry) {
+				       return entry.signature == signature;
+			       }) == list.end();
+		};
+
+		/* Each stream is a group of the mixer's parameter web: its display name, and the application's
+		 * signature as a hidden parameter of kind "renga:app_signature". Streams of the media add-on
+		 * server and of programs without a signature have none and cannot be told apart by the loopback. */
+		if (BMediaRoster::IsRunning() && control.Update() == B_OK) {
+			for (int32 i = 0; i < control.CountStreams(); i++) {
+				const BPrivate::AudioStream *stream = control.StreamAt(i);
+				if (wanted(stream->signature.String()))
+					list.push_back({stream->signature.String(), stream->name.String(), true});
+			}
+		}
+
+		if (be_roster) {
+			BList teams;
+			be_roster->GetAppList(&teams);
+			for (int32 i = 0; i < teams.CountItems(); i++) {
+				app_info app;
+				if (be_roster->GetRunningAppInfo((team_id)(addr_t)teams.ItemAt(i), &app) != B_OK)
+					continue;
+				/* servers and other programs without a face are only listed while they play (above) */
+				if ((app.flags & B_BACKGROUND_APP) || !wanted(app.signature))
+					continue;
+				list.push_back({app.signature, app.ref.name ? app.ref.name : app.signature, false});
+			}
+		}
+		return list;
+	}
+
+	std::mutex mutex;
+	std::condition_variable cond;
+	std::vector<obs_source_t *> sources; /* the Application Audio sources */
+	std::vector<ApplicationEntry> entries;
+	bool have_list = false;
+	uint64_t read_at = 0;
+	bool requested = false;
+	bool notify_always = false;
+	bool stop = false;
+	std::thread thread;
+};
+
+/* Never destroyed: obs_module_unload() joins its thread; a static destructor must not find it joinable */
+ApplicationList &application_list()
+{
+	static ApplicationList *list = new ApplicationList;
+	return *list;
+}
+
+void application_list_register(obs_source_t *source)
+{
+	application_list().Register(source);
+}
+
+void application_list_unregister(obs_source_t *source)
+{
+	application_list().Unregister(source);
+}
+
 void fill_application_list(obs_property_t *list, const char *current)
 {
 	obs_property_list_clear(list);
 	obs_property_list_add_string(list, T_("Application.Select"), "");
 
-	const std::string self = own_signature();
-	std::vector<std::string> listed;
 	struct dstr label = {0};
-
-	auto wanted = [&](const char *signature) {
-		return signature && *signature && self != signature &&
-		       std::find(listed.begin(), listed.end(), signature) == listed.end();
-	};
-
-	/* Each stream is a group of the mixer's parameter web: its display name, and the application's
-	 * signature as a hidden parameter of kind "renga:app_signature". Streams of the media add-on server
-	 * and of programs without a signature have none and cannot be told apart by the loopback. */
-	if (BMediaRoster::IsRunning()) {
-		BPrivate::AudioStreamControl control;
-		if (control.Update() == B_OK) {
-			for (int32 i = 0; i < control.CountStreams(); i++) {
-				const BPrivate::AudioStream *stream = control.StreamAt(i);
-				if (!wanted(stream->signature.String()))
-					continue;
-				dstr_printf(&label, T_("Application.Playing"), stream->name.String());
-				obs_property_list_add_string(list, label.array, stream->signature.String());
-				listed.push_back(stream->signature.String());
-			}
+	bool current_listed = false;
+	for (const ApplicationEntry &entry : application_list().Get()) {
+		if (entry.playing) {
+			dstr_printf(&label, T_("Application.Playing"), entry.name.c_str());
+			obs_property_list_add_string(list, label.array, entry.signature.c_str());
+		} else {
+			obs_property_list_add_string(list, entry.name.c_str(), entry.signature.c_str());
 		}
+		current_listed = current_listed || entry.signature == current;
 	}
 
-	if (be_roster) {
-		BList teams;
-		be_roster->GetAppList(&teams);
-		for (int32 i = 0; i < teams.CountItems(); i++) {
-			app_info app;
-			if (be_roster->GetRunningAppInfo((team_id)(addr_t)teams.ItemAt(i), &app) != B_OK)
-				continue;
-			/* servers and other programs without a face are only listed while they play (above) */
-			if ((app.flags & B_BACKGROUND_APP) || !wanted(app.signature))
-				continue;
-			obs_property_list_add_string(list, app.ref.name, app.signature);
-			listed.push_back(app.signature);
-		}
-	}
-
-	if (wanted(current)) {
+	if (current && *current && !current_listed && own_signature() != current) {
 		dstr_printf(&label, T_("Application.NotRunning"), current);
 		obs_property_list_add_string(list, label.array, current);
 	}
 	dstr_free(&label);
 }
 
-bool application_audio_refresh(obs_properties_t *props, obs_property_t *, void *data)
+bool application_audio_refresh(obs_properties_t *, obs_property_t *, void *)
 {
-	LoopbackAudio *la = static_cast<LoopbackAudio *>(data);
-	std::string current;
-	if (la) {
-		obs_data_t *settings = obs_source_get_settings(la->source);
-		current = obs_data_get_string(settings, S_APPLICATION);
-		obs_data_release(settings);
-	}
-	fill_application_list(obs_properties_get(props, S_APPLICATION), current.c_str());
-	return true; /* rebuild the widgets */
+	/* Read on the list's thread; it reloads the properties when it has the new list */
+	application_list().Refresh();
+	return false;
 }
 
 obs_properties_t *application_audio_properties(void *data)
 {
+	LoopbackAudio *la = static_cast<LoopbackAudio *>(data);
 	obs_properties_t *props = obs_properties_create();
 
 	obs_property_t *list = obs_properties_add_list(props, S_APPLICATION, T_("Application"), OBS_COMBO_TYPE_LIST,
@@ -384,7 +589,13 @@ obs_properties_t *application_audio_properties(void *data)
 	obs_property_set_long_description(list, T_("Application.Description"));
 	obs_properties_add_button2(props, S_REFRESH, T_("Refresh"), application_audio_refresh, data);
 
-	application_audio_refresh(props, nullptr, data);
+	std::string current;
+	if (la) {
+		obs_data_t *settings = obs_source_get_settings(la->source);
+		current = obs_data_get_string(settings, S_APPLICATION);
+		obs_data_release(settings);
+	}
+	fill_application_list(list, current.c_str());
 	return props;
 }
 
@@ -420,9 +631,14 @@ void haiku_register_application_audio(void)
 	info.icon_type = OBS_ICON_TYPE_PROCESS_AUDIO_OUTPUT;
 	info.get_name = application_audio_get_name;
 	info.create = application_audio_create;
-	info.destroy = loopback_destroy;
+	info.destroy = application_audio_destroy;
 	info.update = loopback_update;
 	info.get_defaults = application_audio_defaults;
 	info.get_properties = application_audio_properties;
 	obs_register_source(&info);
+}
+
+void haiku_application_audio_shutdown(void)
+{
+	application_list().Shutdown();
 }
