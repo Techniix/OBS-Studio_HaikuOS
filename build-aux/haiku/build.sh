@@ -8,15 +8,22 @@ set -u
 set -o pipefail
 
 SRC="$(cd "$(dirname "$0")/../.." && pwd)"
-BUILD="${1:-$SRC/build}"
-shift || true
+# An argument starting with "-" is a CMake argument, not the build directory
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+	BUILD="$1"
+	shift
+else
+	BUILD="$SRC/build"
+fi
 
 # Submodules used on Haiku (libdshowcapture isn't needed; of obs-browser only the panel interface header is used)
 SUBMODULES=(deps/simde deps/asio deps/websocketpp deps/srt deps/librist plugins/obs-websocket plugins/obs-browser)
 if [ -e "$SRC/.git" ]; then
 	# Always update: after a pull that moves a submodule pin, an existing checkout would otherwise stay on the old commit
 	echo "==> Updating submodules: ${SUBMODULES[*]}"
-	git -C "$SRC" submodule update --init --recursive "${SUBMODULES[@]}" || exit 1
+	# sync first: picks up submodule URL changes in .gitmodules (only touches submodules already initialized)
+	git -C "$SRC" submodule sync --recursive -- "${SUBMODULES[@]}" >/dev/null || exit 1
+	git -C "$SRC" submodule update --init --recursive -- "${SUBMODULES[@]}" || exit 1
 else
 	missing=()
 	for m in "${SUBMODULES[@]}"; do

@@ -361,17 +361,29 @@ static obs_key_t MapQtKey(const QKeyEvent *event)
 	return obs_key_from_virtual_key((int)event->nativeVirtualKey());
 }
 
+/* Keys that are, or by default are, modifiers. Keys the keymap turns into modifiers map to the OBS modifier
+ * keys and are skipped in PressedPhysicalKey() as well. */
 static bool IsModifierRawKey(int code)
 {
+	switch (obs_key_from_virtual_key(code)) {
+	case OBS_KEY_SHIFT:
+	case OBS_KEY_CONTROL:
+	case OBS_KEY_ALT:
+	case OBS_KEY_META:
+		return true;
+	default:
+		break;
+	}
+
 	switch (code) {
 	case 0x4b: /* left shift */
 	case 0x56: /* right shift */
 	case 0x5c: /* left control */
 	case 0x5d: /* left command (Alt) */
-	case 0x5f: /* right command (AltGr) */
+	case 0x5f: /* right Alt (AltGr; option in stock keymaps) */
 	case 0x60: /* right control */
-	case 0x66: /* left option (Windows) */
-	case 0x67: /* right option */
+	case 0x66: /* left Windows (option) */
+	case 0x67: /* right Windows (command in stock keymaps) */
 		return true;
 	default:
 		return false;
@@ -409,18 +421,18 @@ static obs_key_t PressedPhysicalKey(obs_key_t hint)
 obs_key_t HaikuObsKeyFromQtKeyEvent(const QKeyEvent *event)
 {
 	/* Qt key -> OBS key decided at press time, so the release maps to the same key even though the
-	 * physical key is no longer down by then. Only used from the UI thread. */
+	 * physical key is no longer down by then. Entries are kept (not erased on release): one event can be
+	 * translated by more than one caller (the hotkey event filter and the interaction dialog or the
+	 * hotkey edit), and each of them must get the same key for the release. The map holds at most one
+	 * entry per Qt key code. Only used from the UI thread. */
 	static std::map<int, obs_key_t> pressed;
 
 	const int qt_key = event->key();
 
 	if (event->type() == QEvent::KeyRelease) {
 		auto it = pressed.find(qt_key);
-		if (it != pressed.end()) {
-			obs_key_t key = it->second;
-			pressed.erase(it);
-			return key;
-		}
+		if (it != pressed.end())
+			return it->second;
 		return MapQtKey(event);
 	}
 

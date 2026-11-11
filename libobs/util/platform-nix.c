@@ -376,7 +376,13 @@ char *os_get_executable_path_ptr(const char *name)
 	int32 cookie = 0;
 	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &image) == B_OK) {
 		if (image.type == B_APP_IMAGE) {
-			count = snprintf(exe, sizeof(exe), "%s", image.name);
+			/* image.name is the path the program was exec()ed with, which is relative when it was
+			 * started as e.g. "./obs" (the kernel stores the path as given). Resolve it so the result
+			 * stays valid if the working directory changes. */
+			if (realpath(image.name, exe) != NULL)
+				count = (ssize_t)strlen(exe);
+			else
+				count = snprintf(exe, sizeof(exe), "%s", image.name);
 			break;
 		}
 	}

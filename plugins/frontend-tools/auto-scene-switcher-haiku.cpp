@@ -37,6 +37,10 @@ static bool GetAppName(team_id team, string &name)
 	if ((info.flags & B_BACKGROUND_APP) != 0)
 		return false;
 
+	/* ref.name is NULL for an app registered without an entry_ref */
+	if (info.ref.name == NULL)
+		return false;
+
 	name = info.ref.name;
 	return !name.empty();
 }

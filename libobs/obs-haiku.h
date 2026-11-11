@@ -39,6 +39,25 @@ extern "C" {
  * modifier mask (which reflects the user's Keymap preferences, e.g. swapped Ctrl/Alt). */
 bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTES], uint32_t *modifiers);
 
+/* Size of a key label buffer: one character of the keymap in UTF-8 (the keymap allows a few bytes more for
+ * keys that type several characters; those keep their built-in US name), plus the terminating NUL. */
+#define OBS_HAIKU_KEY_LABEL_SIZE 8
+
+/* The character the key with the given Haiku raw key code types in the user's current keymap without
+ * modifiers, upper-cased, as UTF-8 -- i.e. what is printed on that key of the user's keyboard ("Q" for raw
+ * key 0x3c with a French layout, where a US keyboard has "A"). Number row keys report their digit even on
+ * layouts that need Shift for it. Returns false if the key types nothing printable or the keymap cannot be
+ * read; callers then fall back to the US name. Safe to call from any thread, no BApplication needed. */
+bool obs_haiku_get_key_label(uint8_t code, char label[OBS_HAIKU_KEY_LABEL_SIZE]);
+
+/* Raw key code of the left or right key the user's keymap assigns to a modifier; `modifier` is one of
+ * OBS_HAIKU_COMMAND_KEY, OBS_HAIKU_CONTROL_KEY or OBS_HAIKU_OPTION_KEY. Stock Haiku keymaps put Command on
+ * the left Alt key (0x5d) and the right Windows key (0x67), Control on both Ctrl keys (0x5c, 0x60) and
+ * Option on the left Windows key (0x66) and right Alt/AltGr (0x5f); the Keymap preferences
+ * ("Windows/Linux" shortcut mode) and Renga's defaults swap Command and Control. Returns 0 if the keymap
+ * cannot be read or assigns no key. */
+uint32_t obs_haiku_get_modifier_raw_key(uint32_t modifier, bool right);
+
 /* Global mouse button bitmask (B_PRIMARY_MOUSE_BUTTON = 1, B_SECONDARY = 2, B_TERTIARY = 4, ...) from the
  * app_server. Returns false without a BApplication (the app_server link would call debugger()). */
 bool obs_haiku_get_mouse_buttons(uint32_t *buttons);

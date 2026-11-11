@@ -198,18 +198,20 @@ enum haiku_raw_key {
 	HK_NUM2 = 0x59,
 	HK_NUM3 = 0x5a,
 	HK_ENTER = 0x5b,
+	/* 0x5c, 0x5d, 0x5f, 0x60, 0x66 and 0x67 are the Ctrl, Alt, AltGr, right Ctrl and Windows keys; which
+	 * modifier each one is depends on the keymap, see modifier_raw_key(). */
 	HK_LCONTROL = 0x5c,
-	HK_LCOMMAND = 0x5d, /* left Alt on PC keyboards */
+	HK_LALT = 0x5d,
 	HK_SPACE = 0x5e,
-	HK_RCOMMAND = 0x5f, /* right Alt on PC keyboards */
+	HK_RALT = 0x5f,
 	HK_RCONTROL = 0x60,
 	HK_LEFT = 0x61,
 	HK_DOWN = 0x62,
 	HK_RIGHT = 0x63,
 	HK_NUM0 = 0x64,
 	HK_NUMPERIOD = 0x65,
-	HK_LOPTION = 0x66, /* left Windows key */
-	HK_ROPTION = 0x67, /* right Windows key */
+	HK_LWINDOWS = 0x66,
+	HK_RWINDOWS = 0x67,
 	HK_MENU = 0x68,
 	HK_LESS = 0x69, /* ISO "<>" key */
 };
@@ -219,7 +221,8 @@ struct haiku_key_map {
 	uint8_t code;
 };
 
-/* Primary mapping; for keys with a left and right variant, the second code is in key_alt_codes. */
+/* Raw key positions of the non-modifier keys (the US key caps name the OBS keys; see obs_key_to_str() for the
+ * labels of other layouts). Modifier keys are not in this table: their positions come from the keymap. */
 static const struct haiku_key_map key_map[] = {
 	{OBS_KEY_ESCAPE, HK_ESCAPE},
 	{OBS_KEY_F1, HK_F1 + 0},
@@ -295,7 +298,6 @@ static const struct haiku_key_map key_map[] = {
 	{OBS_KEY_NUM4, HK_NUM4},
 	{OBS_KEY_NUM5, HK_NUM5},
 	{OBS_KEY_NUM6, HK_NUM6},
-	{OBS_KEY_SHIFT, HK_LSHIFT},
 	{OBS_KEY_Z, 0x4c},
 	{OBS_KEY_X, 0x4d},
 	{OBS_KEY_C, 0x4e},
@@ -311,32 +313,64 @@ static const struct haiku_key_map key_map[] = {
 	{OBS_KEY_NUM2, HK_NUM2},
 	{OBS_KEY_NUM3, HK_NUM3},
 	{OBS_KEY_ENTER, HK_ENTER},
-	/* Modifiers follow the convention of Qt's Haiku platform plugin, which reports the Command key (Alt on PC
-	 * keyboards) as Control and the Control key as Alt. Bindings recorded in the Qt frontend therefore
-	 * round-trip. Pressed state of modifiers comes from key_info.modifiers, see below. */
-	{OBS_KEY_CONTROL, HK_LCOMMAND},
-	{OBS_KEY_ALT, HK_LCONTROL},
 	{OBS_KEY_SPACE, HK_SPACE},
 	{OBS_KEY_LEFT, HK_LEFT},
 	{OBS_KEY_DOWN, HK_DOWN},
 	{OBS_KEY_RIGHT, HK_RIGHT},
 	{OBS_KEY_NUM0, HK_NUM0},
 	{OBS_KEY_NUMPERIOD, HK_NUMPERIOD},
-	{OBS_KEY_META, HK_LOPTION},
 	{OBS_KEY_MENU, HK_MENU},
 	{OBS_KEY_LESS, HK_LESS},
 };
 
-/* Right-hand modifier keys that should also count as the generic modifier being held. */
-static const struct haiku_key_map key_alt_codes[] = {
-	{OBS_KEY_SHIFT, HK_RSHIFT},
-	{OBS_KEY_CONTROL, HK_RCOMMAND},
-	{OBS_KEY_ALT, HK_RCONTROL},
-	{OBS_KEY_META, HK_ROPTION},
-};
-
 #define KEY_MAP_COUNT (sizeof(key_map) / sizeof(key_map[0]))
-#define KEY_ALT_COUNT (sizeof(key_alt_codes) / sizeof(key_alt_codes[0]))
+
+/* Modifiers follow the convention of Qt's Haiku platform plugin (QHaikuSurfaceView::hostToQtModifiers()),
+ * which reports B_COMMAND_KEY as Qt::ControlModifier and B_CONTROL_KEY as Qt::AltModifier, and never reports
+ * B_OPTION_KEY. So OBS_KEY_CONTROL is the Haiku Command modifier, OBS_KEY_ALT the Haiku Control modifier and
+ * OBS_KEY_META the Haiku Option modifier, and bindings recorded in the Qt frontend round-trip. Which physical
+ * keys produce those modifiers is up to the keymap (stock Haiku: Command = Alt key, Renga and the Keymap
+ * preferences' "Windows/Linux" mode: Command = Ctrl key), so their positions are read from it. */
+static uint32_t obs_modifier_to_haiku(obs_key_t key)
+{
+	switch (key) {
+	case OBS_KEY_CONTROL:
+		return OBS_HAIKU_COMMAND_KEY;
+	case OBS_KEY_ALT:
+		return OBS_HAIKU_CONTROL_KEY;
+	case OBS_KEY_META:
+		return OBS_HAIKU_OPTION_KEY;
+	default:
+		return 0;
+	}
+}
+
+/* Raw key of a modifier; falls back to the stock Haiku keymap if the keymap cannot be read. */
+static int modifier_raw_key(obs_key_t key, bool right)
+{
+	if (key == OBS_KEY_SHIFT)
+		return right ? HK_RSHIFT : HK_LSHIFT;
+
+	uint32_t modifier = obs_modifier_to_haiku(key);
+	if (!modifier)
+		return 0;
+
+	uint32_t code = obs_haiku_get_modifier_raw_key(modifier, right);
+	if (code)
+		return (int)code;
+
+	switch (key) {
+	case OBS_KEY_CONTROL:
+		return right ? HK_RWINDOWS : HK_LALT;
+	case OBS_KEY_ALT:
+		return right ? HK_RCONTROL : HK_LCONTROL;
+	default:
+		return right ? HK_RALT : HK_LWINDOWS;
+	}
+}
+
+static const obs_key_t modifier_keys[] = {OBS_KEY_SHIFT, OBS_KEY_CONTROL, OBS_KEY_ALT, OBS_KEY_META};
+#define MODIFIER_KEY_COUNT (sizeof(modifier_keys) / sizeof(modifier_keys[0]))
 
 /* Key state is an input_server round trip and mouse state an app_server round trip, so cache each
  * briefly: the hotkey thread queries the modifiers and every bound key once per tick. The two caches
@@ -358,6 +392,9 @@ struct obs_hotkeys_platform {
 
 static int haiku_code_for_key(obs_key_t key)
 {
+	if (key == OBS_KEY_SHIFT || obs_modifier_to_haiku(key))
+		return modifier_raw_key(key, false);
+
 	for (size_t i = 0; i < KEY_MAP_COUNT; i++) {
 		if (key_map[i].key == key)
 			return key_map[i].code;
@@ -374,9 +411,9 @@ static obs_key_t haiku_key_for_code(int code)
 		if (key_map[i].code == code)
 			return key_map[i].key;
 	}
-	for (size_t i = 0; i < KEY_ALT_COUNT; i++) {
-		if (key_alt_codes[i].code == code)
-			return key_alt_codes[i].key;
+	for (size_t i = 0; i < MODIFIER_KEY_COUNT; i++) {
+		if (modifier_raw_key(modifier_keys[i], false) == code || modifier_raw_key(modifier_keys[i], true) == code)
+			return modifier_keys[i];
 	}
 	return OBS_KEY_NONE;
 }
@@ -457,22 +494,14 @@ bool obs_hotkeys_platform_is_pressed(obs_hotkeys_platform_t *plat, obs_key_t key
 			/* no key state available */
 		} else if (key == OBS_KEY_SHIFT || key == OBS_KEY_CONTROL || key == OBS_KEY_ALT ||
 			   key == OBS_KEY_META) {
-			/* Use the modifier mask rather than physical keys so remapped modifiers (Keymap
-			 * preferences) behave the same as in Qt's key events. */
-			uint32_t bit = key == OBS_KEY_SHIFT     ? OBS_HAIKU_SHIFT_KEY
-				       : key == OBS_KEY_CONTROL ? OBS_HAIKU_COMMAND_KEY
-				       : key == OBS_KEY_ALT     ? OBS_HAIKU_CONTROL_KEY
-								: OBS_HAIKU_OPTION_KEY;
+			/* Use the modifier mask rather than physical keys: it follows the keymap (left and right
+			 * keys, swapped Command/Control) exactly as the modifiers of Qt's key events do. */
+			uint32_t bit = key == OBS_KEY_SHIFT ? OBS_HAIKU_SHIFT_KEY : obs_modifier_to_haiku(key);
 			pressed = (plat->modifiers & bit) != 0;
 		} else {
 			int code = haiku_code_for_key(key);
-			if (code)
+			if (code > 0 && code < 0x80)
 				pressed = key_state_bit(plat->key_states, (uint8_t)code);
-
-			for (size_t i = 0; !pressed && i < KEY_ALT_COUNT; i++) {
-				if (key_alt_codes[i].key == key)
-					pressed = key_state_bit(plat->key_states, key_alt_codes[i].code);
-			}
 		}
 	}
 
@@ -514,8 +543,61 @@ static const char *printable_key_name(obs_key_t key)
 	}
 }
 
+/* Which of the translated names "Control", "Alt" and "Super" fits the physical key the keymap assigns to an
+ * OBS modifier, so that labels name the key cap: with the stock keymap, OBS "Control" (Haiku Command) is the
+ * Alt key and is shown as "Alt". */
+static obs_key_t modifier_label_key(obs_key_t key)
+{
+	switch (modifier_raw_key(key, false)) {
+	case HK_LCONTROL:
+	case HK_RCONTROL:
+		return OBS_KEY_CONTROL;
+	case HK_LALT:
+	case HK_RALT:
+		return OBS_KEY_ALT;
+	case HK_LWINDOWS:
+	case HK_RWINDOWS:
+		return OBS_KEY_META;
+	default:
+		return key;
+	}
+}
+
+/* Keys whose label is the character the user's keymap puts on them (letters, digits, punctuation). */
+static bool key_has_layout_label(obs_key_t key)
+{
+	switch (key) {
+	case OBS_KEY_QUOTELEFT:
+	case OBS_KEY_MINUS:
+	case OBS_KEY_EQUAL:
+	case OBS_KEY_BRACKETLEFT:
+	case OBS_KEY_BRACKETRIGHT:
+	case OBS_KEY_BACKSLASH:
+	case OBS_KEY_SEMICOLON:
+	case OBS_KEY_APOSTROPHE:
+	case OBS_KEY_COMMA:
+	case OBS_KEY_PERIOD:
+	case OBS_KEY_SLASH:
+	case OBS_KEY_LESS:
+		return true;
+	default:
+		return (key >= OBS_KEY_A && key <= OBS_KEY_Z) || (key >= OBS_KEY_0 && key <= OBS_KEY_9);
+	}
+}
+
 void obs_key_to_str(obs_key_t key, struct dstr *dstr)
 {
+	/* OBS keys name raw key positions (US layout); show what the user's keyboard has printed there,
+	 * e.g. "Q" rather than "A" for the key left of "S" on a French keyboard. */
+	if (key_has_layout_label(key)) {
+		int code = haiku_code_for_key(key);
+		char label[OBS_HAIKU_KEY_LABEL_SIZE];
+		if (code > 0 && code < 0x80 && obs_haiku_get_key_label((uint8_t)code, label)) {
+			dstr_copy(dstr, label);
+			return;
+		}
+	}
+
 	if (key >= OBS_KEY_MOUSE1 && key <= OBS_KEY_MOUSE29) {
 		if (obs->hotkeys.translations[key])
 			dstr_copy(dstr, obs->hotkeys.translations[key]);
@@ -593,11 +675,16 @@ void obs_key_to_str(obs_key_t key, struct dstr *dstr)
 	case OBS_KEY_SHIFT:
 		return translate_key(key, "Shift");
 	case OBS_KEY_ALT:
-		return translate_key(key, "Alt");
 	case OBS_KEY_CONTROL:
-		return translate_key(key, "Control");
 	case OBS_KEY_META:
-		return translate_key(key, "Super");
+		switch (modifier_label_key(key)) {
+		case OBS_KEY_CONTROL:
+			return translate_key(OBS_KEY_CONTROL, "Control");
+		case OBS_KEY_ALT:
+			return translate_key(OBS_KEY_ALT, "Alt");
+		default:
+			return translate_key(OBS_KEY_META, "Super");
+		}
 	case OBS_KEY_MENU:
 		return translate_key(key, "Menu");
 	case OBS_KEY_SPACE:
