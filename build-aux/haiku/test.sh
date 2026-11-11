@@ -1115,6 +1115,33 @@ obs_run() {
 	result "4 obs-$name" "$status" "$detail"
 }
 
+# ---------------------------------------------------------------------------------------------------------
+# Renga: screen recording permission. The first capture of an application shows the Screen recording prompt
+# and waits up to 2 minutes for an answer (3rdparty/ce/PORTING.md, "Screen capture"), which would stall an
+# unattended run. OBS's signature (frontend/cmake/haiku/obs-studio.rdef.in) is allowed with the
+# ScreenRecording command line (src/preferences/screenrecording, --list / --set). The previous decisions
+# are saved in the report. The permission stays granted afterwards, as it would after answering the prompt;
+# "ScreenRecording --set application/x-vnd.obs-studio ask" undoes it.
+# ---------------------------------------------------------------------------------------------------------
+OBS_SIGNATURE="application/x-vnd.obs-studio"
+step_screen_permission() {
+	local sr=""
+	for c in ScreenRecording /boot/system/preferences/ScreenRecording; do
+		if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then sr="$c"; break; fi
+	done
+	if [ -z "$sr" ]; then
+		result "screen-permission" "SKIPPED" "ScreenRecording not found (not Renga?); the capture prompt may need an answer"
+		return
+	fi
+	"$sr" --list >"$SYS/screen-recording-before.txt" 2>&1
+	if "$sr" --set "$OBS_SIGNATURE" allow >>"$RUNLOG" 2>&1; then
+		"$sr" --list >"$SYS/screen-recording-after.txt" 2>&1
+		result "screen-permission" "PASS" "$OBS_SIGNATURE allowed (undo: $sr --set $OBS_SIGNATURE ask)"
+	else
+		result "screen-permission" "FAIL" "could not allow $OBS_SIGNATURE; the capture prompt may need an answer"
+	fi
+}
+
 step_obs() {
 	if [ -z "$BIN" ] || [ ! -x "$BIN/obs" ]; then
 		say "==> 4. OBS runs"
@@ -1242,6 +1269,7 @@ step_archive() {
 step_system
 step_build
 step_probe
+step_screen_permission
 step_obs
 step_crash
 step_summary

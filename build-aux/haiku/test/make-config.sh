@@ -23,11 +23,11 @@ SCENE_NAME="Test Scene"
 ID_SCREEN_CAPTURE="haiku_screen_capture"         # plugins/haiku-capture/screen-capture.cpp:204
 KEY_SCREEN_CURSOR="capture_cursor"               # plugins/haiku-capture/screen-capture.cpp:40 (S_CAPTURE_CURSOR)
 KEY_SCREEN_FPS="fps"                             # plugins/haiku-capture/screen-capture.cpp:41 (S_FPS)
-KEY_SCREEN_METHOD="capture_method"               # plugins/haiku-capture/capture-throttle.hpp:178; 0 = tear free (:174)
+KEY_SCREEN_MODE="mode"                           # Renga: plugins/haiku-capture/screen-capture.cpp:32 (S_MODE); 0 = whole screen (:41)
 
 ID_DESKTOP_AUDIO="haiku_desktop_audio_capture"   # frontend/OBSApp.cpp:1437 (OUTPUT_AUDIO_SOURCE),
                                                  # plugins/haiku-media/desktop-audio.cpp:544
-KEY_AUDIO_DEVICE="device_id"                     # plugins/haiku-media/desktop-audio.cpp:477, default "default" (:481)
+KEY_AUDIO_DEVICE="device_id"                     # plugins/haiku-media/loopback-audio.cpp:65 (Renga: mixer loopback), default "default" (:481)
 JSON_DESKTOP_AUDIO_KEY="DesktopAudioDevice1"     # frontend/widgets/OBSBasic_SceneCollections.cpp:798, loaded onto
                                                  # output channel 1 at :1259
 
@@ -256,7 +256,7 @@ cat > "$BASE/basic/scenes/$COLLECTION_NAME.json" <<EOF
       "versioned_id": "$ID_SCREEN_CAPTURE",
       "name": "Test Screen Capture",
       "uuid": "0b500000-0000-4000-8000-000000000001",
-      "settings": { "$KEY_SCREEN_CURSOR": true, "$KEY_SCREEN_FPS": $FPS, "$KEY_SCREEN_METHOD": 0 }
+      "settings": { "$KEY_SCREEN_CURSOR": true, "$KEY_SCREEN_FPS": $FPS, "$KEY_SCREEN_MODE": 0 }
     },
     {
       "id": "$ID_COLOR",
