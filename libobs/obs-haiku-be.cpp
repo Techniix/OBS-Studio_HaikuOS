@@ -17,15 +17,18 @@
 
 #include "obs-haiku.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <math.h>
+#include <pthread.h>
 
 #include <Application.h>
 #include <InterfaceDefs.h>
 #include <Point.h>
 #include <Roster.h>
 #include <Screen.h>
+#include <UnicodeChar.h>
 #include <WindowScreen.h> /* set_mouse_position() (libgame) */
 
 /* ScreenSaverFilter (input_server) starts the blanker when a B_MOUSE_MOVED lands in its "blank now" corner,
@@ -53,6 +56,144 @@ extern "C" bool obs_haiku_get_key_states(uint8_t states[OBS_HAIKU_KEY_STATE_BYTE
 	memcpy(states, info.key_states, OBS_HAIKU_KEY_STATE_BYTES);
 	*modifiers = info.modifiers;
 	return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Keymap (key labels and modifier key positions)                             */
+
+/* get_key_map() is an input_server round trip that returns two malloc()ed blocks, and the hotkey settings
+ * page asks for the label of every bound key in a row, so what is needed from the keymap is cached. The
+ * cache is refreshed after two seconds, which is how a layout switch (Keymap preferences, keymap switcher)
+ * is picked up; the same time stamp throttles retries while the input_server cannot be reached. */
+#define KEYMAP_CACHE_US 2000000LL
+
+static pthread_mutex_t keymap_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bigtime_t keymap_fetched = 0;
+static bool keymap_valid = false;
+static char keymap_labels[128][OBS_HAIKU_KEY_LABEL_SIZE];
+static uint32 keymap_command_key, keymap_control_key, keymap_option_key;
+
+/* Copies the character a keymap table produces for a raw key into `label`, upper-cased ("a" -> "A",
+ * "\xc3\xa9" (e acute) -> "\xc3\x89"). The table holds offsets into `chars`, where each entry is a length
+ * byte followed by that many UTF-8 bytes (see key_map in InterfaceDefs.h and the Keyboard chapter of the
+ * Haiku Book). Returns false for keys that produce nothing printable. */
+static bool keymap_char(const int32 *table, const char *chars, int code, char label[OBS_HAIKU_KEY_LABEL_SIZE])
+{
+	const int32 offset = table[code];
+	if (offset < 0)
+		return false;
+
+	const uint8 length = (uint8)chars[offset];
+	if (length == 0 || length >= OBS_HAIKU_KEY_LABEL_SIZE)
+		return false;
+
+	/* zero padded, so decoding a truncated sequence cannot run past the copy */
+	char utf8[OBS_HAIKU_KEY_LABEL_SIZE + 8] = {};
+	memcpy(utf8, chars + offset + 1, length);
+
+	/* control characters, space and DEL are not usable as a label */
+	if ((uint8)utf8[0] <= 0x20 || utf8[0] == 0x7f)
+		return false;
+
+	const char *in = utf8;
+	const uint32 c = BUnicodeChar::FromUTF8(&in);
+	if (c != 0 && (size_t)(in - utf8) == length) {
+		/* a single character: show it the way key caps do. Characters whose upper case form needs a
+		 * longer UTF-8 sequence than the label can hold are kept as they are. */
+		char upper[OBS_HAIKU_KEY_LABEL_SIZE + 8] = {};
+		char *out = upper;
+		BUnicodeChar::ToUTF8(BUnicodeChar::ToUpper(c), &out);
+		if (out > upper && (size_t)(out - upper) < OBS_HAIKU_KEY_LABEL_SIZE)
+			memcpy(utf8, upper, sizeof(upper));
+	}
+
+	memcpy(label, utf8, OBS_HAIKU_KEY_LABEL_SIZE);
+	label[OBS_HAIKU_KEY_LABEL_SIZE - 1] = 0;
+	return true;
+}
+
+/* keymap_mutex must be held */
+static void refresh_keymap(void)
+{
+	const bigtime_t now = system_time();
+	if (keymap_fetched != 0 && now - keymap_fetched < KEYMAP_CACHE_US)
+		return;
+	keymap_fetched = now;
+
+	key_map *map = NULL;
+	char *chars = NULL;
+	/* Talks to the input_server over a port like get_key_info(); leaves both pointers NULL on failure. */
+	get_key_map(&map, &chars);
+	if (map == NULL || chars == NULL) {
+		free(map);
+		free(chars);
+		keymap_valid = false;
+		return;
+	}
+
+	memset(keymap_labels, 0, sizeof(keymap_labels));
+	for (int code = 1; code < 128; code++) {
+		char label[OBS_HAIKU_KEY_LABEL_SIZE];
+
+		if (!keymap_char(map->normal_map, chars, code, label))
+			continue;
+
+		/* Number row (raw keys 0x12..0x1b): layouts such as French AZERTY type the digit with Shift.
+		 * The digit is what is printed on the key cap and what users call the key, so prefer it. */
+		if (code >= 0x12 && code <= 0x1b && !(label[0] >= '0' && label[0] <= '9' && label[1] == 0)) {
+			char shifted[OBS_HAIKU_KEY_LABEL_SIZE];
+			if (keymap_char(map->shift_map, chars, code, shifted) && shifted[0] >= '0' &&
+			    shifted[0] <= '9' && shifted[1] == 0)
+				memcpy(label, shifted, sizeof(label));
+		}
+
+		memcpy(keymap_labels[code], label, sizeof(label));
+	}
+
+	keymap_command_key = map->left_command_key;
+	keymap_control_key = map->left_control_key;
+	keymap_option_key = map->left_option_key;
+	keymap_valid = true;
+
+	free(map);
+	free(chars);
+}
+
+extern "C" bool obs_haiku_get_key_label(uint8_t code, char label[OBS_HAIKU_KEY_LABEL_SIZE])
+{
+	bool found = false;
+
+	if (code == 0 || code >= 128)
+		return false;
+
+	pthread_mutex_lock(&keymap_mutex);
+	refresh_keymap();
+	if (keymap_valid && keymap_labels[code][0] != 0) {
+		memcpy(label, keymap_labels[code], OBS_HAIKU_KEY_LABEL_SIZE);
+		found = true;
+	}
+	pthread_mutex_unlock(&keymap_mutex);
+
+	return found;
+}
+
+extern "C" uint32_t obs_haiku_get_modifier_raw_key(uint32_t modifier)
+{
+	uint32_t code = 0;
+
+	pthread_mutex_lock(&keymap_mutex);
+	refresh_keymap();
+	if (keymap_valid) {
+		if (modifier == OBS_HAIKU_COMMAND_KEY)
+			code = keymap_command_key;
+		else if (modifier == OBS_HAIKU_CONTROL_KEY)
+			code = keymap_control_key;
+		else if (modifier == OBS_HAIKU_OPTION_KEY)
+			code = keymap_option_key;
+	}
+	pthread_mutex_unlock(&keymap_mutex);
+
+	return code;
 }
 
 extern "C" bool obs_haiku_get_mouse_buttons(uint32_t *buttons)
