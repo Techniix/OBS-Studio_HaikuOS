@@ -18,24 +18,24 @@
 /*
  * obs-haiku-browser: renders one web page for an OBS browser source or browser dock with HaikuWebKit.
  *
- *   obs-haiku-browser --area <area_id> [--storage <dir>]
+ *   obs-haiku-browser --ipc <socket fd> --wake <eventfd> [--storage <dir>]
  *
  * One process per browser instance: a page that hangs or crashes WebKit only takes its own helper down, and
- * the OBS side restarts it. See ../browser-shm.h for the protocol.
+ * the OBS side restarts it. See ../browser-ipc.hpp for the protocol; both descriptors are inherited from OBS.
  *
  * The page lives in a borderless window parked far outside the screen. It must stay shown, because hiding a
  * BWebView marks the page invisible and WebCore then stops timers and animations. HaikuWebKit renders the
- * page into the view's offscreen bitmap; a pump thread copies that bitmap into the shared area at the
- * requested frame rate.
+ * page into the view's offscreen bitmap; a pump thread copies that bitmap into a sealed memfd shared with OBS
+ * at the requested frame rate.
  */
 
-#include "../browser-shm.h"
+#include "../browser-ipc.hpp"
 #include "webkit-abi.h"
 
 #include <Application.h>
 #include <Bitmap.h>
 #include <Directory.h>
-#include <Locker.h>
+#include <Messenger.h>
 #include <FindDirectory.h>
 #include <Path.h>
 #include <String.h>
@@ -50,15 +50,22 @@
 
 #include <image.h>
 
+#include <algorithm>
 #include <atomic>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #define LOG(...) fprintf(stderr, "obs-haiku-browser: " __VA_ARGS__)
 
@@ -115,6 +122,84 @@ static void escape_js_string(const std::string &in, std::string &out)
 	}
 }
 
+/*
+ * The helper's end of the connection to OBS. Sends come from three threads (the application thread: hello,
+ * pings, page information; the window thread: page information; the pump: frame buffers), so they are
+ * serialized. The socket blocks: OBS's I/O thread always reads, and if it ever stopped, a blocked helper is
+ * exactly what its ping timeout is there to find.
+ */
+class Channel {
+public:
+	explicit Channel(int fd) : fd(fd) {}
+
+	/* `pass_fd` >= 0: also passes that descriptor (SCM_RIGHTS) with the first byte */
+	bool Send(uint32_t what, int32_t value, const std::string &text = std::string(), int pass_fd = -1)
+	{
+		obs_browser_event event = {what, value};
+		const uint32_t length = (uint32_t)(sizeof(event) + text.size());
+		if (length > OBS_BROWSER_MAX_EVENT)
+			return false;
+		std::vector<uint8_t> bytes(sizeof(length) + length);
+		memcpy(bytes.data(), &length, sizeof(length));
+		memcpy(bytes.data() + sizeof(length), &event, sizeof(event));
+		if (!text.empty())
+			memcpy(bytes.data() + sizeof(length) + sizeof(event), text.data(), text.size());
+
+		std::lock_guard<std::mutex> lock(mutex);
+		size_t offset = 0;
+		while (offset < bytes.size()) {
+			struct iovec iov = {bytes.data() + offset, bytes.size() - offset};
+			struct msghdr message = {};
+			message.msg_iov = &iov;
+			message.msg_iovlen = 1;
+			union {
+				char bytes[CMSG_SPACE(sizeof(int))];
+				struct cmsghdr align;
+			} control;
+			if (pass_fd >= 0 && offset == 0) {
+				memset(&control, 0, sizeof(control));
+				message.msg_control = control.bytes;
+				message.msg_controllen = sizeof(control.bytes);
+				struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+				header->cmsg_level = SOL_SOCKET;
+				header->cmsg_type = SCM_RIGHTS;
+				header->cmsg_len = CMSG_LEN(sizeof(int));
+				memcpy(CMSG_DATA(header), &pass_fd, sizeof(int));
+			}
+			/* MSG_NOSIGNAL: OBS having gone away is handled by the reader, not by SIGPIPE */
+			const ssize_t sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+			if (sent < 0 && errno == EINTR)
+				continue;
+			if (sent <= 0)
+				return false;
+			offset += (size_t)sent;
+		}
+		return true;
+	}
+
+	const int fd;
+
+private:
+	std::mutex mutex;
+};
+
+static Channel *channel = nullptr;
+
+static void send_info(const BString &title, const BString &url)
+{
+	std::string text(title.String());
+	text += '\0';
+	text += url.String();
+	text += '\0';
+	/* both are bounded by the event size; titles and URLs that long are cut, never dropped */
+	if (text.size() > OBS_BROWSER_MAX_EVENT - sizeof(obs_browser_event)) {
+		std::string t(title.String(), std::min<size_t>(title.Length(), 1024));
+		std::string u(url.String(), std::min<size_t>(url.Length(), 8192));
+		text = t + '\0' + u + '\0';
+	}
+	channel->Send(OBS_BROWSER_EVENT_INFO, 0, text);
+}
+
 /* BWebView allocates its offscreen bitmap in FrameResized(), which runs asynchronously after the view gets a
  * real size; until then getOffscreen() would dereference a null view. */
 class HelperView : public BWebView {
@@ -157,25 +242,20 @@ public:
 		be_app->PostMessage(&msg);
 	}
 
+	/* Both run on the window thread, which holds the window lock: CurrentWebView() is safe to use */
 	void TitleChanged(const BString &title, BWebView *) override
 	{
-		if (!shm)
-			return;
-		strlcpy(shm->title, title.String(), sizeof(shm->title));
+		this->title = title;
 		if (CurrentWebView())
-			strlcpy(shm->url, CurrentWebView()->MainFrameURL().String(), sizeof(shm->url));
-		__sync_synchronize();
-		atomic_add((int32 *)&shm->info_serial, 1);
+			url = CurrentWebView()->MainFrameURL();
+		send_info(this->title, url);
 	}
 
 	void NavigationRequested(const BString &url, BWebView *view) override
 	{
 		BWebWindow::NavigationRequested(url, view);
-		if (!shm)
-			return;
-		strlcpy(shm->url, url.String(), sizeof(shm->url));
-		__sync_synchronize();
-		atomic_add((int32 *)&shm->info_serial, 1);
+		this->url = url;
+		send_info(title, this->url);
 	}
 
 	/* popups open in the same view rather than in new windows nobody can see */
@@ -208,26 +288,22 @@ public:
 		return false; /* the application closes us */
 	}
 
-	obs_browser_shm *shm = nullptr;
+private:
+	BString title, url;
 };
 
 class HelperApp : public BApplication {
 public:
 	/* storage: the resolved storage directory (see resolve_storage_dir()); empty if there is none */
-	HelperApp(area_id source_area, const std::string &storage)
+	HelperApp(int wake_fd, const std::string &storage)
 		: BApplication(OBS_BROWSER_HELPER_SIGNATURE),
-		  source_area(source_area),
+		  wake_fd(wake_fd),
 		  storage(storage)
 	{
 	}
 
 	void ReadyToRun() override
 	{
-		if (!AttachArea(source_area)) {
-			Quit();
-			return;
-		}
-
 		BWebPage::InitializeOnce();
 		BWebPage::SetCacheModel(B_WEBKIT_CACHE_MODEL_WEB_BROWSER);
 
@@ -235,7 +311,6 @@ public:
 			BWebSettings::SetPersistentStoragePath(storage.c_str());
 
 		window = new HelperWindow(BRect(PARK_X, PARK_Y, PARK_X + width - 1, PARK_Y + height - 1));
-		window->shm = shm;
 		view = new HelperView();
 		window->AddChild(view);
 		window->SetCurrentWebView(view);
@@ -248,10 +323,7 @@ public:
 			window->Unlock();
 		}
 
-		shm->helper_team = (int32_t)Team();
-		shm->helper_heartbeat = system_time();
-		__sync_synchronize();
-		shm->helper_state = OBS_BROWSER_STATE_READY;
+		channel->Send(OBS_BROWSER_EVENT_HELLO, OBS_BROWSER_PROTOCOL);
 
 		pump = spawn_thread(PumpEntry, "obs browser frame pump", B_DISPLAY_PRIORITY, this);
 		resume_thread(pump);
@@ -272,6 +344,10 @@ public:
 			window = nullptr;
 		}
 		BWebPage::ShutdownOnce();
+		if (buffer) {
+			munmap(buffer, buffer_size);
+			buffer = nullptr;
+		}
 		return true;
 	}
 
@@ -281,12 +357,10 @@ public:
 		case OBS_BROWSER_MSG_CONFIG:
 			ApplyConfig(message);
 			return;
-		case OBS_BROWSER_MSG_ATTACH_AREA: {
-			int32 area;
-			if (message->FindInt32("area", &area) == B_OK)
-				AttachArea(area);
+		case OBS_BROWSER_MSG_PING:
+			/* answered here, on WebCore's main thread: a page stuck in a script delays it */
+			channel->Send(OBS_BROWSER_EVENT_PONG, message->GetInt32("serial", 0));
 			return;
-		}
 		case OBS_BROWSER_MSG_RELOAD:
 			Reload(message->GetBool("nocache", false));
 			return;
@@ -352,7 +426,7 @@ public:
 	void DispatchMessage(BMessage *message, BHandler *handler) override
 	{
 		/* the message is gone after dispatching (BWebPage coalesces queued HANDLE_DRAW messages) */
-		const bool may_paint = message->what != OBS_BROWSER_MSG_STARTUP_SCRIPT;
+		const bool may_paint = message->what != OBS_BROWSER_MSG_STARTUP_SCRIPT && message->what != OBS_BROWSER_MSG_PING;
 		BApplication::DispatchMessage(message, handler);
 		if (may_paint)
 			paint_serial++;
@@ -363,46 +437,6 @@ private:
 	{
 		static_cast<HelperApp *>(data)->Pump();
 		return B_OK;
-	}
-
-	bool AttachArea(area_id source)
-	{
-		void *addr = nullptr;
-		area_id clone = clone_area("obs browser frames", &addr, B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA,
-					   source);
-		if (clone < 0) {
-			LOG("cannot clone area %d: %s\n", (int)source, strerror(clone));
-			return false;
-		}
-		obs_browser_shm *mapped = static_cast<obs_browser_shm *>(addr);
-		if (mapped->magic != OBS_BROWSER_MAGIC || mapped->version != OBS_BROWSER_VERSION) {
-			LOG("area %d is not an OBS browser area\n", (int)source);
-			delete_area(clone);
-			return false;
-		}
-
-		/* the pump reads `shm` without the app lock; swap under frame_lock */
-		frame_lock.Lock();
-		obs_browser_shm *old = shm;
-		const area_id old_area = area;
-		if (old) {
-			mapped->helper_team = old->helper_team;
-			mapped->helper_state = old->helper_state;
-		}
-		mapped->helper_heartbeat = system_time();
-		__sync_synchronize();
-		mapped->helper_team = (int32_t)Team(); /* tells OBS the switch is done */
-		shm = mapped;
-		area = clone;
-		if (window && window->Lock()) {
-			window->shm = shm;
-			window->Unlock();
-		}
-		frame_lock.Unlock();
-
-		if (old_area >= 0)
-			delete_area(old_area);
-		return true;
 	}
 
 	void ApplyConfig(BMessage *message)
@@ -620,8 +654,7 @@ private:
 	{
 		bigtime_t next = system_time();
 		bool warned_alpha = false;
-		uint32 copied_serial = 0;             /* paint_serial starts at 1: the first tick always copies */
-		obs_browser_shm *copied_to = nullptr; /* a new area always gets a frame */
+		uint32 copied_serial = 0; /* paint_serial starts at 1: the first tick always copies */
 
 		while (!quitting) {
 			const bigtime_t now = system_time();
@@ -631,33 +664,18 @@ private:
 			if (next < now)
 				next = now + interval; /* we fell behind; don't try to catch up */
 
-			frame_lock.Lock();
-			obs_browser_shm *s = shm;
-			s->helper_heartbeat = now;
-
-			if (now - s->client_heartbeat > OBS_BROWSER_CLIENT_TIMEOUT) {
-				frame_lock.Unlock();
-				LOG("client went away, exiting\n");
-				PostMessage(B_QUIT_REQUESTED);
-				return;
-			}
-
 			/* Read the serial before getOffscreen(), which syncs the offscreen view: anything drawn after
 			 * this read bumps it again and is copied on the next tick. */
 			const uint32 serial = paint_serial.load();
-			if ((serial != copied_serial || s != copied_to) && window && view->offscreen_ready &&
-			    window->LockWithTimeout(interval) == B_OK) {
+			if (serial != copied_serial && view->offscreen_ready && window->LockWithTimeout(interval) == B_OK) {
 				BBitmap *bitmap = WebCore::DumpRenderTreeClient::getOffscreen(view);
 				if (bitmap && bitmap->Lock()) {
-					if (CopyFrame(s, bitmap, warned_alpha)) {
+					if (CopyFrame(bitmap, warned_alpha))
 						copied_serial = serial;
-						copied_to = s;
-					}
 					bitmap->Unlock();
 				}
 				window->Unlock();
 			}
-			frame_lock.Unlock();
 
 			const bigtime_t wait = next - system_time();
 			if (wait > 0)
@@ -665,13 +683,63 @@ private:
 		}
 	}
 
+	/*
+	 * Makes sure the frame buffer can hold `bytes` of pixels, replacing it (and telling OBS) if not. A buffer is
+	 * a memfd (Renga: libgnu memfd_create(), 3rdparty/ce/PORTING.md "memfd_create"), sealed once it is sized:
+	 * F_SEAL_SHRINK | F_SEAL_GROW so that no mapping of it can ever fault, F_SEAL_FUTURE_WRITE so that OBS
+	 * (and anyone it might leak to) can only map it read-only while our own writable mapping keeps working
+	 * (memfd_test.cpp "future_write"), and F_SEAL_SEAL. Buffers grow with headroom and shrink only when a
+	 * quarter would do, so resizing a source does not make one per step.
+	 */
+	bool EnsureBuffer(size_t bytes)
+	{
+		const size_t needed = OBS_BROWSER_FRAME_HEADER_SIZE + bytes;
+		if (buffer && needed <= buffer_size && needed * 4 > buffer_size)
+			return true;
+
+		const size_t size = (needed + needed / 4 + 65535) & ~(size_t)65535;
+		const int fd = memfd_create("obs-browser-frames", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+		if (fd < 0) {
+			LOG("memfd_create failed: %s\n", strerror(errno));
+			return false;
+		}
+		void *address = MAP_FAILED;
+		if (ftruncate(fd, (off_t)size) == 0)
+			address = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (address == MAP_FAILED ||
+		    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL) != 0) {
+			LOG("cannot set up a %zu byte frame buffer: %s\n", size, strerror(errno));
+			if (address != MAP_FAILED)
+				munmap(address, size);
+			close(fd);
+			return false;
+		}
+
+		obs_browser_frame_header *header = static_cast<obs_browser_frame_header *>(address);
+		header->magic = OBS_BROWSER_FRAME_MAGIC; /* the rest is zero: ftruncate() fills with zeros */
+
+		const bool sent = channel->Send(OBS_BROWSER_EVENT_BUFFER, 0, std::string(), fd);
+		close(fd); /* our mapping keeps the file; OBS has its own descriptor now */
+		if (!sent) {
+			munmap(address, size);
+			return false; /* OBS is gone; the socket reader is about to quit */
+		}
+
+		if (buffer)
+			munmap(buffer, buffer_size);
+		buffer = static_cast<uint8_t *>(address);
+		buffer_size = size;
+		return true;
+	}
+
 	/* false if nothing was published (and the same picture has to be copied again later) */
-	bool CopyFrame(obs_browser_shm *s, BBitmap *bitmap, bool &warned_alpha)
+	bool CopyFrame(BBitmap *bitmap, bool &warned_alpha)
 	{
 		const BRect bounds = bitmap->Bounds();
 		int32 w = (int32)bounds.IntegerWidth() + 1;
 		int32 h = (int32)bounds.IntegerHeight() + 1;
-		/* the offscreen bitmap only grows; the visible page is the view size */
+		/* the offscreen bitmap only grows; the visible page is the view size (`width`/`height` are written on
+		 * the application thread with the window locked, and we hold that lock) */
 		if (w > width)
 			w = width;
 		if (h > height)
@@ -684,15 +752,17 @@ private:
 			return false;
 
 		const uint32 dst_stride = (uint32)w * 4;
-		if ((uint64)dst_stride * (uint64)h > s->capacity)
-			return false; /* OBS is about to hand us a bigger area */
+		if (!EnsureBuffer((size_t)dst_stride * (size_t)h))
+			return false;
 
+		obs_browser_frame_header *header = reinterpret_cast<obs_browser_frame_header *>(buffer);
 		const uint8 *src = (const uint8 *)bitmap->Bits();
 		const int32 src_stride = bitmap->BytesPerRow();
-		uint8 *dst = obs_browser_pixels(s);
+		uint8 *dst = buffer + OBS_BROWSER_FRAME_HEADER_SIZE;
 
-		atomic_add((int32 *)&s->seq, 1); /* odd: writing */
-		__sync_synchronize();
+		/* sequence lock: odd while writing (the release fences order the pixel stores against it) */
+		__atomic_store_n(&header->seq, header->seq + 1, __ATOMIC_RELAXED);
+		__atomic_thread_fence(__ATOMIC_RELEASE);
 
 		bool any_alpha = false;
 		for (int32 y = 0; y < h; y++) {
@@ -717,22 +787,24 @@ private:
 			warned_alpha = true;
 		}
 
-		s->width = w;
-		s->height = h;
-		s->stride = (int32_t)dst_stride;
-		s->has_alpha = has_alpha ? 1 : 0;
-		s->frame_count++;
-		__sync_synchronize();
-		atomic_add((int32 *)&s->seq, 1); /* even: complete */
+		header->width = (uint32_t)w;
+		header->height = (uint32_t)h;
+		header->stride = dst_stride;
+		header->has_alpha = has_alpha ? 1 : 0;
+		header->frame_count++;
+		__atomic_store_n(&header->seq, header->seq + 1, __ATOMIC_RELEASE); /* even: complete */
+
+		/* Renga eventfd: wakes OBS's reader; the counter coalesces and never blocks us (non-blocking) */
+		eventfd_write(wake_fd, 1);
 		return true;
 	}
 
-	area_id source_area;
+	const int wake_fd;
 	std::string storage;
 
-	area_id area = -1;
-	obs_browser_shm *shm = nullptr;
-	BLocker frame_lock{"obs browser frame lock"};
+	/* the current frame memfd's writable mapping; pump thread only (and QuitRequested() after it ended) */
+	uint8_t *buffer = nullptr;
+	size_t buffer_size = 0;
 
 	HelperWindow *window = nullptr;
 	HelperView *view = nullptr;
@@ -892,28 +964,101 @@ static void setup_cookie_store(const std::string &dir)
 		    "kept in memory per page and not persisted\n");
 }
 
+/*
+ * Reads OBS's messages and posts them to the application. Its own thread, blocking in poll(): messages that
+ * arrive before the BApplication runs wait in the socket. End-of-file means OBS closed our socket (it wants us
+ * gone) or died: either way we quit. If the application thread does not get to it (a page stuck in a script),
+ * the process exits after a grace period; OBS kills it a moment later if even that fails (browser-client.cpp,
+ * REAP_GRACE).
+ */
+static status_t socket_reader(void *)
+{
+	BMessenger app(be_app);
+	std::vector<uint8_t> rx;
+	for (;;) {
+		uint8_t chunk[16384];
+		const ssize_t got = recv(channel->fd, chunk, sizeof(chunk), 0);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break;
+		rx.insert(rx.end(), chunk, chunk + got);
+
+		size_t offset = 0;
+		bool bad = false;
+		while (rx.size() - offset >= sizeof(uint32_t)) {
+			uint32_t length;
+			memcpy(&length, rx.data() + offset, sizeof(length));
+			if (length == 0 || length > OBS_BROWSER_MAX_MESSAGE) {
+				bad = true;
+				break;
+			}
+			if (rx.size() - offset - sizeof(length) < length)
+				break;
+			/* BLooper::PostMessage() gives up at once when the looper's port is full (it sends with a zero
+			 * timeout); waiting here instead pushes back to OBS through the socket, which holds the rest. */
+			BMessage message;
+			if (message.Unflatten((const char *)rx.data() + offset + sizeof(length)) == B_OK)
+				app.SendMessage(&message, (BHandler *)nullptr, B_INFINITE_TIMEOUT);
+			offset += sizeof(length) + length;
+		}
+		if (bad) {
+			LOG("invalid message from OBS\n");
+			break;
+		}
+		rx.erase(rx.begin(), rx.begin() + offset);
+	}
+
+	BMessage quit(B_QUIT_REQUESTED);
+	app.SendMessage(&quit, (BHandler *)nullptr, 1000000);
+	snooze(2000000);
+	LOG("did not quit in time, exiting\n");
+	_exit(0);
+	return B_OK;
+}
+
+static int descriptor_arg(const char *value)
+{
+	char *end = nullptr;
+	const long fd = strtol(value, &end, 10);
+	return (end && !*end && fd >= 0 && fd < 65536) ? (int)fd : -1;
+}
+
 int main(int argc, char **argv)
 {
-	area_id area = -1;
+	int ipc_fd = -1, wake_fd = -1;
 	const char *storage = nullptr;
 
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--area") && i + 1 < argc)
-			area = (area_id)atoi(argv[++i]);
+		if (!strcmp(argv[i], "--ipc") && i + 1 < argc)
+			ipc_fd = descriptor_arg(argv[++i]);
+		else if (!strcmp(argv[i], "--wake") && i + 1 < argc)
+			wake_fd = descriptor_arg(argv[++i]);
 		else if (!strcmp(argv[i], "--storage") && i + 1 < argc)
 			storage = argv[++i];
 	}
 
-	if (area < 0) {
-		fprintf(stderr, "usage: %s --area <area_id> [--storage <dir>]\n", argv[0]);
+	struct stat st;
+	if (ipc_fd < 0 || wake_fd < 0 || fstat(ipc_fd, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+		fprintf(stderr, "usage: %s --ipc <fd> --wake <fd> [--storage <dir>]\n", argv[0]);
 		fprintf(stderr, "This helper is started by OBS Studio's browser source; it is not meant to be run by hand.\n");
 		return 1;
 	}
+	/* Inherited without close-on-exec; nothing this process starts may keep OBS's socket open (OBS would not
+	 * see us die) */
+	fcntl(ipc_fd, F_SETFD, FD_CLOEXEC);
+	fcntl(wake_fd, F_SETFD, FD_CLOEXEC);
 
 	const std::string storage_dir = resolve_storage_dir(storage);
 	setup_cookie_store(storage_dir);
 
-	HelperApp app(area, storage_dir);
+	Channel connection(ipc_fd);
+	channel = &connection;
+
+	HelperApp app(wake_fd, storage_dir);
+	const thread_id reader = spawn_thread(socket_reader, "obs browser ipc", B_NORMAL_PRIORITY, nullptr);
+	resume_thread(reader);
 	app.Run();
+	/* the reader may still be blocked in recv(); exiting ends it with the process */
 	return 0;
 }

@@ -36,7 +36,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #define T_(text) obs_module_text(text)
 
@@ -64,16 +63,11 @@ namespace {
 struct BrowserSource {
 	obs_source_t *source = nullptr;
 	std::unique_ptr<HaikuBrowserClient> client;
-	HaikuBrowserConfig config;
 	std::atomic_bool shutdown_when_hidden{false};
 	std::atomic_bool restart_when_active{false};
 	std::atomic_bool showing{false};
 
-	std::thread thread;
-	std::atomic_bool stop{false};
-	std::atomic<int> fps{30};
-
-	void Run();
+	void OutputFrame(const HaikuBrowserFrame &frame);
 };
 
 std::string file_url(const char *path)
@@ -93,35 +87,21 @@ std::string file_url(const char *path)
 	return url;
 }
 
-void BrowserSource::Run()
+/* On the client's I/O thread, when the helper published a new frame: OBS keeps showing the last one, so a page
+ * that did not repaint costs no copy and no upload. obs_source_output_video() copies the frame. */
+void BrowserSource::OutputFrame(const HaikuBrowserFrame &frame)
 {
-	os_set_thread_name("haiku-browser-source");
-	HaikuBrowserFrame frame;
-
-	while (!stop) {
-		client->Poll();
-
-		/* false unless the helper published a new frame (frame_count changed): OBS keeps showing the last
-		 * one, so a page that did not repaint costs no copy and no upload */
-		if (client->ReadFrame(frame)) {
-			struct obs_source_frame out = {};
-			out.data[0] = frame.pixels.data();
-			out.linesize[0] = frame.stride;
-			out.width = frame.width;
-			out.height = frame.height;
-			out.format = frame.has_alpha ? VIDEO_FORMAT_BGRA : VIDEO_FORMAT_BGRX;
-			out.timestamp = os_gettime_ns();
-			out.full_range = true;
-			video_format_get_parameters_for_format(VIDEO_CS_SRGB, VIDEO_RANGE_FULL, out.format,
-							       out.color_matrix, out.color_range_min,
-							       out.color_range_max);
-			obs_source_output_video(source, &out);
-		}
-
-		const int rate = fps > 0 ? fps.load() : 30;
-		/* poll at twice the page rate so a frame is never late by more than half an interval */
-		os_sleep_ms((uint32_t)std::max(2, 500 / rate));
-	}
+	struct obs_source_frame out = {};
+	out.data[0] = const_cast<uint8_t *>(frame.pixels);
+	out.linesize[0] = frame.stride;
+	out.width = frame.width;
+	out.height = frame.height;
+	out.format = frame.has_alpha ? VIDEO_FORMAT_BGRA : VIDEO_FORMAT_BGRX;
+	out.timestamp = os_gettime_ns();
+	out.full_range = true;
+	video_format_get_parameters_for_format(VIDEO_CS_SRGB, VIDEO_RANGE_FULL, out.format, out.color_matrix,
+					       out.color_range_min, out.color_range_max);
+	obs_source_output_video(source, &out);
 }
 
 const char *browser_get_name(void *)
@@ -156,39 +136,38 @@ void browser_update(void *data, obs_data_t *settings)
 	const bool was_shutdown = bs->shutdown_when_hidden;
 	bs->shutdown_when_hidden = obs_data_get_bool(settings, S_SHUTDOWN);
 	bs->restart_when_active = obs_data_get_bool(settings, S_RESTART_ACTIVE);
-	bs->fps = cfg.fps;
-	bs->config = cfg;
 
 	if (bs->shutdown_when_hidden && !bs->showing) {
-		/* also when the option was just turned on for a hidden source; configured when it is shown */
+		/* also when the option was just turned on for a hidden source; it starts when it is shown, with this
+		 * configuration. Stop() first, so that no helper is started for it now, and Stop() returns after the
+		 * last frame callback, so the cleared frame stays cleared. */
 		bs->client->Stop();
+		bs->client->Configure(cfg);
 		if (!was_shutdown)
 			obs_source_output_video(bs->source, nullptr);
 		return;
 	}
 
+	bs->client->Configure(cfg);
 	/* no-op unless it was stopped, e.g. shut down while hidden before the option was turned off */
 	bs->client->Start();
-	bs->client->Configure(cfg);
 }
 
 void *browser_create(obs_data_t *settings, obs_source_t *source)
 {
 	BrowserSource *bs = new BrowserSource;
 	bs->source = source;
-	bs->client = std::make_unique<HaikuBrowserClient>(obs_source_get_name(source));
+	HaikuBrowserClient::Callbacks callbacks;
+	callbacks.frame = [bs](const HaikuBrowserFrame &frame) { bs->OutputFrame(frame); };
+	bs->client = std::make_unique<HaikuBrowserClient>(obs_source_get_name(source), std::move(callbacks));
 	browser_update(bs, settings);
-	bs->thread = std::thread([bs]() { bs->Run(); });
 	return bs;
 }
 
 void browser_destroy(void *data)
 {
 	BrowserSource *bs = static_cast<BrowserSource *>(data);
-	bs->stop = true;
-	if (bs->thread.joinable())
-		bs->thread.join();
-	bs->client.reset();
+	bs->client.reset(); /* joins its I/O thread: no frame callback runs after this */
 	delete bs;
 }
 
@@ -196,10 +175,8 @@ void browser_show(void *data)
 {
 	BrowserSource *bs = static_cast<BrowserSource *>(data);
 	bs->showing = true;
-	if (bs->shutdown_when_hidden) {
-		bs->client->Start();
-		bs->client->Configure(bs->config);
-	}
+	if (bs->shutdown_when_hidden)
+		bs->client->Start(); /* with the configuration last given to Configure() */
 	bs->client->SetVisibility(true);
 }
 

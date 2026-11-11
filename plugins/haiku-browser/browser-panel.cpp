@@ -36,7 +36,6 @@
 #include <QPainter>
 #include <QPointer>
 #include <QResizeEvent>
-#include <QTimer>
 #include <QWheelEvent>
 
 #include <ctype.h>
@@ -431,9 +430,7 @@ public:
 
 class HaikuQCefWidget : public QCefWidget {
 public:
-	HaikuQCefWidget(QWidget *parent, const std::string &url, const std::string &storage)
-		: QCefWidget(parent),
-		  client(std::make_unique<HaikuBrowserClient>("dock", storage))
+	HaikuQCefWidget(QWidget *parent, const std::string &url, const std::string &storage) : QCefWidget(parent)
 	{
 		setFocusPolicy(Qt::StrongFocus);
 		setMouseTracking(true);
@@ -445,10 +442,34 @@ public:
 		config.fps = 30;
 		config.transparent = false;
 
-		timer = new QTimer(this);
-		timer->setInterval(16);
-		connect(timer, &QTimer::timeout, this, [this]() { Tick(); });
-		timer->start();
+		/*
+		 * The callbacks run on the client's I/O thread. Frames are handed over through a one-slot mailbox
+		 * (`latest`): the I/O thread replaces what is there and queues one call to the UI thread only if none
+		 * is pending, so a busy UI thread drops intermediate frames instead of collecting a backlog. Queued
+		 * calls whose context object (`this`) was deleted are discarded by Qt; the client, and with it the
+		 * I/O thread, is destroyed before the widget's QObject part (it is a member).
+		 */
+		HaikuBrowserClient::Callbacks callbacks;
+		callbacks.frame = [this](const HaikuBrowserFrame &frame) {
+			QImage view(frame.pixels, (int)frame.width, (int)frame.height, (int)frame.stride,
+				    QImage::Format_RGB32);
+			QImage copy = view.copy(); /* the frame buffer is reused */
+			bool post;
+			{
+				std::lock_guard<std::mutex> lock(latest_mutex);
+				latest = std::move(copy);
+				post = !frame_posted;
+				frame_posted = true;
+			}
+			if (post)
+				QMetaObject::invokeMethod(this, [this]() { TakeFrame(); }, Qt::QueuedConnection);
+		};
+		callbacks.info = [this](const std::string &title, const std::string &url) {
+			const QString t = QString::fromStdString(title), u = QString::fromStdString(url);
+			QMetaObject::invokeMethod(
+				this, [this, t, u]() { Info(t, u); }, Qt::QueuedConnection);
+		};
+		client = std::make_unique<HaikuBrowserClient>("dock", std::move(callbacks), storage);
 	}
 
 	~HaikuQCefWidget() override { closeBrowser(); }
@@ -463,12 +484,8 @@ public:
 	void setStartupScript(const std::string &script) override { client->SetStartupScript(script); }
 	void allowAllPopups(bool) override {} /* popups always open in the same view */
 
-	void closeBrowser() override
-	{
-		if (timer)
-			timer->stop();
-		client->Stop();
-	}
+	/* Stop() returns after the last callback; it never waits for the UI thread (the callbacks only post) */
+	void closeBrowser() override { client->Stop(); }
 
 	void reloadPage() override { client->Reload(false); }
 
@@ -578,39 +595,40 @@ private:
 		client->Key(down, haiku_key_bytes(raw, text.constData()), raw, haiku_modifiers(e->modifiers()));
 	}
 
-	void Tick()
+	void TakeFrame()
 	{
-		if (!configured)
-			return;
-		client->Poll();
-
-		if (client->ReadFrame(frame)) {
-			QImage view(frame.pixels.data(), (int)frame.width, (int)frame.height, (int)frame.stride,
-				    QImage::Format_RGB32);
-			image = view.copy(); /* the frame buffer is reused */
-			update();
+		{
+			std::lock_guard<std::mutex> lock(latest_mutex);
+			image = std::move(latest);
+			latest = QImage();
+			frame_posted = false;
 		}
+		update();
+	}
 
-		std::string title, url;
-		if (client->ReadInfo(title, url)) {
-			if (title != last_title) {
-				last_title = title;
-				emit titleChanged(QString::fromStdString(title));
-			}
-			if (url != last_url) {
-				last_url = url;
-				emit urlChanged(QString::fromStdString(url));
-			}
+	void Info(const QString &title, const QString &url)
+	{
+		if (title != last_title) {
+			last_title = title;
+			emit titleChanged(title);
+		}
+		if (url != last_url) {
+			last_url = url;
+			emit urlChanged(url);
 		}
 	}
 
-	std::unique_ptr<HaikuBrowserClient> client;
+	/* declared first, destroyed last: the callbacks below use these until the client is gone */
+	std::mutex latest_mutex;
+	QImage latest;
+	bool frame_posted = false;
+
 	HaikuBrowserConfig config;
 	bool configured = false;
-	QPointer<QTimer> timer;
-	HaikuBrowserFrame frame;
 	QImage image;
-	std::string last_title, last_url;
+	QString last_title, last_url;
+
+	std::unique_ptr<HaikuBrowserClient> client;
 
 	int32 clicks = 1;
 	quint64 last_click = 0;

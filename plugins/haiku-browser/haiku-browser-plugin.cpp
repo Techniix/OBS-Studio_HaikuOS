@@ -22,13 +22,21 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-browser", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Browser source and browser docks for Haiku (HaikuWebKit)";
+	return "Browser source and browser docks for Renga (HaikuWebKit)";
 }
 
 extern void haiku_register_browser_source(void);
+extern void haiku_browser_shutdown(void);
 
 bool obs_module_load(void)
 {
 	haiku_register_browser_source();
 	return true;
+}
+
+/* Sources and docks are gone by now; helpers they told to quit may still be flushing WebKit's storage. Their
+ * reaper thread has to finish before this module's code is unloaded. */
+void obs_module_unload(void)
+{
+	haiku_browser_shutdown();
 }

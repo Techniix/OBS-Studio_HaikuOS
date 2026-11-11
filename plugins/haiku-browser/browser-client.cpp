@@ -20,34 +20,57 @@
 #include <obs-module.h>
 #include <util/bmem.h>
 #include <util/platform.h>
+#include <util/threading.h>
 
 #include <AppFileInfo.h>
 #include <File.h>
-#include <Messenger.h>
 #include <Roster.h>
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
-#include <thread>
+#include <chrono>
+#include <condition_variable>
 
 extern char **environ;
 
 #define BLOG(level, fmt, ...) blog(level, "[haiku-browser] %s: " fmt, name.c_str(), ##__VA_ARGS__)
 
-/* the helper must answer within this long after being spawned, or it is considered hung */
-#define HELPER_START_TIMEOUT 15000000LL
-#define HELPER_STALL_TIMEOUT 10000000LL
+/* How often the helper's application thread is asked for a sign of life, and how long it may stay silent.
+ * Generous: WebCore runs page script on that thread, and a slow page is not a hung one. A helper that died
+ * is not found this way but at once, by the end-of-file on its socket. */
+#define PING_INTERVAL 5000000LL
+#define STALL_TIMEOUT 30000000LL
+
+/* Bytes of messages waiting for a helper that does not read them; more are dropped (it is hung, and the
+ * helper that replaces it gets the configuration anew) */
+#define QUEUE_LIMIT (2 * (size_t)OBS_BROWSER_MAX_MESSAGE)
+
+/* A helper told to go (its socket was closed) gets this long before it is killed. The helper gives itself
+ * two seconds (browser-helper.cpp, SocketReader). */
+#define REAP_GRACE 3000000LL
+
+/* Renga's debug_server writes one report per crashing program here (roadmap F-51,
+ * src/servers/debug/DebugServer.cpp, TeamDebugHandler::_WriteCrashReport()): "app-<program>-<date>.txt",
+ * containing a "team: <id>" line. The System logs application lists them. */
+#define CRASH_REPORT_DIR "/boot/system/var/log/crash"
 
 namespace {
 
-std::atomic_int area_counter{0};
+enum { EVENT_WAKE = 1, EVENT_SOCKET = 2, EVENT_FRAME = 3 };
 
 std::string helper_path()
 {
@@ -84,207 +107,594 @@ void mark_background_app(const std::string &path)
 	});
 }
 
+/* The crash report debug_server wrote for `team` since `not_before`, or empty. One directory scan and, for the
+ * few files that are recent enough, one small read; only called after a helper died or stopped answering. */
+std::string find_crash_report(pid_t team, time_t not_before)
+{
+	static const char prefix[] = "app-" OBS_BROWSER_HELPER_NAME "-";
+	DIR *dir = opendir(CRASH_REPORT_DIR);
+	if (!dir)
+		return std::string();
+
+	char needle[32];
+	snprintf(needle, sizeof(needle), "\nteam: %d\n", (int)team);
+
+	std::string found;
+	time_t found_time = 0;
+	while (struct dirent *entry = readdir(dir)) {
+		if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1) != 0)
+			continue;
+		const std::string path = std::string(CRASH_REPORT_DIR "/") + entry->d_name;
+		struct stat st;
+		/* a little slack: the report's time is debug_server's, taken before it wrote the file */
+		if (stat(path.c_str(), &st) != 0 || st.st_mtime + 2 < not_before || st.st_mtime < found_time)
+			continue;
+		/* the header is: title, time, program (a path), command line (at most 64 bytes), team */
+		char head[2048];
+		const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		const ssize_t got = read(fd, head, sizeof(head) - 1);
+		close(fd);
+		if (got <= 0)
+			continue;
+		head[got] = 0;
+		if (strstr(head, needle)) {
+			found = path;
+			found_time = st.st_mtime;
+		}
+	}
+	closedir(dir);
+	return found;
+}
+
+/*
+ * Waits for helpers that were told to go, so that no caller has to: closing a helper's socket makes it quit
+ * (it flushes WebKit's storage first), which can take a moment that neither the UI thread nor a client's I/O
+ * thread should spend. One thread for the whole module, joined in obs_module_unload(), instead of a detached
+ * thread per helper that could still be running when the module's code is unloaded.
+ */
+class Reaper {
+public:
+	~Reaper() { Shutdown(); }
+
+	void Add(pid_t pid)
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		if (done) {
+			/* after module unload began; nothing may be left running */
+			lock.unlock();
+			kill(pid, SIGKILL);
+			waitpid(pid, nullptr, 0);
+			return;
+		}
+		pending.push_back({pid, system_time() + REAP_GRACE, false});
+		if (!thread.joinable())
+			thread = std::thread([this]() { Run(); });
+		cond.notify_one();
+	}
+
+	/* returns once every helper handed over has exited (at most REAP_GRACE plus the time SIGKILL takes) */
+	void Shutdown()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			done = true;
+		}
+		cond.notify_one();
+		if (thread.joinable())
+			thread.join();
+	}
+
+private:
+	struct Entry {
+		pid_t pid;
+		bigtime_t deadline;
+		bool killed;
+	};
+
+	void Run()
+	{
+		os_set_thread_name("haiku-browser-reaper");
+		std::unique_lock<std::mutex> lock(mutex);
+		for (;;) {
+			if (pending.empty()) {
+				if (done)
+					return;
+				cond.wait(lock);
+				continue;
+			}
+			const bigtime_t now = system_time();
+			for (auto it = pending.begin(); it != pending.end();) {
+				/* non-zero: it exited, or it is not our child (any more) */
+				if (waitpid(it->pid, nullptr, WNOHANG) != 0) {
+					it = pending.erase(it);
+					continue;
+				}
+				if (now >= it->deadline && !it->killed) {
+					kill(it->pid, SIGKILL);
+					it->killed = true;
+				}
+				++it;
+			}
+			if (!pending.empty())
+				cond.wait_for(lock, std::chrono::milliseconds(50));
+		}
+	}
+
+	std::mutex mutex;
+	std::condition_variable cond;
+	std::vector<Entry> pending;
+	std::thread thread;
+	bool done = false;
+};
+
+Reaper &reaper()
+{
+	static Reaper instance;
+	return instance;
+}
+
+/* Serializes helper starts of all clients: while one is being started, its ends of the socket and the eventfd
+ * are inheritable, and a helper started at the same moment by another client's thread would inherit them too
+ * (and then keep the first helper's socket open after that one died). */
+std::mutex spawn_mutex;
+
 } // namespace
 
-HaikuBrowserClient::HaikuBrowserClient(const char *log_name, const std::string &storage_path)
-	: name(log_name ? log_name : "browser"),
-	  storage(storage_path)
+void haiku_browser_shutdown(void)
 {
+	reaper().Shutdown();
+}
+
+HaikuBrowserClient::HaikuBrowserClient(const char *log_name, Callbacks callbacks_, const std::string &storage_path)
+	: name(log_name ? log_name : "browser"),
+	  storage(storage_path),
+	  callbacks(std::move(callbacks_))
+{
+	/* Renga: epoll and eventfd (libgnu; 3rdparty/ce/PORTING.md "epoll", "eventfd") */
+	epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+	wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	struct epoll_event event = {};
+	event.events = EPOLLIN;
+	event.data.u32 = EVENT_WAKE;
+	if (epoll_fd < 0 || wake_fd < 0 || epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wake_fd, &event) != 0) {
+		BLOG(LOG_ERROR, "cannot set up the helper event loop (%s); this browser stays empty", strerror(errno));
+		return;
+	}
+	thread = std::thread([this]() { Run(); });
 }
 
 HaikuBrowserClient::~HaikuBrowserClient()
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	StopHelper();
-	DestroyArea();
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		quit = true;
+	}
+	Wake();
+	if (thread.joinable())
+		thread.join(); /* the thread closes the helper's socket, which ends the helper */
+	if (wake_fd >= 0)
+		close(wake_fd);
+	if (epoll_fd >= 0)
+		close(epoll_fd);
 }
 
-/* Areas are allocated with headroom (at least 1920x1080, rounded up to 64 pixels) so that resizing a source or
- * a dock rarely needs a new one. */
-static uint32_t area_dimension(uint32_t value, uint32_t minimum)
+void HaikuBrowserClient::Wake()
 {
-	value = std::max(value, minimum);
-	return (value + 63u) & ~63u;
+	if (wake_fd >= 0)
+		eventfd_write(wake_fd, 1);
 }
 
-bool HaikuBrowserClient::CreateArea(uint32_t width, uint32_t height)
+/* ---------------------------------------------------------------------------------------------------------- */
+/* any thread */
+
+bool HaikuBrowserClient::EnqueueLocked(std::vector<uint8_t> &&bytes, bool mouse_move)
 {
-	width = area_dimension(width, 1920);
-	height = area_dimension(height, 1080);
-
-	char area_name[B_OS_NAME_LENGTH];
-	snprintf(area_name, sizeof(area_name), "obs browser %d.%d", (int)getpid(), area_counter++);
-
-	void *addr = nullptr;
-	area_id id = create_area(area_name, &addr, B_ANY_ADDRESS, obs_browser_area_size(width, height), B_NO_LOCK,
-				 B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
-	if (id < 0) {
-		BLOG(LOG_WARNING, "create_area(%ux%u) failed: %s", width, height, strerror(id));
+	if (bytes.empty() || !connected)
 		return false;
+
+	/* Pointer positions the helper has not even been sent yet are superseded by the newest one */
+	if (mouse_move && queue_tail_is_move && !queue.empty()) {
+		queue_bytes -= queue.back().size();
+		queue_bytes += bytes.size();
+		queue.back() = std::move(bytes);
+		return true;
 	}
 
-	obs_browser_shm *mapped = static_cast<obs_browser_shm *>(addr);
-	memset(mapped, 0, OBS_BROWSER_HEADER_SIZE);
-	mapped->magic = OBS_BROWSER_MAGIC;
-	mapped->version = OBS_BROWSER_VERSION;
-	mapped->capacity = obs_browser_area_size(width, height) - OBS_BROWSER_HEADER_SIZE;
-	mapped->client_heartbeat = system_time();
+	if (queue_bytes + bytes.size() > QUEUE_LIMIT) {
+		if (!queue_overflow_logged)
+			BLOG(LOG_WARNING, "browser helper is not reading its messages; dropping input");
+		queue_overflow_logged = true;
+		return false;
+	}
+	queue_bytes += bytes.size();
+	queue.push_back(std::move(bytes));
+	queue_tail_is_move = mouse_move;
+	return true;
+}
 
-	if (shm && helper > 0 && HelperAlive()) {
-		/* The running (or starting) helper keeps using its area until it has switched. Seed the new header
-		 * with its state and a heartbeat so that nothing reading it before the switch sees a dead helper;
-		 * helper_team stays 0 until the helper has attached (that is how the switch is confirmed). */
-		const obs_browser_shm *state = HelperShm();
-		mapped->helper_state = state->helper_state;
-		mapped->helper_heartbeat = system_time();
-		if (attach_pending) {
-			/* the current area was never handed to the helper: replace it, keep the one it uses */
-			delete_area(area);
-			area = -1;
-			shm = nullptr;
-		} else {
-			RetireArea();
+void HaikuBrowserClient::Post(const BMessage &message, bool mouse_move)
+{
+	std::vector<uint8_t> bytes = obs_browser_frame_message(message);
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!EnqueueLocked(std::move(bytes), mouse_move))
+			return;
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::QueueConfigLocked()
+{
+	BMessage msg(OBS_BROWSER_MSG_CONFIG);
+	msg.AddString("url", config.url.c_str());
+	msg.AddInt32("width", config.width);
+	msg.AddInt32("height", config.height);
+	msg.AddInt32("fps", config.fps);
+	msg.AddString("css", config.css.c_str());
+	msg.AddBool("transparent", config.transparent);
+	EnqueueLocked(obs_browser_frame_message(msg), false);
+}
+
+void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		config = cfg;
+		config.width = std::clamp(config.width, 1, OBS_BROWSER_MAX_DIMENSION);
+		config.height = std::clamp(config.height, 1, OBS_BROWSER_MAX_DIMENSION);
+		config.fps = std::clamp(config.fps, 1, 120);
+		have_config = true;
+		QueueConfigLocked(); /* no-op without a helper: one started later is sent `config` first thing */
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::Stop()
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		stopped = true;
+	}
+	Wake();
+	/* a callback that began before `stopped` was set finishes first; later ones see the flag */
+	std::lock_guard<std::mutex> wait(deliver_mutex);
+}
+
+void HaikuBrowserClient::Start()
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!stopped)
+			return; /* keep a running restart backoff */
+		stopped = false;
+		reset_backoff = true;
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::Reload(bool nocache)
+{
+	BMessage msg(OBS_BROWSER_MSG_RELOAD);
+	msg.AddBool("nocache", nocache);
+	Post(msg);
+}
+
+void HaikuBrowserClient::ExecuteJavaScript(const std::string &script)
+{
+	BMessage msg(OBS_BROWSER_MSG_EXECUTE_JS);
+	msg.AddString("script", script.c_str());
+	Post(msg);
+}
+
+void HaikuBrowserClient::SetStartupScript(const std::string &script)
+{
+	BMessage msg(OBS_BROWSER_MSG_STARTUP_SCRIPT);
+	msg.AddString("startup", script.c_str());
+	std::vector<uint8_t> bytes = obs_browser_frame_message(msg);
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		startup_script = script;
+		if (!EnqueueLocked(std::move(bytes), false))
+			return;
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::QueueVisibilityLocked(const char *field, int value)
+{
+	if (value < 0)
+		return;
+	BMessage msg(OBS_BROWSER_MSG_VISIBILITY);
+	msg.AddBool(field, value != 0);
+	EnqueueLocked(obs_browser_frame_message(msg), false);
+}
+
+/* Remembered: a helper started (or restarted) later is told the current state, so a page's
+ * obsSourceVisibleChanged/obsSourceActiveChanged handlers see it even when the event came before the helper. */
+void HaikuBrowserClient::SetVisibility(bool value)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		visible = value ? 1 : 0;
+		QueueVisibilityLocked("visible", visible);
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::SetActive(bool value)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		active = value ? 1 : 0;
+		QueueVisibilityLocked("active", active);
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::Zoom(int direction)
+{
+	BMessage msg(OBS_BROWSER_MSG_ZOOM);
+	msg.AddInt32("direction", direction);
+	Post(msg);
+}
+
+void HaikuBrowserClient::MouseDown(int x, int y, int32 buttons, int32 clicks, int32 modifiers)
+{
+	BMessage msg(OBS_BROWSER_MSG_MOUSE_DOWN);
+	msg.AddInt32("x", x);
+	msg.AddInt32("y", y);
+	msg.AddInt32("buttons", buttons);
+	msg.AddInt32("clicks", clicks);
+	msg.AddInt32("modifiers", modifiers);
+	Post(msg);
+}
+
+void HaikuBrowserClient::MouseUp(int x, int y, int32 buttons, int32 clicks, int32 modifiers)
+{
+	BMessage msg(OBS_BROWSER_MSG_MOUSE_UP);
+	msg.AddInt32("x", x);
+	msg.AddInt32("y", y);
+	msg.AddInt32("buttons", buttons);
+	msg.AddInt32("clicks", clicks);
+	msg.AddInt32("modifiers", modifiers);
+	Post(msg);
+}
+
+void HaikuBrowserClient::MouseMove(int x, int y, int32 modifiers, bool leave)
+{
+	BMessage msg(OBS_BROWSER_MSG_MOUSE_MOVE);
+	msg.AddInt32("x", x);
+	msg.AddInt32("y", y);
+	msg.AddInt32("modifiers", modifiers);
+	msg.AddBool("leave", leave);
+	Post(msg, !leave);
+}
+
+void HaikuBrowserClient::MouseWheel(float dx, float dy, int32 modifiers)
+{
+	BMessage msg(OBS_BROWSER_MSG_MOUSE_WHEEL);
+	msg.AddFloat("dx", dx);
+	msg.AddFloat("dy", dy);
+	msg.AddInt32("modifiers", modifiers);
+	Post(msg);
+}
+
+void HaikuBrowserClient::Key(bool down, const std::string &bytes, int32 key, int32 modifiers)
+{
+	if (bytes.empty())
+		return;
+	BMessage msg(down ? OBS_BROWSER_MSG_KEY_DOWN : OBS_BROWSER_MSG_KEY_UP);
+	msg.AddString("bytes", bytes.c_str());
+	msg.AddInt32("key", key);
+	msg.AddInt32("modifiers", modifiers);
+	Post(msg);
+}
+
+void HaikuBrowserClient::Focus(bool focus)
+{
+	BMessage msg(OBS_BROWSER_MSG_FOCUS);
+	msg.AddBool("focus", focus);
+	Post(msg);
+}
+
+/* ---------------------------------------------------------------------------------------------------------- */
+/* I/O thread */
+
+void HaikuBrowserClient::Run()
+{
+	os_set_thread_name("haiku-browser-io");
+
+	for (;;) {
+		bool want_helper;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (quit)
+				break;
+			want_helper = have_config && !stopped;
+			if (reset_backoff) {
+				reset_backoff = false;
+				restarts = 0;
+				next_restart = 0;
+			}
 		}
-		area = id;
-		shm = mapped;
-		area_fresh = false;
-		attach_pending = true;
-		TrySendAttach();
-	} else {
-		DestroyArea();
-		area = id;
-		shm = mapped;
-		area_fresh = true;
+
+		bigtime_t now = system_time();
+		if (!want_helper && helper > 0)
+			CloseHelper();
+		if (want_helper && helper <= 0 && now >= next_restart)
+			Spawn(now);
+		if (helper > 0)
+			Housekeeping(now);
+		if (helper > 0)
+			Flush(now);
+
+		/* Nothing to do until a descriptor says so, except the slow ping while a helper runs and the
+		 * restart backoff while none does. */
+		int timeout = -1;
+		if (helper > 0)
+			timeout = (int)(PING_INTERVAL / 2000);
+		else if (want_helper)
+			timeout = (int)std::max<bigtime_t>((next_restart - system_time()) / 1000 + 1, 1);
+
+		struct epoll_event events[4];
+		const int count = epoll_wait(epoll_fd, events, 4, timeout);
+		if (count < 0) {
+			if (errno == EINTR)
+				continue;
+			BLOG(LOG_ERROR, "epoll_wait failed (%s); this browser stops updating", strerror(errno));
+			break;
+		}
+
+		now = system_time();
+		for (int i = 0; i < count; i++) {
+			eventfd_t value;
+			switch (events[i].data.u32) {
+			case EVENT_WAKE:
+				eventfd_read(wake_fd, &value);
+				break;
+			case EVENT_SOCKET:
+				/* also for hang-up and error: the read then reports the end-of-file. Skipped if an
+				 * earlier event of this batch already closed the helper. */
+				if (sock >= 0)
+					ReadSocket(now);
+				break;
+			case EVENT_FRAME:
+				if (frame_fd >= 0) {
+					eventfd_read(frame_fd, &value);
+					ReadFrame();
+				}
+				break;
+			}
+		}
 	}
 
-	area_width = width;
-	area_height = height;
-	last_frame = -1;
-	return true;
+	CloseHelper();
 }
 
-/* Only called while no switch is in flight (see AttachInFlight()), so there is no older retired area that the
- * helper might still be using. */
-void HaikuBrowserClient::RetireArea()
-{
-	if (retired_area >= 0)
-		delete_area(retired_area);
-	retired_area = area;
-	retired_shm = shm;
-	area = -1;
-	shm = nullptr;
-}
-
-bool HaikuBrowserClient::TrySendAttach()
-{
-	if (!attach_pending || !ready)
-		return false;
-	BMessage msg(OBS_BROWSER_MSG_ATTACH_AREA);
-	msg.AddInt32("area", area);
-	if (!SendLocked(msg))
-		return false;
-	/* the retired area stays the helper's until it confirms the switch in the new header (Poll()) */
-	attach_pending = false;
-	attach_sent = system_time();
-	return true;
-}
-
-bool HaikuBrowserClient::AttachInFlight() const
-{
-	return retired_shm && !attach_pending;
-}
-
-bool HaikuBrowserClient::NeedsBiggerArea() const
-{
-	return !shm || (uint32_t)config.width > area_width || (uint32_t)config.height > area_height;
-}
-
-obs_browser_shm *HaikuBrowserClient::HelperShm() const
-{
-	return retired_shm ? retired_shm : shm;
-}
-
-void HaikuBrowserClient::DestroyArea()
-{
-	if (area >= 0)
-		delete_area(area);
-	if (retired_area >= 0)
-		delete_area(retired_area);
-	area = retired_area = -1;
-	shm = retired_shm = nullptr;
-	attach_pending = false;
-	resize_deferred = false;
-	area_fresh = false;
-	area_width = area_height = 0;
-}
-
-bool HaikuBrowserClient::HelperAlive() const
-{
-	return helper > 0 && kill(helper, 0) == 0;
-}
-
-bool HaikuBrowserClient::SpawnHelper()
+bool HaikuBrowserClient::Spawn(bigtime_t now)
 {
 	const std::string path = helper_path();
 	if (access(path.c_str(), X_OK) != 0) {
 		if (!spawn_failing)
 			BLOG(LOG_ERROR, "helper %s is missing; browser sources cannot render", path.c_str());
 		spawn_failing = true;
-		ScheduleRestart(system_time());
+		ScheduleRestart(now);
 		return false;
 	}
 	mark_background_app(path);
 
-	/* A new helper always starts on an area no earlier helper was given: one that was just stopped (or
-	 * killed after a stall) can keep running for a moment, and two writers would break the sequence lock.
-	 * Dropping our handles to the old areas is safe; a helper still running keeps its own clone. */
-	if (!area_fresh &&
-	    !CreateArea(std::max<uint32_t>(config.width, area_width), std::max<uint32_t>(config.height, area_height))) {
-		ScheduleRestart(system_time());
+	/* SOCK_STREAM: see browser-ipc.hpp. Both ends close-on-exec; the helper's is made inheritable only
+	 * while it is started. The helper adds to the eventfd, we read it; O_NONBLOCK belongs to the open file,
+	 * so the helper's copy never blocks either. */
+	int pair[2] = {-1, -1};
+	int event_fd = -1;
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
+	    fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) | O_NONBLOCK) != 0 ||
+	    (event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
+		if (!spawn_failing)
+			BLOG(LOG_ERROR, "cannot create the helper's socket and eventfd: %s", strerror(errno));
+		spawn_failing = true;
+		if (pair[0] >= 0) {
+			close(pair[0]);
+			close(pair[1]);
+		}
+		ScheduleRestart(now);
 		return false;
 	}
 
-	/* ...with clean state and a single area */
-	if (retired_area >= 0) {
-		delete_area(retired_area);
-		retired_area = -1;
-		retired_shm = nullptr;
-	}
-	attach_pending = false;
-	shm->seq = 0;
-	shm->frame_count = 0;
-	shm->helper_state = OBS_BROWSER_STATE_STARTING;
-	shm->helper_heartbeat = 0;
-	shm->helper_team = 0;
-	shm->client_heartbeat = system_time();
-	last_frame = -1;
-	__sync_synchronize();
-
-	char area_arg[16];
-	snprintf(area_arg, sizeof(area_arg), "%d", (int)area);
-	char *argv[6] = {const_cast<char *>(path.c_str()), const_cast<char *>("--area"), area_arg, nullptr, nullptr,
-			 nullptr};
-	if (!storage.empty()) {
-		argv[3] = const_cast<char *>("--storage");
-		argv[4] = const_cast<char *>(storage.c_str());
-	}
-
 	pid_t pid = -1;
-	const int err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
+	int err;
+	{
+		/*
+		 * No posix_spawn file actions: with any, Haiku's posix_spawn() fork()s the calling process
+		 * (src/system/libroot/posix/spawn.cpp, do_posix_spawn()), and OBS is a large multi-threaded
+		 * process with graphics driver state. Without them it uses load_image(), whose new team inherits
+		 * every descriptor that is not close-on-exec (src/system/kernel/team.cpp, load_image_internal():
+		 * vfs_new_io_context(parent, true)). So the helper's two descriptors are made inheritable for the
+		 * duration of the call and named on the command line.
+		 */
+		std::lock_guard<std::mutex> lock(spawn_mutex);
+		const int child_event = dup(event_fd); /* dup() clears close-on-exec */
+		if (child_event < 0 || fcntl(pair[1], F_SETFD, 0) != 0) {
+			err = errno;
+		} else {
+			char ipc_arg[16], wake_arg[16];
+			snprintf(ipc_arg, sizeof(ipc_arg), "%d", pair[1]);
+			snprintf(wake_arg, sizeof(wake_arg), "%d", child_event);
+			char *argv[8] = {const_cast<char *>(path.c_str()),
+					 const_cast<char *>("--ipc"),
+					 ipc_arg,
+					 const_cast<char *>("--wake"),
+					 wake_arg,
+					 nullptr,
+					 nullptr,
+					 nullptr};
+			if (!storage.empty()) {
+				argv[5] = const_cast<char *>("--storage");
+				argv[6] = const_cast<char *>(storage.c_str());
+			}
+			err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
+		}
+		if (child_event >= 0)
+			close(child_event);
+		close(pair[1]);
+	}
+
+	struct epoll_event socket_event = {};
+	socket_event.events = EPOLLIN;
+	socket_event.data.u32 = EVENT_SOCKET;
+	struct epoll_event frame_event = {};
+	frame_event.events = EPOLLIN;
+	frame_event.data.u32 = EVENT_FRAME;
+	if (err == 0 && (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pair[0], &socket_event) != 0 ||
+			 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &frame_event) != 0)) {
+		err = errno;
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, pair[0], nullptr);
+		reaper().Add(pid); /* closing its socket below ends it */
+	}
 	if (err != 0) {
 		if (!spawn_failing)
 			BLOG(LOG_ERROR, "could not start %s: %s", path.c_str(), strerror(err));
 		spawn_failing = true;
-		ScheduleRestart(system_time());
+		close(pair[0]);
+		close(event_fd);
+		ScheduleRestart(now);
 		return false;
 	}
 
 	spawn_failing = false;
-	area_fresh = false;
+	sock = pair[0];
+	sock_writable_watched = false;
+	frame_fd = event_fd;
 	helper = pid;
-	helper_started = system_time();
-	ready = false;
-	config_dirty = true;
+	helper_started = last_alive = last_ping = now;
+	helper_started_wall = time(nullptr);
+	last_crash_check = now;
+	ping_outstanding = false;
+	hello = false;
+
+	{
+		/* The helper reads these once its application runs; until then they wait in the socket. */
+		std::lock_guard<std::mutex> lock(mutex);
+		queue.clear();
+		queue_bytes = 0;
+		queue_tail_is_move = false;
+		queue_overflow_logged = false;
+		connected = true;
+		if (!startup_script.empty()) {
+			BMessage script(OBS_BROWSER_MSG_STARTUP_SCRIPT);
+			script.AddString("startup", startup_script.c_str());
+			EnqueueLocked(obs_browser_frame_message(script), false);
+		}
+		QueueConfigLocked();
+		/* the events reach the document present when the helper handles them (the load the configuration
+		 * starts is asynchronous); a page that needs the state at load time has no other source on Haiku */
+		QueueVisibilityLocked("visible", visible);
+		QueueVisibilityLocked("active", active);
+	}
+
 	BLOG(LOG_INFO, "started browser helper (team %d)", (int)pid);
 	return true;
 }
@@ -296,376 +706,424 @@ void HaikuBrowserClient::ScheduleRestart(bigtime_t now)
 	restarts++;
 }
 
-/* Never blocks the caller (often the UI or graphics thread): asks the helper to quit and leaves waiting for
- * it, and killing it if it doesn't, to a short-lived reaper thread. */
-void HaikuBrowserClient::StopHelper()
+/* Forgets the current helper. Closing the socket is the request to quit: the helper sees end-of-file, shuts
+ * WebKit down and exits; the reaper waits for it (and kills it if it does not). Never blocks. */
+void HaikuBrowserClient::CloseHelper()
 {
-	if (helper <= 0)
-		return;
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		connected = false;
+		queue.clear();
+		queue_bytes = 0;
+		queue_tail_is_move = false;
+	}
+	sending.clear();
+	sending_offset = 0;
+	rx.clear();
+	for (int fd : rx_fds)
+		close(fd);
+	rx_fds.clear();
 
-	const pid_t pid = helper;
-	/* a clean quit lets WebKit flush its storage; without a messenger (helper never became ready) SIGTERM
-	 * is fine, the helper owns no system state */
-	BMessage quit(B_QUIT_REQUESTED);
-	if (!messenger.IsValid() || messenger.SendMessage(&quit, (BHandler *)nullptr, 0) != B_OK)
-		kill(pid, SIGTERM);
+	/* Removed explicitly: an epoll registration only goes away with the last descriptor of the open file
+	 * (PORTING.md "epoll"), and the frame eventfd's open file is shared with the helper, which may still be
+	 * running for a moment. A stale, level-triggered registration of a counter nobody reads would spin. */
+	if (sock >= 0) {
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock, nullptr);
+		close(sock);
+	}
+	if (frame_fd >= 0) {
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, frame_fd, nullptr);
+		close(frame_fd);
+	}
+	sock = frame_fd = -1;
+	sock_writable_watched = false;
+	UnmapBuffer();
 
-	std::thread([pid]() {
-		for (int i = 0; i < 30; i++) {
-			if (waitpid(pid, nullptr, WNOHANG) != 0)
-				return; /* exited (or not our child any more) */
-			snooze(50000);
-		}
-		kill(pid, SIGKILL);
-		waitpid(pid, nullptr, 0);
-	}).detach();
-
+	if (helper > 0)
+		reaper().Add(helper);
 	helper = -1;
-	ready = false;
-	messenger = BMessenger();
 }
 
-bool HaikuBrowserClient::SendLocked(BMessage &message)
+void HaikuBrowserClient::HelperExited(bigtime_t now, pid_t pid, int status)
 {
-	if (!ready || helper <= 0)
-		return false;
-	if (!messenger.IsValid()) {
-		/* a registrar round trip; done once per helper, not per message */
-		messenger = BMessenger(OBS_BROWSER_HELPER_SIGNATURE, helper);
-		if (!messenger.IsValid())
-			return false;
-	}
-	/* never wait: a busy helper (page loading, long JS) drops input rather than stalling OBS; configuration
-	 * and area switches are retried from Poll() */
-	return messenger.SendMessage(&message, (BHandler *)nullptr, 0) == B_OK;
+	char how[96];
+	if (WIFSIGNALED(status))
+		snprintf(how, sizeof(how), "was ended by signal %d (%s)", WTERMSIG(status), strsignal(WTERMSIG(status)));
+	else
+		snprintf(how, sizeof(how), "exited with status %d", WEXITSTATUS(status));
+
+	/* Renga F-51: say where the crash report is instead of only "helper died" */
+	const std::string report = find_crash_report(pid, helper_started_wall);
+	if (!report.empty())
+		BLOG(LOG_WARNING, "browser helper (team %d) crashed (%s); crash report: %s (also in System logs)",
+		     (int)pid, how, report.c_str());
+	else
+		BLOG(LOG_WARNING, "browser helper (team %d) %s unexpectedly; no crash report for it in %s", (int)pid,
+		     how, CRASH_REPORT_DIR);
+
+	helper = -1; /* already waited for */
+	CloseHelper();
+	ScheduleRestart(now);
 }
 
-void HaikuBrowserClient::SendConfigLocked()
+/* End-of-file on the socket: the helper is gone or going. */
+void HaikuBrowserClient::HelperDied(bigtime_t now)
 {
-	if (resize_deferred)
-		return; /* the new size is sent once the area that fits it exists */
-	if (attach_pending && !TrySendAttach())
-		return; /* the helper must be on the new area before it is told the new size */
-
-	BMessage msg(OBS_BROWSER_MSG_CONFIG);
-	msg.AddString("url", config.url.c_str());
-	msg.AddInt32("width", config.width);
-	msg.AddInt32("height", config.height);
-	msg.AddInt32("fps", config.fps);
-	msg.AddString("css", config.css.c_str());
-	msg.AddBool("transparent", config.transparent);
-	if (!SendLocked(msg))
-		return;
-	config_dirty = false;
-
-	if (!startup_script.empty()) {
-		BMessage s(OBS_BROWSER_MSG_STARTUP_SCRIPT);
-		s.AddString("startup", startup_script.c_str());
-		SendLocked(s);
-	}
-}
-
-void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	config = cfg;
-	config.width = std::clamp(config.width, 1, 8192);
-	config.height = std::clamp(config.height, 1, 8192);
-	config.fps = std::clamp(config.fps, 1, 120);
-	config_dirty = true;
-
-	if (NeedsBiggerArea()) {
-		/* one switch at a time: while one is unconfirmed, Poll() makes the bigger area after it */
-		if (AttachInFlight())
-			resize_deferred = true;
-		else
-			CreateArea(std::max<uint32_t>(config.width, area_width),
-				   std::max<uint32_t>(config.height, area_height));
-	}
-
-	if (!shm)
-		return;
-	if (!stopped && helper <= 0)
-		SpawnHelper();
-	else if (ready)
-		SendConfigLocked();
-}
-
-void HaikuBrowserClient::Stop()
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	stopped = true;
-	StopHelper();
-}
-
-void HaikuBrowserClient::Start()
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	if (!stopped)
-		return; /* keep a running restart backoff */
-	stopped = false;
-	restarts = 0;
-	next_restart = 0;
-}
-
-bool HaikuBrowserClient::Running() const
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	return ready && HelperAlive();
-}
-
-void HaikuBrowserClient::Poll()
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	if (!shm || stopped)
-		return;
-
-	const bigtime_t now = system_time();
-	shm->client_heartbeat = now;
-	if (retired_shm)
-		retired_shm->client_heartbeat = now;
-
-	if (helper > 0 && !HelperAlive()) {
+	const pid_t pid = helper;
+	/* its descriptors are closed a moment before it can be waited for */
+	for (int i = 0; i < 50; i++) {
 		int status = 0;
-		waitpid(helper, &status, WNOHANG);
-		BLOG(LOG_WARNING, "browser helper (team %d) exited unexpectedly (status %d)", (int)helper, status);
-		helper = -1;
-		ready = false;
-		messenger = BMessenger();
-		ScheduleRestart(now);
-	}
-
-	if (helper <= 0) {
-		if (now >= next_restart)
-			SpawnHelper();
-		return;
-	}
-
-	obs_browser_shm *state = HelperShm();
-
-	if (!ready) {
-		if (state->helper_state == OBS_BROWSER_STATE_READY) {
-			ready = true;
-			SendConfigLocked();
-		} else if (now - helper_started > HELPER_START_TIMEOUT) {
-			BLOG(LOG_WARNING, "browser helper did not start in time, restarting it");
-			StopHelper();
-			next_restart = now;
+		const pid_t result = waitpid(pid, &status, WNOHANG);
+		if (result == pid) {
+			HelperExited(now, pid, status);
+			return;
 		}
-		return;
+		if (result < 0)
+			break;
+		snooze(20000);
 	}
 
-	if (now - helper_started > 30000000LL)
+	const std::string report = find_crash_report(pid, helper_started_wall);
+	if (!report.empty())
+		BLOG(LOG_WARNING, "browser helper (team %d) crashed; crash report: %s (also in System logs)", (int)pid,
+		     report.c_str());
+	else
+		BLOG(LOG_WARNING, "browser helper (team %d) closed its connection unexpectedly", (int)pid);
+	CloseHelper();
+	ScheduleRestart(now);
+}
+
+void HaikuBrowserClient::KillHelper(bigtime_t now, const char *why, const std::string &crash_report)
+{
+	if (!crash_report.empty())
+		BLOG(LOG_WARNING, "browser helper (team %d) %s; crash report: %s (also in System logs); restarting it",
+		     (int)helper, why, crash_report.c_str());
+	else
+		BLOG(LOG_WARNING, "browser helper (team %d) %s; restarting it", (int)helper, why);
+	kill(helper, SIGKILL);
+	CloseHelper();
+	ScheduleRestart(now);
+}
+
+void HaikuBrowserClient::Housekeeping(bigtime_t now)
+{
+	if (hello && restarts > 0 && now - helper_started > 30000000LL)
 		restarts = 0;
 
-	if (AttachInFlight()) {
-		if (shm->helper_team != 0) {
-			/* the helper has switched to the current area; its clone of the old one lives as long as
-			 * it needs it */
-			delete_area(retired_area);
-			retired_area = -1;
-			retired_shm = nullptr;
-			state = shm;
-		} else if (now - attach_sent > HELPER_STALL_TIMEOUT) {
-			BLOG(LOG_WARNING, "browser helper did not switch to the new frame area, restarting it");
-			StopHelper();
-			next_restart = now;
+	if (!ping_outstanding) {
+		if (now - last_ping >= PING_INTERVAL) {
+			BMessage ping(OBS_BROWSER_MSG_PING);
+			ping.AddInt32("serial", ++ping_serial);
+			Post(ping);
+			ping_outstanding = true;
+			last_ping = now;
+		}
+		return;
+	}
+
+	/* A ping has been unanswered for a while: busy, hung, or crashed. A crashed team does not exit by
+	 * itself: debug_server writes its report and then shows its alert, with the team stopped and its socket
+	 * still open. The report tells the two apart without waiting for the full timeout. */
+	if (now - last_ping >= PING_INTERVAL && now - last_crash_check >= PING_INTERVAL) {
+		last_crash_check = now;
+
+		/* gone although the socket is open (a descriptor leaked into some other child process)? */
+		int status = 0;
+		if (waitpid(helper, &status, WNOHANG) == helper) {
+			HelperExited(now, helper, status);
+			return;
+		}
+
+		const std::string report = find_crash_report(helper, helper_started_wall);
+		if (!report.empty()) {
+			KillHelper(now, "crashed", report);
 			return;
 		}
 	}
 
-	const bigtime_t last_sign_of_life = std::max<bigtime_t>((bigtime_t)state->helper_heartbeat, helper_started);
-	if (now - last_sign_of_life > HELPER_STALL_TIMEOUT) {
-		BLOG(LOG_WARNING, "browser helper stopped responding, restarting it");
-		StopHelper();
-		next_restart = now;
-		return;
-	}
-
-	if (resize_deferred && !AttachInFlight()) {
-		resize_deferred = false;
-		if (NeedsBiggerArea())
-			CreateArea(std::max<uint32_t>(config.width, area_width),
-				   std::max<uint32_t>(config.height, area_height));
-	}
-	if (attach_pending)
-		TrySendAttach();
-	if (config_dirty)
-		SendConfigLocked();
+	if (now - last_alive > STALL_TIMEOUT)
+		KillHelper(now, "stopped responding");
 }
 
-bool HaikuBrowserClient::ReadFrame(HaikuBrowserFrame &frame)
+template<typename Call> void HaikuBrowserClient::Deliver(Call &&call)
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	if (!shm || !ready)
-		return false;
+	std::lock_guard<std::mutex> delivering(deliver_mutex);
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (stopped || quit)
+			return;
+	}
+	call();
+}
 
-	for (int attempt = 0; attempt < 3; attempt++) {
-		const int32_t seq1 = shm->seq;
-		if (seq1 & 1) {
-			snooze(500);
-			continue;
+void HaikuBrowserClient::ReadSocket(bigtime_t now)
+{
+	for (;;) {
+		uint8_t buffer[4096];
+		/* room for the descriptor of a buffer event (and a few more, which a correct helper never sends) */
+		union {
+			char bytes[CMSG_SPACE(4 * sizeof(int))];
+			struct cmsghdr align;
+		} control;
+		struct iovec iov = {buffer, sizeof(buffer)};
+		struct msghdr message = {};
+		message.msg_iov = &iov;
+		message.msg_iovlen = 1;
+		message.msg_control = control.bytes;
+		message.msg_controllen = sizeof(control.bytes);
+
+		const ssize_t got = recvmsg(sock, &message, MSG_CMSG_CLOEXEC);
+		if (got < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			HelperDied(now);
+			return;
 		}
-		__sync_synchronize();
+		if (got == 0) {
+			HelperDied(now);
+			return;
+		}
 
-		const int64_t count = shm->frame_count;
-		if (count == last_frame)
+		/* SCM_RIGHTS (3rdparty/ce/tests/posix_compat/memfd_test.cpp "scm_rights"). On a stream socket the
+		 * descriptors arrive with the read that takes the first byte of the message they were sent with
+		 * (UnixFifo.cpp), that is, never later than the event they belong to is complete. */
+		for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+			if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+				continue;
+			const size_t fds = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+			for (size_t i = 0; i < fds; i++) {
+				int fd;
+				memcpy(&fd, CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
+				rx_fds.push_back(fd);
+			}
+		}
+		rx.insert(rx.end(), buffer, buffer + got);
+
+		size_t offset = 0;
+		while (rx.size() - offset >= sizeof(uint32_t)) {
+			uint32_t length;
+			memcpy(&length, rx.data() + offset, sizeof(length));
+			const bool valid = length >= sizeof(obs_browser_event) && length <= OBS_BROWSER_MAX_EVENT;
+			if (valid && rx.size() - offset - sizeof(length) < length)
+				break; /* the rest is still to come */
+			if (!valid || !HandleEvent(rx.data() + offset + sizeof(length), length, now)) {
+				KillHelper(now, "sent an invalid message");
+				return;
+			}
+			if (helper <= 0)
+				return; /* the event made us drop the helper */
+			offset += sizeof(length) + length;
+		}
+		rx.erase(rx.begin(), rx.begin() + offset);
+
+		/* one buffer event can be in flight; anything beyond is a helper leaking descriptors into OBS */
+		if (rx_fds.size() > 4) {
+			KillHelper(now, "sent unexpected file descriptors");
+			return;
+		}
+	}
+}
+
+/* false: protocol violation */
+bool HaikuBrowserClient::HandleEvent(const uint8_t *payload, size_t size, bigtime_t now)
+{
+	obs_browser_event event;
+	memcpy(&event, payload, sizeof(event));
+	const char *text = (const char *)payload + sizeof(event);
+	const size_t text_size = size - sizeof(event);
+
+	switch (event.what) {
+	case OBS_BROWSER_EVENT_HELLO:
+		if (event.value != OBS_BROWSER_PROTOCOL) {
+			if (!spawn_failing)
+				BLOG(LOG_ERROR,
+				     "%s speaks protocol %d, this OBS speaks %d: it is a leftover from another OBS "
+				     "version; browser sources cannot render",
+				     helper_path().c_str(), (int)event.value, OBS_BROWSER_PROTOCOL);
+			spawn_failing = true;
+			CloseHelper();
+			restarts = 5; /* look again every ten seconds, quietly */
+			ScheduleRestart(now);
+			return true;
+		}
+		hello = true;
+		last_alive = now;
+		return true;
+
+	case OBS_BROWSER_EVENT_PONG:
+		if (event.value == ping_serial) {
+			ping_outstanding = false;
+			last_alive = now;
+		}
+		return true;
+
+	case OBS_BROWSER_EVENT_BUFFER: {
+		if (rx_fds.empty())
 			return false;
+		const int fd = rx_fds.front();
+		rx_fds.pop_front();
+		return MapBuffer(fd);
+	}
 
-		const uint32_t w = (uint32_t)shm->width;
-		const uint32_t h = (uint32_t)shm->height;
-		const uint32_t stride = (uint32_t)shm->stride;
-		const bool alpha = shm->has_alpha != 0;
-		if (!w || !h || stride < w * 4 || (uint64_t)stride * h > shm->capacity)
+	case OBS_BROWSER_EVENT_INFO: {
+		/* two NUL-terminated strings */
+		const char *title_end = (const char *)memchr(text, 0, text_size);
+		if (!title_end)
 			return false;
-
-		frame.pixels.resize((size_t)stride * h);
-		memcpy(frame.pixels.data(), obs_browser_pixels(shm), frame.pixels.size());
-
-		__sync_synchronize();
-		if (shm->seq != seq1)
-			continue; /* torn: the helper wrote while we copied */
-
-		frame.width = w;
-		frame.height = h;
-		frame.stride = stride;
-		frame.has_alpha = alpha;
-		last_frame = count;
+		const char *url = title_end + 1;
+		const char *url_end = (const char *)memchr(url, 0, text_size - (size_t)(url - text));
+		if (!url_end)
+			return false;
+		if (callbacks.info) {
+			const std::string title(text), address(url);
+			Deliver([&]() { callbacks.info(title, address); });
+		}
 		return true;
 	}
-	return false;
+	}
+	return true; /* unknown events are ignored */
 }
 
-bool HaikuBrowserClient::ReadInfo(std::string &title, std::string &url)
+/* Takes ownership of `fd`, a frame memfd from the helper. */
+bool HaikuBrowserClient::MapBuffer(int fd)
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	if (!shm)
+	/*
+	 * A mapping of a file faults when the file is truncated under it, and the helper is not trusted that
+	 * far. Renga's memfds can be sealed like Linux's (PORTING.md "memfd_create"; memfd_test.cpp
+	 * "shrink_grow_sealed"): once F_SEAL_SHRINK is set, nobody can make the file smaller again. The helper
+	 * sets it; if it did not, set it here (seals are shared by every descriptor of the file), and refuse
+	 * anything that cannot be sealed: F_GET_SEALS fails with EINVAL on files that are not memfds.
+	 */
+	int seals = fcntl(fd, F_GET_SEALS);
+	if (seals >= 0 && !(seals & F_SEAL_SHRINK) && fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) == 0)
+		seals |= F_SEAL_SHRINK;
+
+	/* the helper allocates with headroom (a quarter, rounded to 64 KiB: EnsureBuffer() in browser-helper.cpp) */
+	const uint64_t largest = (uint64_t)OBS_BROWSER_FRAME_HEADER_SIZE +
+				 (uint64_t)OBS_BROWSER_MAX_DIMENSION * OBS_BROWSER_MAX_DIMENSION * 4;
+	const uint64_t max_size = largest + largest / 4 + 65536;
+	struct stat st;
+	void *address = MAP_FAILED;
+	if (seals >= 0 && (seals & F_SEAL_SHRINK) && fstat(fd, &st) == 0 &&
+	    (uint64_t)st.st_size > OBS_BROWSER_FRAME_HEADER_SIZE && (uint64_t)st.st_size <= max_size)
+		address = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd); /* the mapping keeps the file (memfd_test.cpp "mapping_outlives_fd") */
+	if (address == MAP_FAILED) {
+		BLOG(LOG_WARNING, "cannot use the helper's frame buffer");
 		return false;
-	const int32_t serial = shm->info_serial;
-	if (serial == last_info)
-		return false;
-	__sync_synchronize();
-	char t[OBS_BROWSER_TITLE_LEN], u[OBS_BROWSER_URL_LEN];
-	memcpy(t, shm->title, sizeof(t));
-	memcpy(u, shm->url, sizeof(u));
-	t[sizeof(t) - 1] = 0;
-	u[sizeof(u) - 1] = 0;
-	title = t;
-	url = u;
-	last_info = serial;
+	}
+
+	UnmapBuffer();
+	map = static_cast<const uint8_t *>(address);
+	map_size = (size_t)st.st_size;
+	ReadFrame(); /* its first frame may be complete already; its wake-up may have been consumed earlier */
 	return true;
 }
 
-void HaikuBrowserClient::Reload(bool nocache)
+void HaikuBrowserClient::UnmapBuffer()
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_RELOAD);
-	msg.AddBool("nocache", nocache);
-	SendLocked(msg);
+	if (map)
+		munmap(const_cast<uint8_t *>(map), map_size);
+	map = nullptr;
+	map_size = 0;
+	have_last_frame = false;
 }
 
-void HaikuBrowserClient::ExecuteJavaScript(const std::string &script)
+/* Copies the newest frame out of the shared buffer if there is a complete one that was not delivered yet. */
+void HaikuBrowserClient::ReadFrame()
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_EXECUTE_JS);
-	msg.AddString("script", script.c_str());
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::SetStartupScript(const std::string &script)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	startup_script = script;
-	BMessage msg(OBS_BROWSER_MSG_STARTUP_SCRIPT);
-	msg.AddString("startup", script.c_str());
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::SetVisibility(bool visible)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_VISIBILITY);
-	msg.AddBool("visible", visible);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::SetActive(bool active)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_VISIBILITY);
-	msg.AddBool("active", active);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::Zoom(int direction)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_ZOOM);
-	msg.AddInt32("direction", direction);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::MouseDown(int x, int y, int32 buttons, int32 clicks, int32 modifiers)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_MOUSE_DOWN);
-	msg.AddInt32("x", x);
-	msg.AddInt32("y", y);
-	msg.AddInt32("buttons", buttons);
-	msg.AddInt32("clicks", clicks);
-	msg.AddInt32("modifiers", modifiers);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::MouseUp(int x, int y, int32 buttons, int32 clicks, int32 modifiers)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_MOUSE_UP);
-	msg.AddInt32("x", x);
-	msg.AddInt32("y", y);
-	msg.AddInt32("buttons", buttons);
-	msg.AddInt32("clicks", clicks);
-	msg.AddInt32("modifiers", modifiers);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::MouseMove(int x, int y, int32 modifiers, bool leave)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_MOUSE_MOVE);
-	msg.AddInt32("x", x);
-	msg.AddInt32("y", y);
-	msg.AddInt32("modifiers", modifiers);
-	msg.AddBool("leave", leave);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::MouseWheel(float dx, float dy, int32 modifiers)
-{
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_MOUSE_WHEEL);
-	msg.AddFloat("dx", dx);
-	msg.AddFloat("dy", dy);
-	msg.AddInt32("modifiers", modifiers);
-	SendLocked(msg);
-}
-
-void HaikuBrowserClient::Key(bool down, const std::string &bytes, int32 key, int32 modifiers)
-{
-	if (bytes.empty())
+	if (!map || !callbacks.frame)
 		return;
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(down ? OBS_BROWSER_MSG_KEY_DOWN : OBS_BROWSER_MSG_KEY_UP);
-	msg.AddString("bytes", bytes.c_str());
-	msg.AddInt32("key", key);
-	msg.AddInt32("modifiers", modifiers);
-	SendLocked(msg);
+
+	/* the helper writes this memory while we read it */
+	const volatile obs_browser_frame_header *header = reinterpret_cast<const volatile obs_browser_frame_header *>(map);
+
+	const uint32_t seq = __atomic_load_n(&header->seq, __ATOMIC_ACQUIRE);
+	if (seq & 1)
+		return; /* being written; the eventfd is signalled again when it is complete */
+
+	const uint64_t count = header->frame_count;
+	if (header->magic != OBS_BROWSER_FRAME_MAGIC || count == 0 || (have_last_frame && count == last_frame))
+		return;
+
+	/* every field is checked against our own mapping, never trusted */
+	const uint32_t width = header->width;
+	const uint32_t height = header->height;
+	const uint32_t stride = header->stride;
+	const bool alpha = header->has_alpha != 0;
+	if (!width || !height || width > OBS_BROWSER_MAX_DIMENSION || height > OBS_BROWSER_MAX_DIMENSION ||
+	    stride < width * 4 || stride > OBS_BROWSER_MAX_DIMENSION * 4 ||
+	    (uint64_t)stride * height > map_size - OBS_BROWSER_FRAME_HEADER_SIZE)
+		return;
+
+	copy.resize((size_t)stride * height);
+	memcpy(copy.data(), map + OBS_BROWSER_FRAME_HEADER_SIZE, copy.size());
+
+	/* seqlock reader: the copy must be complete before `seq` is read again */
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	if (__atomic_load_n(&header->seq, __ATOMIC_RELAXED) != seq)
+		return; /* torn by a newer frame, which announces itself */
+
+	last_frame = count;
+	have_last_frame = true;
+
+	HaikuBrowserFrame frame;
+	frame.pixels = copy.data();
+	frame.width = width;
+	frame.height = height;
+	frame.stride = stride;
+	frame.has_alpha = alpha;
+	Deliver([&]() { callbacks.frame(frame); });
 }
 
-void HaikuBrowserClient::Focus(bool focus)
+void HaikuBrowserClient::WatchSocket(bool writable)
 {
-	std::lock_guard<std::mutex> lock(mutex);
-	BMessage msg(OBS_BROWSER_MSG_FOCUS);
-	msg.AddBool("focus", focus);
-	SendLocked(msg);
+	if (writable == sock_writable_watched)
+		return;
+	struct epoll_event event = {};
+	event.events = EPOLLIN | (writable ? EPOLLOUT : 0);
+	event.data.u32 = EVENT_SOCKET;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sock, &event) == 0)
+		sock_writable_watched = writable;
+}
+
+/* Writes queued messages until the queue is empty or the socket is full; in the latter case epoll reports
+ * when there is room again. A stream socket may take part of a message: the rest stays in `sending`. */
+void HaikuBrowserClient::Flush(bigtime_t now)
+{
+	for (;;) {
+		if (sending_offset == sending.size()) {
+			std::lock_guard<std::mutex> lock(mutex);
+			if (queue.empty()) {
+				sending.clear();
+				sending_offset = 0;
+				break;
+			}
+			queue_bytes -= queue.front().size();
+			sending = std::move(queue.front());
+			queue.pop_front();
+			if (queue.empty())
+				queue_tail_is_move = false;
+			sending_offset = 0;
+		}
+
+		/* MSG_NOSIGNAL: a helper that just died must not raise SIGPIPE in OBS */
+		const ssize_t sent =
+			send(sock, sending.data() + sending_offset, sending.size() - sending_offset, MSG_NOSIGNAL);
+		if (sent > 0) {
+			sending_offset += (size_t)sent;
+			continue;
+		}
+		if (sent < 0 && errno == EINTR)
+			continue;
+		if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			WatchSocket(true);
+			return;
+		}
+		HelperDied(now);
+		return;
+	}
+	WatchSocket(false);
 }
