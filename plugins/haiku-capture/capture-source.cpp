@@ -24,8 +24,12 @@
 #include <cstring>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <Application.h>
+#include <Looper.h>
+#include <Message.h>
+#include <Messenger.h>
 #include <Roster.h>
 
 #define S_CAPTURE_CURSOR "capture_cursor"
@@ -33,35 +37,20 @@
 
 namespace {
 
-/* How long the user gets to answer the prompt (the API's default). After that the state is "denied" and the
- * properties offer "Try again"; a late answer in the prompt still counts then (the app_server keeps the request). */
-const uint64_t kPermissionTimeout = 120000000000ULL;
-/* The permission thread asks in slices of this length, so that it can be stopped within about this time */
-const bigtime_t kPermissionSlice = 1000000;
-/* See prompt_on_screen() */
-const uint64_t kPromptSettle = 250000000ULL;
-
-const uint64_t kStatePoll = 250000000ULL;      /* how often a thread that waits for the user looks again */
-const uint64_t kPermissionPoll = 100000000ULL; /* ... and while the prompt is up */
+/* Waits for the user, for the permission answer or for a button end on a wakeup (CaptureWakeup); these
+ * timeouts only bound them, in case a wakeup is ever missed. */
+const uint64_t kStatePoll = 1000000000ULL;
 const uint64_t kPromptGrace = 300000000ULL;    /* an answer within this time didn't come from the user */
 const uint64_t kRetryInterval = 1000000000ULL; /* a source that isn't there, a failed start */
+/*
+ * The longest a running session sleeps without taking a frame. The frame notification covers everything that
+ * changes the source's area of the screen, including a window being hidden, minimized, uncovered or moved to
+ * another workspace (each of them redraws that area). It doesn't cover a window that is closed while it isn't
+ * on screen (on another workspace, minimized: nothing is drawn), and a window source looks for its selected
+ * window once a second while it captures a stand-in. A frame without changes costs one app_server round trip.
+ */
+const uint64_t kIdleWake = 1000000000ULL;
 const uint64_t kStatsInterval = 10000000000ULL;
-
-struct PermissionGate {
-	std::mutex mutex;
-	CapturePermission state = CapturePermission::Unknown;
-	std::thread thread;
-	StopSignal stop;
-	bool shut_down = false;
-};
-
-/* Never destroyed: obs_module_unload() joins the thread, but a static destructor running after that (or
- * without it, at exit()) must not find a joinable std::thread. */
-PermissionGate &permission_gate()
-{
-	static PermissionGate *gate = new PermissionGate;
-	return *gate;
-}
 
 std::string application_signature()
 {
@@ -72,105 +61,127 @@ std::string application_signature()
 	return "?";
 }
 
-/*
- * Whether a Screen recording prompt ("ScreenRecording --prompt <request>", launched by the app_server:
- * ScreenCaptureManager::_LaunchAgent()) is running.
- *
- * Needed because BScreenCapture::_Start() returns B_NOT_ALLOWED both when the user said no and when its own
- * timeout ran out while the app_server still answered B_WOULD_BLOCK (src/kits/interface/ScreenCapture.cpp).
- * A timeout leaves the request on the app_server, so asking again just goes on waiting for it. But a "no"
- * without "Remember my decision" is consumed by the Start that returned it (ScreenCaptureManager::_Start()),
- * and asking again would show a second prompt. A slice that ends at its timeout can also have read such a no
- * (the reply to its last round trip, which starts after the deadline), so the return value alone can't tell.
- * The prompt quits as soon as it is answered (PromptWindow in src/preferences/screenrecording), so: prompt
- * still up after a short settle time -> the request is pending; gone -> it was answered, and the answer was
- * the B_NOT_ALLOWED we got. (In the unlikely case that the user answers in the few milliseconds between that
- * reply and this check, the answer is still on the app_server and "Try again" picks it up.)
- *
- * Any application's prompt counts (the request id isn't returned to the client): with two applications asking
- * at once this can take another application's prompt for ours and ask once more. Renga request: a way for
- * Start() to report "still pending" distinctly (B_WOULD_BLOCK for a zero timeout) would replace this.
- */
-bool prompt_running()
+class PermissionLooper;
+
+struct PermissionGate {
+	std::mutex mutex;
+	CapturePermission state = CapturePermission::Unknown;
+	/* Created on first need; quit (which deletes it) in capture_permission_shutdown() */
+	PermissionLooper *looper = nullptr;
+	bool shut_down = false;
+	/* See permission_answer() */
+	bool ask_twice = false;
+	int32 last_request = -1;
+	bool unavailable_logged = false;
+	/* After a failed request, no new one before this (os_gettime_ns()): the sources ask again once a second */
+	uint64_t not_before = 0;
+	/* Every source's wakeup, registered for the source's whole lifetime: woken under `mutex`, so a source
+	 * that is being destroyed (it unregisters under `mutex` before its semaphore goes) is never touched. */
+	std::vector<CaptureWakeup *> wakeups;
+};
+
+/* Never destroyed: a source destroyed after obs_module_unload() (libobs frees modules before the remaining
+ * sources, obs_shutdown()) still unregisters, and a static destructor must not run before that. */
+PermissionGate &permission_gate()
 {
-	static const char kPrompt[] = SCREEN_CAPTURE_AGENT_PATH " --prompt";
-	int32 cookie = 0;
-	team_info info;
-	while (get_next_team_info(&cookie, &info) == B_OK) {
-		/* args: the command line, cut to 63 characters; the prefix fits */
-		if (strncmp(info.args, kPrompt, sizeof(kPrompt) - 1) == 0) {
-			return true;
+	static PermissionGate *gate = new PermissionGate;
+	return *gate;
+}
+
+void wake_all_locked(PermissionGate &gate)
+{
+	for (CaptureWakeup *wakeup : gate.wakeups) {
+		wakeup->Wake();
+	}
+}
+
+void permission_answer(status_t status, int32 request);
+
+/* Receives the app_server's SCREEN_CAPTURE_PERMISSION_ANSWER ('ScPa': "status", "request", "sources";
+ * headers/private/app/ScreenCaptureDefs.h) for BScreenCapture::RequestPermission(). */
+class PermissionLooper : public BLooper {
+public:
+	PermissionLooper() : BLooper("haiku-capture permission") {}
+
+	void MessageReceived(BMessage *message) override
+	{
+		if (message->what != BPrivate::SCREEN_CAPTURE_PERMISSION_ANSWER) {
+			BLooper::MessageReceived(message);
+			return;
 		}
+		permission_answer((status_t)message->GetInt32("status", B_ERROR), message->GetInt32("request", -1));
 	}
-	return false;
-}
+};
 
-bool prompt_on_screen(StopSignal &stop)
+/* gate.mutex held. The answer comes to the looper; for a decision the app_server already knows (remembered,
+ * or "allowed" earlier in this run) it is sent right away. */
+status_t send_request(PermissionGate &gate)
 {
-	if (!prompt_running()) {
-		return false;
-	}
-	/* Answered just now: give the prompt the time to quit (it posts B_QUIT_REQUESTED right after answering) */
-	stop.WaitFor(kPromptSettle);
-	return prompt_running();
+	return BScreenCapture::RequestPermission(BMessenger(gate.looper), BPrivate::SCREEN_CAPTURE_ANY_MASK);
 }
 
 /*
- * Asks through a session of its own for one pixel, which is stopped again at once: the permission belongs to
- * the application, not to a session, so the sources' own sessions start without a prompt afterwards.
- * B_NOT_ALLOWED stands for "Don't allow" as well as for no answer within kPermissionTimeout.
+ * On the looper's thread.
  *
- * Starting that session shows the Screen recording indicator for a moment (ScreenCaptureManager::_Start() ->
- * _EnsureIndicator()); the sources' sessions start right after it, so it normally just stays up.
+ * Why `ask_twice`: an answer that came from the prompt stays with the app_server's request "for the
+ * application's next Start...()" (ScreenCaptureManager::_AnswerRequest()), and the next request uses it up
+ * (_Decide()): after "Don't allow" without "Remember my decision" the next RequestPermission() is answered
+ * B_NOT_ALLOWED at once, without a prompt, and the one after that asks. A prompt closed unanswered (B_CANCELED)
+ * leaves its request too, and _Decide() takes that as a no for the next request as well. So when the user
+ * presses "Try again" after either, the first, immediate no (request -1: no prompt was shown) only uses up
+ * that leftover, and the question is sent once more. A remembered "Don't allow" is answered no again by the
+ * second request, and stays denied. (Recorded as a Renga request: such leftovers should not answer a later
+ * RequestPermission().)
  */
-void permission_thread()
+void permission_answer(status_t status, int32 request)
 {
-	os_set_thread_name("haiku-capture-permission");
-
 	PermissionGate &gate = permission_gate();
-	BScreenCapture probe;
-	const uint64_t deadline = os_gettime_ns() + kPermissionTimeout;
-	status_t status = B_NOT_ALLOWED;
-
-	while (!gate.stop.Stopped()) {
-		/* Every BScreenCapture call goes through be_app's app_server connection (AppServerLink) */
-		if (!be_app) {
-			status = B_NO_INIT;
-			break;
-		}
-		const uint64_t before = os_gettime_ns();
-		status = probe.StartRegion(BRect(0, 0, 0, 0), 0, kPermissionSlice);
-		const bool slice_ran_out = os_gettime_ns() - before >= (uint64_t)kPermissionSlice * 1000ULL;
-		if (status != B_NOT_ALLOWED || !slice_ran_out || os_gettime_ns() >= deadline) {
-			break;
-		}
-		if (!prompt_on_screen(gate.stop)) {
-			break;
-		}
-	}
-	/* Only a running session costs a round trip */
-	if (be_app) {
-		probe.Stop();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	if (gate.shut_down || gate.state != CapturePermission::Asking) {
+		/* Unloading, or an answer nobody waits for (only one request is ever out) */
+		return;
 	}
 
-	if (gate.stop.Stopped()) {
-		return; /* unloading: nobody reads the state any more */
+	if (status == B_NOT_ALLOWED && request < 0 && gate.ask_twice) {
+		gate.ask_twice = false;
+		if (send_request(gate) == B_OK) {
+			return; /* still asking */
+		}
+		status = B_ERROR;
 	}
+	gate.ask_twice = false;
+	gate.last_request = request;
 
 	const std::string signature = application_signature();
-	if (status == B_OK) {
+	switch (status) {
+	case B_OK:
+		gate.state = CapturePermission::Granted;
 		blog(LOG_INFO, "[haiku-capture] Screen recording is allowed for this application (signature '%s')",
 		     signature.c_str());
-	} else {
+		break;
+	case B_CANCELED:
+		gate.state = CapturePermission::NotAnswered;
 		blog(LOG_WARNING,
-		     "[haiku-capture] Screen recording is not allowed (%s). To allow it, open the Screen recording "
+		     "[haiku-capture] The Screen recording prompt was closed without an answer; press \"Try again\" "
+		     "in the source's properties to be asked again");
+		break;
+	case B_NOT_ALLOWED:
+		gate.state = CapturePermission::Denied;
+		blog(LOG_WARNING,
+		     "[haiku-capture] Screen recording is not allowed. To allow it, open the Screen recording "
 		     "preferences (" SCREEN_CAPTURE_AGENT_PATH ") and allow this application, or run "
 		     "'ScreenRecording --set %s allow'; then press \"Try again\" in the source's properties.",
-		     strerror(status), signature.c_str());
+		     signature.c_str());
+		break;
+	default:
+		/* Not one of the documented answers; the sources show "failed" and ask again in a second */
+		gate.state = CapturePermission::Unknown;
+		gate.not_before = os_gettime_ns() + kRetryInterval;
+		blog(LOG_ERROR, "[haiku-capture] Asking for the screen recording permission failed: %s",
+		     strerror(status));
+		break;
 	}
-
-	std::lock_guard<std::mutex> lock(gate.mutex);
-	gate.state = status == B_OK ? CapturePermission::Granted : CapturePermission::Denied;
+	wake_all_locked(gate);
 }
 
 /* Moved on by any source's "Start capture" button: see CaptureSource::Restart() */
@@ -184,8 +195,11 @@ int32 round_up(int32 value)
 
 struct Stats {
 	uint64_t since = 0;
-	uint32_t polls = 0;
+	uint32_t wakeups = 0; /* frame notifications (and other wakeups) of a running session */
+	uint32_t frames = 0;  /* NextFrame() calls */
 	uint32_t changed = 0;
+	uint32_t output = 0;
+	uint32_t refused = 0; /* changed frames not output: the window doesn't show (AcceptFrame()) */
 	uint64_t next_frame_ns = 0;
 	uint64_t next_frame_max_ns = 0;
 	uint64_t output_ns = 0;
@@ -197,20 +211,50 @@ CapturePermission capture_permission_poll()
 {
 	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
-	if (gate.state == CapturePermission::Unknown && !gate.shut_down) {
-		/* A thread from an earlier question has set the state (its last action) and is returning or has
-		 * returned: this join doesn't wait for anything that needs the lock held here */
-		if (gate.thread.joinable()) {
-			gate.thread.join();
-		}
-		gate.state = CapturePermission::Asking;
-		try {
-			gate.thread = std::thread(permission_thread);
-		} catch (const std::system_error &error) {
-			blog(LOG_ERROR, "[haiku-capture] Unable to start the permission thread: %s", error.what());
-			gate.state = CapturePermission::Denied;
-		}
+	if (gate.state != CapturePermission::Unknown) {
+		return gate.state;
 	}
+	if (gate.shut_down || os_gettime_ns() < gate.not_before) {
+		return CapturePermission::Unavailable;
+	}
+
+	/* Every BScreenCapture call goes through be_app's app_server connection (AppServerLink) */
+	if (!be_app) {
+		if (!gate.unavailable_logged) {
+			blog(LOG_ERROR,
+			     "[haiku-capture] No BApplication: unable to ask for the screen recording permission");
+		}
+		gate.unavailable_logged = true;
+		return CapturePermission::Unavailable;
+	}
+
+	if (!gate.looper) {
+		PermissionLooper *looper = new PermissionLooper;
+		const thread_id thread = looper->Run();
+		if (thread < 0) {
+			blog(LOG_ERROR, "[haiku-capture] Unable to start the permission looper: %s", strerror(thread));
+			/* Quit() deletes it, also when Run() failed (BLooper::Quit()) */
+			if (looper->Lock()) {
+				looper->Quit();
+			}
+			return CapturePermission::Unavailable;
+		}
+		gate.looper = looper;
+	}
+
+	gate.state = CapturePermission::Asking;
+	const status_t status = send_request(gate);
+	if (status != B_OK) {
+		gate.state = CapturePermission::Unknown;
+		gate.not_before = os_gettime_ns() + kRetryInterval;
+		if (!gate.unavailable_logged) {
+			blog(LOG_ERROR, "[haiku-capture] Asking for the screen recording permission failed: %s",
+			     strerror(status));
+		}
+		gate.unavailable_logged = true;
+		return CapturePermission::Unavailable;
+	}
+	gate.unavailable_logged = false;
 	return gate.state;
 }
 
@@ -220,6 +264,7 @@ void capture_permission_invalidate()
 	std::lock_guard<std::mutex> lock(gate.mutex);
 	if (gate.state == CapturePermission::Granted) {
 		gate.state = CapturePermission::Unknown;
+		gate.ask_twice = false;
 	}
 }
 
@@ -227,7 +272,9 @@ void capture_permission_retry()
 {
 	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
-	if (gate.state == CapturePermission::Denied) {
+	if (gate.state == CapturePermission::Denied || gate.state == CapturePermission::NotAnswered) {
+		/* Leftovers on the app_server's side: see permission_answer() */
+		gate.ask_twice = gate.state == CapturePermission::NotAnswered || gate.last_request >= 0;
 		gate.state = CapturePermission::Unknown;
 	}
 }
@@ -235,17 +282,43 @@ void capture_permission_retry()
 void capture_permission_shutdown()
 {
 	PermissionGate &gate = permission_gate();
-	std::thread thread;
+	PermissionLooper *looper;
 	{
 		std::lock_guard<std::mutex> lock(gate.mutex);
 		gate.shut_down = true;
-		thread = std::move(gate.thread);
+		looper = gate.looper;
+		gate.looper = nullptr;
 	}
-	/* The thread returns after the round trip it is in, at most one slice (kPermissionSlice) */
-	gate.stop.Stop();
-	if (thread.joinable()) {
-		thread.join();
+	/*
+	 * Without gate.mutex: the looper may be waiting for it in permission_answer(), which returns at once now
+	 * that shut_down is set. Quit() from another thread lets the looper finish the messages it has, then
+	 * waits for its thread (BLooper::Quit()); the looper deletes itself. An answer the app_server sends later
+	 * goes to a port that no longer exists, which it tolerates (a SendMessage() with a timeout).
+	 */
+	if (looper && looper->Lock()) {
+		looper->Quit();
 	}
+}
+
+void capture_register_wakeup(CaptureWakeup *wakeup)
+{
+	PermissionGate &gate = permission_gate();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	gate.wakeups.push_back(wakeup);
+}
+
+void capture_unregister_wakeup(CaptureWakeup *wakeup)
+{
+	PermissionGate &gate = permission_gate();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	gate.wakeups.erase(std::remove(gate.wakeups.begin(), gate.wakeups.end(), wakeup), gate.wakeups.end());
+}
+
+void capture_wake_all()
+{
+	PermissionGate &gate = permission_gate();
+	std::lock_guard<std::mutex> lock(gate.mutex);
+	wake_all_locked(gate);
 }
 
 CaptureSource::CaptureSource(obs_source_t *source, const char *what) : source(source), what(what)
@@ -258,6 +331,7 @@ CaptureSource::CaptureSource(obs_source_t *source, const char *what) : source(so
 	 * live screen has nothing to gain from the buffering either.
 	 */
 	obs_source_set_async_unbuffered(source, true);
+	capture_register_wakeup(&wakeup);
 }
 
 CaptureSource::~CaptureSource()
@@ -265,9 +339,11 @@ CaptureSource::~CaptureSource()
 	/* The thread calls virtual functions: the subclass's owner must have called Hide() */
 	if (thread.joinable()) {
 		blog(LOG_ERROR, "[haiku-capture] %s: destroyed while capturing", what);
-		stop.Stop();
+		wakeup.Stop();
 		thread.join();
 	}
+	/* Before `wakeup` (and its semaphore) goes: the permission looper wakes registered sources */
+	capture_unregister_wakeup(&wakeup);
 }
 
 void CaptureSource::Show()
@@ -277,7 +353,7 @@ void CaptureSource::Show()
 		return;
 	}
 
-	stop.Reset();
+	wakeup.Reset();
 	try {
 		thread = std::thread(&CaptureSource::Run, this);
 	} catch (const std::system_error &error) {
@@ -292,9 +368,10 @@ void CaptureSource::Hide()
 		return;
 	}
 
-	/* Called on the graphics thread. The capture thread is at most inside one NextFrame() or one Start with
-	 * a zero timeout (a round trip to the app_server each), or copying one frame into libobs. */
-	stop.Stop();
+	/* Called on the graphics thread. Stop() releases the semaphore the capture thread sleeps on, so it wakes
+	 * at once; it is at most inside one NextFrame(), one Start with a zero timeout or one RequestPermission()
+	 * (a round trip to the app_server each), or copying one frame into libobs. */
+	wakeup.Stop();
 	thread.join();
 
 	/* Don't keep showing stale content when the source is shown again */
@@ -310,6 +387,7 @@ void CaptureSource::Restart()
 	restart_generation++;
 	user_stopped = false;
 	capture_permission_retry();
+	capture_wake_all();
 }
 
 void CaptureSource::UpdateCommon(obs_data_t *settings)
@@ -366,6 +444,10 @@ void CaptureSource::AddStatusProperties(obs_properties_t *props, CaptureSource *
 		text = T_("Status.Denied");
 		type = OBS_TEXT_INFO_WARNING;
 		break;
+	case State::NotAnswered:
+		text = T_("Status.NotAnswered");
+		type = OBS_TEXT_INFO_WARNING;
+		break;
 	case State::StoppedByUser:
 		text = T_("Status.StoppedByUser");
 		type = OBS_TEXT_INFO_WARNING;
@@ -387,9 +469,9 @@ void CaptureSource::AddStatusProperties(obs_properties_t *props, CaptureSource *
 		obs_property_t *status = obs_properties_add_text(props, "status", text, OBS_TEXT_INFO);
 		obs_property_text_set_info_type(status, type);
 	}
-	if (current == State::Denied || current == State::StoppedByUser) {
+	if (current == State::Denied || current == State::NotAnswered || current == State::StoppedByUser) {
 		obs_properties_add_button2(props, "restart",
-					   current == State::Denied ? T_("TryAgain") : T_("StartCapture"),
+					   current == State::StoppedByUser ? T_("StartCapture") : T_("TryAgain"),
 					   restart_clicked, self);
 	}
 }
@@ -412,6 +494,7 @@ bool CaptureSource::SetState(State new_state)
 		"waiting for the user's permission",
 		"capturing",
 		"not allowed",
+		"the Screen recording prompt was closed without an answer",
 		"stopped by the user (Screen recording indicator or preferences)",
 		"source not available",
 		"failed",
@@ -435,6 +518,11 @@ void CaptureSource::Run()
 		SetState(State::Failed);
 		return;
 	}
+	if (!wakeup.IsValid()) {
+		blog(LOG_ERROR, "[haiku-capture] %s: unable to create a semaphore, unable to capture", what);
+		SetState(State::Failed);
+		return;
+	}
 
 	/* Used by this thread only, as the class requires */
 	BScreenCapture capture;
@@ -443,15 +531,17 @@ void CaptureSource::Run()
 	int32 bitmap_height = 0;
 	/* Show the next frame even if nothing changed since the one before: that one wasn't shown */
 	bool force_output = true;
+	/* Take a frame without waiting for the notification (a new session, a bitmap that was too small) */
+	bool take_frame = false;
 	uint32_t generation = session_generation;
 	uint64_t retry_at = 0;
-	uint64_t next_frame = os_gettime_ns();
-	uint64_t last_took = 0;
+	/* The frame rate cap: no NextFrame() before this */
+	uint64_t next_due = 0;
 	uint64_t asking_since = 0;
 	bool frame_error_logged = false;
 	Stats stats;
 
-	while (!stop.Stopped()) {
+	while (!wakeup.Stopped()) {
 		/* The user said stop: only the button in the properties starts a capture again, not hiding and
 		 * showing the source (a scene switch) or a settings change. */
 		if (user_stopped && stopped_generation != restart_generation) {
@@ -459,7 +549,7 @@ void CaptureSource::Run()
 		}
 		if (user_stopped) {
 			SetState(State::StoppedByUser);
-			stop.WaitFor(kStatePoll);
+			wakeup.WaitFor(kStatePoll);
 			continue;
 		}
 
@@ -472,15 +562,23 @@ void CaptureSource::Run()
 
 		if (!capture.IsRunning()) {
 			const CapturePermission permission = capture_permission_poll();
-			if (permission == CapturePermission::Denied) {
+			if (permission == CapturePermission::Denied || permission == CapturePermission::NotAnswered) {
 				asking_since = 0;
-				SetState(State::Denied);
-				stop.WaitFor(kStatePoll);
+				SetState(permission == CapturePermission::Denied ? State::Denied : State::NotAnswered);
+				wakeup.WaitFor(kStatePoll); /* "Try again" wakes it */
+				continue;
+			}
+			if (permission == CapturePermission::Unavailable) {
+				asking_since = 0;
+				if (SetState(State::Failed)) {
+					ClearOutput();
+				}
+				wakeup.WaitFor(kRetryInterval);
 				continue;
 			}
 			if (permission != CapturePermission::Granted) {
-				/* With a remembered decision the answer is there within milliseconds: only say
-				 * "waiting" once it is clear that the user is being asked */
+				/* A decision the app_server knows is answered within milliseconds: only say "waiting"
+				 * once it is clear that the user is being asked. The answer wakes this thread. */
 				const uint64_t asking_now = os_gettime_ns();
 				if (!asking_since) {
 					asking_since = asking_now;
@@ -489,21 +587,25 @@ void CaptureSource::Run()
 				if (prompting) {
 					SetState(State::WaitingForPermission);
 				}
-				stop.WaitFor(prompting ? kPermissionPoll : kPromptGrace / 10);
+				wakeup.WaitFor(prompting ? kStatePoll : kPromptGrace);
 				continue;
 			}
 			asking_since = 0;
 
 			const uint64_t now = os_gettime_ns();
 			if (now < retry_at) {
-				stop.WaitUntil(std::min(retry_at, now + kStatePoll));
+				wakeup.WaitUntil(retry_at);
 				continue;
 			}
 
 			const status_t status = StartSession(capture);
-			if (status == B_NOT_ALLOWED) {
-				/* Revoked since it was granted. If the setting is "ask" now, this start has made the
-				 * app_server show the prompt, and the permission thread picks that request up. */
+			if (status == B_NOT_ALLOWED || status == B_TIMED_OUT) {
+				/* Changed since it was granted. B_NOT_ALLOWED: set to "deny" (the request below is answered
+				 * no at once). B_TIMED_OUT: set back to "ask", and this zero-timeout start has made the
+				 * app_server show the prompt (BScreenCapture::_Start()); the request below joins it, and the
+				 * properties say "waiting" rather than "not allowed". */
+				blog(LOG_INFO, "[haiku-capture] %s: the session was refused (%s); asking again", what,
+				     status == B_TIMED_OUT ? "the user is being asked" : "not allowed");
 				capture_permission_invalidate();
 				continue;
 			}
@@ -521,156 +623,203 @@ void CaptureSource::Run()
 				continue;
 			}
 
+			/* F-58 (O-8): the app_server releases the semaphore when the source changes after a frame was
+			 * taken (ScreenCaptureManager::ScreenDamaged()), and when the session is stopped from the
+			 * indicator (_Stop()) or its window is gone (_Frame()). The semaphore must belong to this team
+			 * (_SetNotification() checks). No SetFrameNotification(-1) is needed before Stop(): a stopped
+			 * session is removed with its notification. */
+			const status_t notify = capture.SetFrameNotification(wakeup.Semaphore());
+			if (notify != B_OK) {
+				blog(LOG_ERROR, "[haiku-capture] %s: SetFrameNotification failed: %s", what,
+				     strerror(notify));
+				capture.Stop();
+				if (SetState(State::Failed)) {
+					ClearOutput();
+				}
+				retry_at = now + kRetryInterval;
+				continue;
+			}
+
 			SetState(State::Capturing);
 			force_output = true;
-			next_frame = os_gettime_ns();
+			take_frame = true;
+			next_due = 0;
 			stats = Stats();
-			stats.since = next_frame;
+			stats.since = os_gettime_ns();
 		}
 
+		if (!take_frame) {
+			/* Sleep until the source changes (or Stop(), a restart, a button) */
+			const CaptureWakeup::Result result = wakeup.WaitFor(kIdleWake);
+			if (result == CaptureWakeup::Result::Stopped) {
+				break;
+			}
+			if (result == CaptureWakeup::Result::Woken) {
+				stats.wakeups++;
+			}
+			take_frame = true;
+			continue; /* look at the state again first: a wakeup may have been a restart or a stop */
+		}
+
+		/*
+		 * The frame rate cap: not faster than the source's frame rate. Changes in the meantime are not lost:
+		 * the app_server collects them for the next NextFrame(), and doesn't release the semaphore again
+		 * before that (once per frame), so this wait isn't cut short by drawing on the desktop.
+		 */
 		uint64_t now = os_gettime_ns();
-		const Poll poll = BeforeFrame(now);
-		if (poll == Poll::Restart) {
+		if (now < next_due) {
+			if (wakeup.WaitUntil(next_due) == CaptureWakeup::Result::Stopped) {
+				break;
+			}
+			continue;
+		}
+
+		if (WantsRestart(now)) {
 			capture.Stop();
 			continue;
 		}
 
-		if (poll == Poll::Capture) {
-			/* The app_server fills the bitmap from its top left and clips to its size (ServerBitmap::
-			 * ImportBits() -> BPrivate::ConvertBits()), so a larger bitmap than the frame is fine, and a
-			 * smaller one is safe but incomplete: it is replaced below. */
-			BRect frame = capture.Frame();
-			int32 width = frame.IntegerWidth() + 1;
-			int32 height = frame.IntegerHeight() + 1;
-			if (!bitmap || bitmap_width < width || bitmap_height < height) {
-				bitmap_width = round_up(std::max(width, bitmap_width));
-				bitmap_height = round_up(std::max(height, bitmap_height));
-				bitmap.reset(); /* first: never two screen-sized bitmaps at once */
-				bitmap = std::make_unique<BBitmap>(BRect(0, 0, bitmap_width - 1, bitmap_height - 1),
-								   B_RGB32);
-				force_output = true;
-				if (!bitmap->IsValid()) {
-					blog(LOG_ERROR, "[haiku-capture] %s: unable to allocate a %dx%d bitmap", what,
-					     (int)bitmap_width, (int)bitmap_height);
-					bitmap.reset();
-					bitmap_width = bitmap_height = 0;
-					capture.Stop();
-					SetState(State::Failed);
-					retry_at = now + kRetryInterval;
-					continue;
-				}
-			}
-
-			bool changed = false;
-			bigtime_t time = 0;
-			const uint64_t before = os_gettime_ns();
-			const status_t status = capture.NextFrame(bitmap.get(), &changed, nullptr, &time);
-			const uint64_t took = os_gettime_ns() - before;
-
-			if (status == B_CANCELED) {
-				/* Stopped from the indicator or the preferences, or the permission was revoked. Give
-				 * the session up (the app_server keeps a stopped one until then) and wait for the
-				 * button; the picture goes too, the user doesn't expect it to stay on stream. */
-				capture.Stop();
-				ClearOutput();
-				stopped_generation = restart_generation.load();
-				user_stopped = true;
-				continue;
-			}
-			if (status == B_ENTRY_NOT_FOUND) {
-				/* The window is gone (or entirely outside the screen; a region after a mode change).
-				 * The session is dead on the app_server's side as well. */
-				capture.Stop();
-				ClearOutput();
-				SessionLost();
-				continue; /* straight to StartSession(), which looks for the source again */
-			}
-			if (status != B_OK) {
-				/* B_ERROR: no reply, or the app_server could not lock its drawing engine;
-				 * B_BAD_VALUE: it doesn't know the session or the bitmap. Start over. */
-				if (!frame_error_logged) {
-					blog(LOG_ERROR, "[haiku-capture] %s: reading a frame failed: %s", what,
-					     strerror(status));
-				}
-				frame_error_logged = true;
+		/* The app_server fills the bitmap from its top left and clips to its size (ServerBitmap::ImportBits()
+		 * -> BPrivate::ConvertBits()), so a larger bitmap than the frame is fine, and a smaller one is safe but
+		 * incomplete: it is replaced below. */
+		BRect frame = capture.Frame();
+		int32 width = frame.IntegerWidth() + 1;
+		int32 height = frame.IntegerHeight() + 1;
+		if (!bitmap || bitmap_width < width || bitmap_height < height) {
+			bitmap_width = round_up(std::max(width, bitmap_width));
+			bitmap_height = round_up(std::max(height, bitmap_height));
+			bitmap.reset(); /* first: never two screen-sized bitmaps at once */
+			bitmap = std::make_unique<BBitmap>(BRect(0, 0, bitmap_width - 1, bitmap_height - 1), B_RGB32);
+			force_output = true;
+			if (!bitmap->IsValid()) {
+				blog(LOG_ERROR, "[haiku-capture] %s: unable to allocate a %dx%d bitmap", what,
+				     (int)bitmap_width, (int)bitmap_height);
+				bitmap.reset();
+				bitmap_width = bitmap_height = 0;
 				capture.Stop();
 				SetState(State::Failed);
 				retry_at = now + kRetryInterval;
 				continue;
 			}
+		}
 
-			frame_error_logged = false;
-			last_took = took;
-			stats.polls++;
-			stats.next_frame_ns += took;
-			stats.next_frame_max_ns = std::max(stats.next_frame_max_ns, took);
+		bool changed = false;
+		bigtime_t time = 0;
+		uint32 flags = 0;
+		const uint64_t before = os_gettime_ns();
+		/* F-58 (O-9): the overload with flags; window sessions report whether the window shows */
+		const status_t status = capture.NextFrame(bitmap.get(), &changed, nullptr, &time, &flags);
+		const uint64_t after = os_gettime_ns();
+		const uint64_t took = after - before;
+		take_frame = false;
 
-			/* Frame() is now the frame this bitmap was filled for. If the window grew (or the screen
-			 * mode did) beyond the bitmap, this frame is cut off: read it again into a larger one. */
-			frame = capture.Frame();
-			width = frame.IntegerWidth() + 1;
-			height = frame.IntegerHeight() + 1;
-			if (width > bitmap_width || height > bitmap_height) {
-				continue;
+		if (status == B_CANCELED) {
+			/* Stopped from the indicator or the preferences, or the permission was revoked. Give the
+			 * session up (the app_server keeps a stopped one until then) and wait for the button; the
+			 * picture goes too, the user doesn't expect it to stay on stream. */
+			capture.Stop();
+			ClearOutput();
+			stopped_generation = restart_generation.load();
+			user_stopped = true;
+			continue;
+		}
+		if (status == B_ENTRY_NOT_FOUND) {
+			/* The window is gone (or entirely outside the screen; a region after a mode change). The
+			 * session is dead on the app_server's side as well. */
+			capture.Stop();
+			ClearOutput();
+			SessionLost();
+			continue; /* straight to StartSession(), which looks for the source again */
+		}
+		if (status != B_OK) {
+			/* B_ERROR: no reply, or the app_server could not lock its drawing engine; B_BAD_VALUE: it
+			 * doesn't know the session or the bitmap. Start over. */
+			if (!frame_error_logged) {
+				blog(LOG_ERROR, "[haiku-capture] %s: reading a frame failed: %s", what,
+				     strerror(status));
 			}
+			frame_error_logged = true;
+			capture.Stop();
+			SetState(State::Failed);
+			retry_at = now + kRetryInterval;
+			continue;
+		}
 
-			if ((changed || force_output) && width > 0 && height > 0) {
-				if (AcceptFrame(os_gettime_ns())) {
-					const uint64_t output_start = os_gettime_ns();
-					struct obs_source_frame out = {};
-					out.data[0] = (uint8_t *)bitmap->Bits();
-					out.linesize[0] = (uint32_t)bitmap->BytesPerRow();
-					out.width = (uint32_t)width;
-					out.height = (uint32_t)height;
-					out.format = VIDEO_FORMAT_BGRX; /* B_RGB32 on little endian */
-					out.full_range = true;
-					/* When the app_server took the frame: system_time() in microseconds, the same
-					 * clock as os_gettime_ns() (CLOCK_MONOTONIC) */
-					out.timestamp = (uint64_t)time * 1000ULL;
-					obs_source_output_video(source, &out);
-
-					force_output = false;
-					stats.changed++;
-					stats.output_ns += os_gettime_ns() - output_start;
-				} else {
-					/* The bitmap now holds something that wasn't shown */
-					force_output = true;
-				}
-			}
-
-			now = os_gettime_ns();
-			if (now - stats.since >= kStatsInterval) {
-				/* For before/after numbers: the cost of a frame is one NextFrame() (a round trip to
-				 * the app_server plus its copy of what changed) and, for changed frames, libobs's
-				 * copy of the whole frame */
-				blog(LOG_DEBUG,
-				     "[haiku-capture] %s: %dx%d, %" PRIu32 " frames polled in %.1f s, %" PRIu32
-				     " changed; NextFrame avg %.2f ms, max %.2f ms; output avg %.2f ms",
-				     what, (int)width, (int)height, stats.polls, (now - stats.since) / 1e9,
-				     stats.changed, stats.polls ? stats.next_frame_ns / 1e6 / stats.polls : 0.0,
-				     stats.next_frame_max_ns / 1e6,
-				     stats.changed ? stats.output_ns / 1e6 / stats.changed : 0.0);
-				stats = Stats();
-				stats.since = now;
-			}
+		frame_error_logged = false;
+		stats.frames++;
+		stats.next_frame_ns += took;
+		stats.next_frame_max_ns = std::max(stats.next_frame_max_ns, took);
+		if (changed) {
+			stats.changed++;
 		}
 
 		/*
-		 * A steady schedule; a late frame isn't made up for. The app_server copies while it holds its
-		 * drawing lock (DrawingEngine::LockExclusiveAccess() in ScreenCaptureManager::_Frame()): nothing on
-		 * the desktop is drawn meanwhile. Normally that is a short copy from its back buffer, but where a
-		 * frame takes longer than the frame interval (a large screen that changes all over, read from a
-		 * slow front buffer), polling back to back would hold that lock all the time. So wait at least as
-		 * long as the last read took: the desktop always gets half of the time.
+		 * The next frame is due one frame interval after this one started, and not before as long again as
+		 * this one took: the app_server copies while it holds its drawing lock (DrawingEngine::
+		 * LockExclusiveAccess() in ScreenCaptureManager::_Frame()), and nothing on the desktop is drawn
+		 * meanwhile. Normally that is a short copy from its back buffer, but where a frame takes longer than
+		 * the frame interval (a large screen that changes all over, read from a slow front buffer), reading
+		 * back to back would hold that lock all the time. So the desktop always gets at least half of it.
 		 */
 		const int rate = fps;
-		next_frame += 1000000000ULL / (uint64_t)(rate > 0 ? rate : 30);
-		now = os_gettime_ns();
-		if (next_frame < now + last_took) {
-			next_frame = now + last_took;
+		next_due = std::max<uint64_t>(before + 1000000000ULL / (uint64_t)(rate > 0 ? rate : 30), after + took);
+
+		/* Frame() is now the frame this bitmap was filled for. If the window grew (or the screen mode did)
+		 * beyond the bitmap, this frame is cut off: read it again into a larger one. */
+		frame = capture.Frame();
+		width = frame.IntegerWidth() + 1;
+		height = frame.IntegerHeight() + 1;
+		if (width > bitmap_width || height > bitmap_height) {
+			take_frame = true;
+			continue;
 		}
-		last_took = 0;
-		stop.WaitUntil(next_frame);
+
+		if ((changed || force_output) && width > 0 && height > 0) {
+			if (AcceptFrame(flags)) {
+				const uint64_t output_start = os_gettime_ns();
+				struct obs_source_frame out = {};
+				out.data[0] = (uint8_t *)bitmap->Bits();
+				out.linesize[0] = (uint32_t)bitmap->BytesPerRow();
+				out.width = (uint32_t)width;
+				out.height = (uint32_t)height;
+				out.format = VIDEO_FORMAT_BGRX; /* B_RGB32 on little endian */
+				out.full_range = true;
+				/* When the app_server took the frame: system_time() in microseconds, the same clock as
+				 * os_gettime_ns() (CLOCK_MONOTONIC) */
+				out.timestamp = (uint64_t)time * 1000ULL;
+				obs_source_output_video(source, &out);
+
+				force_output = false;
+				stats.output++;
+				stats.output_ns += os_gettime_ns() - output_start;
+			} else {
+				/* The bitmap now holds something that wasn't shown: show the next frame the source
+				 * accepts even if nothing changes in it */
+				force_output = true;
+				if (changed) {
+					stats.refused++;
+				}
+			}
+		}
+
+		now = os_gettime_ns();
+		if (now - stats.since >= kStatsInterval) {
+			/* For before/after numbers. A frame costs one NextFrame() (a round trip to the app_server plus
+			 * its copy of what changed) and, when output, libobs's copy of the whole frame. Wakeups are
+			 * frame notifications; frames read beyond them are the idle checks (kIdleWake) and first
+			 * frames. */
+			blog(LOG_DEBUG,
+			     "[haiku-capture] %s: %dx%d, in %.1f s: %" PRIu32 " wakeups, %" PRIu32
+			     " frames read (%" PRIu32 " changed), %" PRIu32 " output, %" PRIu32
+			     " not shown (window not visible); NextFrame avg "
+			     "%.2f ms, max %.2f ms; output avg %.2f ms",
+			     what, (int)width, (int)height, (now - stats.since) / 1e9, stats.wakeups, stats.frames,
+			     stats.changed, stats.output, stats.refused,
+			     stats.frames ? stats.next_frame_ns / 1e6 / stats.frames : 0.0,
+			     stats.next_frame_max_ns / 1e6, stats.output ? stats.output_ns / 1e6 / stats.output : 0.0);
+			stats = Stats();
+			stats.since = now;
+		}
 	}
 
 	capture.Stop();

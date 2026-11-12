@@ -37,7 +37,7 @@ target_include_directories(
   PRIVATE "${RengaInterfacePrivate_INCLUDE_DIR}" "${RengaAppPrivate_INCLUDE_DIR}"
 )
 
-# libbe: BScreenCapture, BBitmap, BScreen, the window list
+# libbe: BScreenCapture, BBitmap, BScreen, BLooper (the permission answers), the window list
 target_link_libraries(haiku-capture PRIVATE OBS::libobs be)
 target_compile_features(haiku-capture PRIVATE cxx_std_17)
 

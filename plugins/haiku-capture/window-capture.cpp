@@ -26,10 +26,12 @@
  *    window on top of the captured one is in the picture. The properties say so.
  *  - It follows the window: Frame() changes when the window moves or changes size, the bitmap is filled from
  *    its top left. CaptureSource keeps the bitmap large enough.
- *  - It does not look at whether the window is visible: for a minimized or hidden window, or one on another
- *    workspace, it would copy whatever is on screen at the window's position. So when a frame has changed,
- *    this source asks for the window's state (get_window_info(), as Deskbar and the Switcher do) before it
- *    shows the frame, and pauses, keeping the last picture, until the window is back.
+ *  - With each frame it says whether the window's area shows the window (NextFrame()'s flags, F-58 / O-9):
+ *    SCREEN_CAPTURE_FRAME_HIDDEN (hidden or minimized) and _OTHER_WORKSPACE mean the area shows something
+ *    else, so the source pauses, keeping the last picture, until the window is back. _COVERED (partly) and
+ *    _FULLY_COVERED (with _COVERED) mean other windows are in front of it: what they show is in the copy.
+ *    By default the source captures anyway (as the screen looks); the "When the window is covered" setting
+ *    pauses it instead when the window is fully covered, or when any part of it is.
  *  - B_ENTRY_NOT_FOUND means the window is closed, or entirely outside the screen. The picture is cleared and
  *    the window looked for again once a second, by application and title, so it is found again when it
  *    reopens with a new token.
@@ -47,7 +49,6 @@
 
 #include <unistd.h>
 
-#include <InterfaceDefs.h>
 #include <Rect.h>
 #include <Roster.h>
 
@@ -55,6 +56,7 @@
 
 #define S_WINDOW "window"
 #define S_DECORATIONS "include_decorations"
+#define S_WHEN_COVERED "when_covered"
 
 /* Window ids are "<application name>\x1f<window title>"; the unit separator never appears in either. */
 #define ID_SEPARATOR '\x1f'
@@ -62,7 +64,13 @@
 namespace {
 
 const uint64_t kSecond = 1000000000ULL;
-const uint64_t kVisibilityPoll = 250000000ULL;
+
+/* "When the window is covered" */
+enum covered_mode {
+	COVERED_CAPTURE = 0,     /* capture anyway: the covering windows are in the picture */
+	COVERED_PAUSE_FULLY = 1, /* pause while nothing of the window shows */
+	COVERED_PAUSE_ANY = 2,   /* pause while any part of it is covered */
+};
 
 struct WindowEntry {
 	int32 token = -1;
@@ -105,22 +113,6 @@ bool read_window(int32 token, WindowEntry &entry, bool lookup_app)
 		entry.app = app_name_for_team(entry.team);
 	}
 	return true;
-}
-
-enum class Visibility { Gone, Hidden, OnScreen };
-
-/* Whether the window's area of the screen shows the window now (other windows may still cover it). */
-Visibility window_visibility(int32 token)
-{
-	client_window_info *info = get_window_info(token);
-	if (!info) {
-		return Visibility::Gone;
-	}
-
-	const bool on_workspace = (info->workspaces & (1u << current_workspace())) != 0;
-	const bool on_screen = info->layer >= 3 && !info->is_mini && info->show_hide_level <= 0 && on_workspace;
-	free(info);
-	return on_screen ? Visibility::OnScreen : Visibility::Hidden;
 }
 
 std::vector<WindowEntry> list_windows()
@@ -226,6 +218,8 @@ public:
 	{
 		const std::string wanted = obs_data_get_string(settings, S_WINDOW);
 		const bool border = obs_data_get_bool(settings, S_DECORATIONS);
+		/* Read with each frame: no restart needed */
+		when_covered = (int)obs_data_get_int(settings, S_WHEN_COVERED);
 		{
 			std::lock_guard<std::mutex> lock(settings_mutex);
 			/* The window and the border flag are fixed when a session starts */
@@ -295,7 +289,7 @@ protected:
 			return status;
 		}
 
-		paused = false;
+		paused_for = 0;
 		next_exact_check = os_gettime_ns() + kSecond;
 		blog(LOG_INFO,
 		     exact ? "[haiku-capture] Capturing window '%s' of '%s'"
@@ -305,7 +299,7 @@ protected:
 		return B_OK;
 	}
 
-	Poll BeforeFrame(uint64_t now) override
+	bool WantsRestart(uint64_t now) override
 	{
 		/* Capturing a stand-in of the same application: switch to the selected window when it opens */
 		if (!exact && now >= next_exact_check) {
@@ -314,56 +308,53 @@ protected:
 			if (find_exact_window(id, found)) {
 				window = std::move(found);
 				exact = true;
-				return Poll::Restart;
+				return true;
 			}
 		}
-
-		if (!paused) {
-			return Poll::Capture;
-		}
-		if (now < next_visibility_check) {
-			return Poll::Skip;
-		}
-		next_visibility_check = now + kVisibilityPoll;
-
-		switch (window_visibility(window.token)) {
-		case Visibility::Hidden:
-			return Poll::Skip;
-		case Visibility::OnScreen:
-			blog(LOG_INFO, "[haiku-capture] Window '%s' is back on screen", window.title.c_str());
-			break;
-		case Visibility::Gone:
-			/* The next frame reports it (B_ENTRY_NOT_FOUND) */
-			break;
-		}
-		paused = false;
-		return Poll::Capture;
+		return false;
 	}
 
-	bool AcceptFrame(uint64_t now) override
+	bool AcceptFrame(uint32 flags) override
 	{
-		/* Asked after the frame was read, and only for frames that changed: hiding or minimizing a window
-		 * changes its area of the screen, so the frame that would show what is behind it is one of them. */
-		switch (window_visibility(window.token)) {
-		case Visibility::OnScreen:
-			return true;
-		case Visibility::Hidden:
-			paused = true;
-			next_visibility_check = now + kVisibilityPoll;
-			blog(LOG_INFO,
-			     "[haiku-capture] Window '%s' is minimized, hidden or on another workspace; paused",
-			     window.title.c_str());
-			return false;
-		case Visibility::Gone:
+		/* SCREEN_CAPTURE_FRAME_NOT_VISIBLE includes _FULLY_COVERED; whether that pauses is the user's
+		 * choice, so the mask is built here. */
+		uint32 pause_on = BPrivate::SCREEN_CAPTURE_FRAME_HIDDEN |
+				  BPrivate::SCREEN_CAPTURE_FRAME_OTHER_WORKSPACE;
+		switch (when_covered.load()) {
+		case COVERED_PAUSE_FULLY:
+			pause_on |= BPrivate::SCREEN_CAPTURE_FRAME_FULLY_COVERED;
+			break;
+		case COVERED_PAUSE_ANY:
+			pause_on |= BPrivate::SCREEN_CAPTURE_FRAME_COVERED; /* also set when fully covered */
+			break;
+		default:
 			break;
 		}
-		return false;
+
+		const uint32 reason = flags & pause_on;
+		if (reason != paused_for) {
+			if (!reason) {
+				blog(LOG_INFO, "[haiku-capture] Window '%s' shows again; resumed",
+				     window.title.c_str());
+			} else {
+				const char *why =
+					(reason & BPrivate::SCREEN_CAPTURE_FRAME_HIDDEN) ? "minimized or hidden"
+					: (reason & BPrivate::SCREEN_CAPTURE_FRAME_OTHER_WORKSPACE)
+						? "on another workspace"
+					: (reason & BPrivate::SCREEN_CAPTURE_FRAME_FULLY_COVERED) ? "fully covered"
+												  : "partly covered";
+				blog(LOG_INFO, "[haiku-capture] Window '%s' is %s; paused", window.title.c_str(), why);
+			}
+			paused_for = reason;
+		}
+		return !reason;
 	}
 
 	void SessionLost() override
 	{
 		blog(LOG_INFO, "[haiku-capture] Window '%s' is gone, waiting for it to appear", window.title.c_str());
 		have_window = false;
+		paused_for = 0;
 	}
 
 	const char *MissingText() const override { return T_("Status.WindowNotOpen"); }
@@ -372,15 +363,15 @@ private:
 	std::mutex settings_mutex;
 	std::string window_id;
 	bool decorations = false;
+	std::atomic_int when_covered = COVERED_CAPTURE;
 
 	/* Capture thread only */
 	std::string id; /* the selection `window` was found for */
 	WindowEntry window;
 	bool have_window = false;
-	bool exact = false; /* `window` is the selected window, not another one of the same application */
-	bool paused = false;
+	bool exact = false;    /* `window` is the selected window, not another one of the same application */
+	uint32 paused_for = 0; /* the SCREEN_CAPTURE_FRAME_* flags the source is paused for; 0: not paused */
 	uint64_t next_exact_check = 0;
-	uint64_t next_visibility_check = 0;
 };
 
 const char *window_capture_get_name(void *)
@@ -420,6 +411,7 @@ void window_capture_hide(void *data)
 void window_capture_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_DECORATIONS, false);
+	obs_data_set_default_int(settings, S_WHEN_COVERED, COVERED_CAPTURE);
 	CaptureSource::CommonDefaults(settings);
 }
 
@@ -466,6 +458,11 @@ obs_properties_t *window_capture_properties(void *data)
 
 	obs_properties_add_button2(props, "refresh", T_("RefreshWindows"), refresh_windows, wc);
 	obs_properties_add_bool(props, S_DECORATIONS, T_("IncludeDecorations"));
+	obs_property_t *covered = obs_properties_add_list(props, S_WHEN_COVERED, T_("WhenCovered"), OBS_COMBO_TYPE_LIST,
+							  OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(covered, T_("WhenCovered.Capture"), COVERED_CAPTURE);
+	obs_property_list_add_int(covered, T_("WhenCovered.PauseFully"), COVERED_PAUSE_FULLY);
+	obs_property_list_add_int(covered, T_("WhenCovered.PauseAny"), COVERED_PAUSE_ANY);
 	CaptureSource::AddCommonProperties(props);
 	obs_properties_add_text(props, "note", T_("WindowCaptureNote"), OBS_TEXT_INFO);
 

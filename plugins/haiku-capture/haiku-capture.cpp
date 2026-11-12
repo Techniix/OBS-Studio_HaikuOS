@@ -37,9 +37,11 @@ bool obs_module_load(void)
 }
 
 /*
- * Joins the thread that asks for the screen recording permission (capture-source.cpp). libobs calls this from
- * obs_shutdown() (free_module()), which the frontend runs in OBSApp's destructor body (applicationShutdown()),
- * that is before ~QApplication and so while be_app, which every BScreenCapture call needs, still exists.
+ * Quits and joins the looper that receives the screen recording permission answers (capture-source.cpp,
+ * BScreenCapture::RequestPermission(), F-58 / O-7). libobs calls this from obs_shutdown() (free_module()), which
+ * the frontend runs in OBSApp's destructor body (applicationShutdown()), that is before ~QApplication and so
+ * while be_app, which every BScreenCapture call needs, still exists. Sources that libobs destroys after this
+ * (obs_free_data() runs after the modules are freed) don't ask again.
  */
 void obs_module_unload(void)
 {
