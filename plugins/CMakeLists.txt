@@ -84,6 +84,7 @@ add_core_module(
 add_core_module(haiku-capture PLATFORMS HAIKU)
 add_core_module(haiku-media PLATFORMS HAIKU)
 add_core_module(haiku-video-accel PLATFORMS HAIKU)
+add_core_module(haiku-virtualcam PLATFORMS HAIKU)
 add_core_module(image-source)
 add_core_module(linux-alsa PLATFORMS LINUX FREEBSD OPENBSD)
 add_core_module(linux-capture PLATFORMS LINUX FREEBSD OPENBSD)

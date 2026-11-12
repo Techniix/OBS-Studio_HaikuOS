@@ -21,6 +21,9 @@
 
 #include <components/UIValidation.hpp>
 #include <dialogs/OBSBasicVCamConfig.hpp>
+#if defined(__HAIKU__)
+#include <qt-wrappers.hpp>
+#endif
 
 #define VIRTUAL_CAM_START "==== Virtual Camera Start =========================================="
 #define VIRTUAL_CAM_STOP "==== Virtual Camera Stop ==========================================="
@@ -76,7 +79,7 @@ void OBSBasic::OnVirtualCamStart()
 	blog(LOG_INFO, VIRTUAL_CAM_START);
 }
 
-void OBSBasic::OnVirtualCamStop(int)
+void OBSBasic::OnVirtualCamStop([[maybe_unused]] int code)
 {
 	if (!outputHandler || !outputHandler->virtualCam) {
 		return;
@@ -93,6 +96,19 @@ void OBSBasic::OnVirtualCamStop(int)
 	blog(LOG_INFO, VIRTUAL_CAM_STOP);
 
 	OnDeactivate();
+
+#if defined(__HAIKU__)
+	/* An output that stops itself on an error (obs_output_signal_stop() with a code other than
+	 * OBS_OUTPUT_SUCCESS) has nowhere else to tell the user why; upstream's v4l2 and macOS outputs never do
+	 * that, so upstream shows nothing. plugins/haiku-virtualcam does when the connection to Renga's Virtual
+	 * Camera breaks, and sets the reason with obs_output_set_last_error(). Nothing here is Haiku specific; it is
+	 * only in a Haiku block to keep the port's changes to upstream files easy to find (ARCHITECTURE.md). */
+	if (code != OBS_OUTPUT_SUCCESS && !restartingVCam) {
+		const char *error = obs_output_get_last_error(outputHandler->virtualCam);
+		OBSMessageBox::warning(this, QTStr("Output.VirtualCamStopped.Title"),
+				       error ? QT_UTF8(error) : QTStr("Output.StartFailedGeneric"));
+	}
+#endif
 
 	if (!restartingVCam) {
 		return;
