@@ -34,10 +34,17 @@
 #include <MediaRoster.h>
 #include <Messenger.h>
 #include <OS.h>
+#include <ParameterWeb.h>
+#include <Roster.h>
+
+#include <strings.h>
 
 /* Renga private header (headers/private/media, header-only on public Media Kit API): the system mixer's
  * per-application streams and the loopback flavor. PORTING.md, "Per-application audio, routing and loopback". */
 #include <AudioStreamControl.h>
+/* Renga private header (headers/private/media; F-58, O-12): only its constants are used here, so nothing of
+ * the feeder (memfd, sockets) is compiled in */
+#include <VirtualCamera.h>
 
 #define T_(text) obs_module_text(text)
 
@@ -88,13 +95,23 @@ static std::vector<dormant_node_info> dormant_capture_nodes(media_type type)
 		count = 0;
 	nodes.resize((size_t)std::min<int32>(count, 64));
 
-	/* the mixer's loopback is a physical input too (MixerAddOn.cpp); it has sources of its own */
+	/* The mixer's loopback is a physical input too (MixerAddOn.cpp); it has sources of its own. Renga's
+	 * "Virtual Camera" (virtual_camera add-on, VIRTUAL_CAMERA_FLAVOR_NAME, its only flavor) shows what OBS
+	 * itself feeds it (plugins/haiku-virtualcam): capturing it would loop OBS's output back into itself, so
+	 * it is no camera to choose here. */
 	nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
-				   [](const dormant_node_info &info) {
-					   return strcmp(info.name, HAIKU_MEDIA_LOOPBACK_FLAVOR) == 0;
+				   [type](const dormant_node_info &info) {
+					   return strcmp(info.name, HAIKU_MEDIA_LOOPBACK_FLAVOR) == 0 ||
+						  (type == B_MEDIA_RAW_VIDEO &&
+						   strcmp(info.name, VIRTUAL_CAMERA_FLAVOR_NAME) == 0);
 				   }),
 		    nodes.end());
 	return nodes;
+}
+
+static bool is_virtual_camera_id(const std::string &device_id, media_type type)
+{
+	return type == B_MEDIA_RAW_VIDEO && device_id == VIRTUAL_CAMERA_FLAVOR_NAME;
 }
 
 static bool device_listed(const std::string &device_id, media_type type)
@@ -126,7 +143,14 @@ void HaikuFillDeviceList(obs_property_t *list, media_type type, const char *curr
 		found = found || device.id == current;
 	}
 
-	if (!found) {
+	if (!found && is_virtual_camera_id(current, type)) {
+		/* a saved source that points to OBS's own virtual camera: shown, never opened (acquire_node()) */
+		struct dstr label = {0};
+		dstr_printf(&label, T_("VirtualCamera.NotAvailable"), current);
+		const size_t index = obs_property_list_add_string(list, label.array, current);
+		obs_property_list_item_disable(list, index, true);
+		dstr_free(&label);
+	} else if (!found) {
 		/* Devices are remembered by flavor name; one that is unplugged keeps its place in the list (the
 		 * capture uses the default device meanwhile and returns to it when it is back). */
 		struct dstr label = {0};
@@ -140,36 +164,100 @@ void HaikuFillDeviceList(obs_property_t *list, media_type type, const char *curr
 /* ------------------------------------------------------------------------------------------------------ */
 /* Frame sizes                                                                                            */
 
-/* Renga's video producers still have no way to list their frame sizes or rates (checked in Renga's
- * usb_webcam): the add-on's parameter web has an "Info" text and the camera's picture controls only
- * (Producer.cpp NodeRegistered(), UVCCamDevice::AddParameters()), FormatSuggestionRequested() answers only
- * for B_MEDIA_ENCODED_VIDEO and with one size (Producer.cpp), and BMediaRoster has no public call that
- * reaches BBufferProducer::FormatProposal() except Connect(). The UVC driver does know the camera's frame
- * descriptors (UVCCamDevice::fUncompressedFrames, fMJPEGFrames) but only uses them to accept or refuse a
- * size: UVCCamDevice::AcceptVideoFrame() takes exact matches, YUY2 first, MJPEG (decoded by the add-on)
- * otherwise; older sensors clamp or round the size instead. The frame interval is fixed at 30 fps
- * (UVCCamDevice.cpp, request.frame_interval = 333333) while the format reports 5 (Producer.cpp FIELD_RATE),
- * so there is no frame rate to choose or to trust.
+/* Renga's camera producers list what they can send in a hidden, read-only text parameter of kind
+ * "renga:video_modes" (F-58, OBS Studio's O-5; usb_webcam/Producer.cpp P_MODES from UVCCamDevice::VideoModes(),
+ * video_producer_demo and virtual_camera have one too), one line per frame size and encoding:
+ * "<w>x<h> <encoding> <fps>,<fps>,...", fastest first. A connection's field_rate picks the device's nearest rate
+ * for the size (UVCCamDevice::SetFrameRate() -> _ChooseInterval(); 0: the descriptor's default) and the rate
+ * granted is in the connected format.
  *
- * What does work is connecting with a specific size and looking at the format the connection ends up with.
- * So sizes are probed by connecting and disconnecting with each of these, once per device and session,
- * while the device is open for capture anyway. A list from the add-on would replace all of this; that is
- * requested from Renga (docs/haiku/RENGA-REQUESTS.md). */
-static const HaikuVideoSize common_sizes[] = {
-	{160, 120},  {176, 144},  {320, 240},  {352, 288},   {640, 360},   {640, 480},  {800, 600},
-	{960, 540},  {1024, 576}, {1024, 768}, {1280, 720},  {1280, 800},  {1280, 960}, {1280, 1024},
-	{1600, 900}, {1600, 1200}, {1920, 1080},
-};
+ * Reading the parameter is a round trip to the node (GetParameterWebFor(), then GetValue()), so it is done by
+ * the capture's supervisor thread when it opens the device (HaikuRecorder::ReadVideoModes()), and the
+ * properties, built on the UI thread, read this cache. A device that has not been opened in this session yet
+ * offers "Device default" only until it is (the properties are reloaded then, HaikuCapture::Opened()). */
+static std::mutex modes_mutex;
+static std::map<std::string, HaikuVideoModes> modes_cache; /* device id -> what it listed when last opened */
 
-static std::mutex size_cache_mutex;
-static std::map<std::string, std::vector<HaikuVideoSize>> size_cache; /* device id -> sizes it accepted */
-
-/* keyed on the device actually acquired (its node name, see HaikuRecorder::Open()); an empty entry is a
- * device that was not (or could not be) probed and is not probed again: the common sizes are listed */
-static bool sizes_probed(const std::string &device_id)
+bool HaikuVideoModes::operator==(const HaikuVideoModes &o) const
 {
-	std::lock_guard<std::mutex> lock(size_cache_mutex);
-	return size_cache.count(device_id) != 0;
+	if (listed != o.listed || !(suggested == o.suggested) || suggested_rate != o.suggested_rate ||
+	    modes.size() != o.modes.size())
+		return false;
+	for (size_t i = 0; i < modes.size(); i++)
+		if (!(modes[i].size == o.modes[i].size) || modes[i].encoding != o.modes[i].encoding ||
+		    modes[i].rates != o.modes[i].rates)
+			return false;
+	return true;
+}
+
+static bool cached_modes(const std::string &device_id, HaikuVideoModes &modes)
+{
+	std::lock_guard<std::mutex> lock(modes_mutex);
+	auto it = modes_cache.find(device_id);
+	if (it == modes_cache.end())
+		return false;
+	modes = it->second;
+	return true;
+}
+
+/* true if this changed what was known */
+static bool cache_modes(const std::string &device_id, const HaikuVideoModes &modes)
+{
+	std::lock_guard<std::mutex> lock(modes_mutex);
+	auto it = modes_cache.find(device_id);
+	if (it != modes_cache.end() && it->second == modes)
+		return false;
+	modes_cache[device_id] = modes;
+	return true;
+}
+
+/* A rate as the device wrote it: digits with at most one decimal point, above 0. */
+static bool valid_rate(const std::string &rate)
+{
+	if (rate.empty() || rate.size() > 15)
+		return false;
+	int points = 0;
+	for (char c : rate) {
+		if (c == '.')
+			points++;
+		else if (c < '0' || c > '9')
+			return false;
+	}
+	return points <= 1 && strtod(rate.c_str(), nullptr) > 0.0;
+}
+
+/* The parameter's text; lines that don't parse are skipped (and so is the whole list if none does) */
+static std::vector<HaikuVideoMode> parse_video_modes(const char *text)
+{
+	std::vector<HaikuVideoMode> modes;
+	for (const char *line = text; line && *line;) {
+		const char *end = strchr(line, '\n');
+		const std::string entry(line, end ? (size_t)(end - line) : strlen(line));
+		line = end ? end + 1 : nullptr;
+
+		unsigned w = 0, h = 0;
+		char encoding[16] = {0}, rates[512] = {0};
+		if (sscanf(entry.c_str(), "%ux%u %15s %511s", &w, &h, encoding, rates) != 4 || !w || !h ||
+		    w > 16384 || h > 16384)
+			continue;
+		HaikuVideoMode mode;
+		mode.size.width = w;
+		mode.size.height = h;
+		mode.encoding = encoding;
+		for (const char *rate = rates; *rate;) {
+			const char *comma = strchr(rate, ',');
+			const std::string value(rate, comma ? (size_t)(comma - rate) : strlen(rate));
+			if (valid_rate(value) &&
+			    std::find(mode.rates.begin(), mode.rates.end(), value) == mode.rates.end())
+				mode.rates.push_back(value);
+			if (!comma)
+				break;
+			rate = comma + 1;
+		}
+		if (!mode.rates.empty())
+			modes.push_back(std::move(mode));
+	}
+	return modes;
 }
 
 HaikuVideoSize HaikuParseVideoSize(const char *text)
@@ -184,37 +272,123 @@ HaikuVideoSize HaikuParseVideoSize(const char *text)
 	return size;
 }
 
+float HaikuParseFrameRate(const char *text)
+{
+	if (!text || !valid_rate(text))
+		return 0.0f;
+	const double rate = strtod(text, nullptr);
+	return rate <= 1000.0 ? (float)rate : 0.0f;
+}
+
+static std::string size_value(const HaikuVideoSize &size)
+{
+	char value[32];
+	snprintf(value, sizeof(value), "%ux%u", size.width, size.height);
+	return value;
+}
+
 static void add_size(obs_property_t *list, const HaikuVideoSize &size)
 {
-	char value[32], label[32];
-	snprintf(value, sizeof(value), "%ux%u", size.width, size.height);
+	char label[32];
 	snprintf(label, sizeof(label), "%u x %u", size.width, size.height);
-	obs_property_list_add_string(list, label, value);
+	obs_property_list_add_string(list, label, size_value(size).c_str());
 }
 
 void HaikuFillVideoSizeList(obs_property_t *list, const std::string &device_id, const char *current)
 {
-	std::vector<HaikuVideoSize> sizes;
-	bool probed = false;
-	{
-		std::lock_guard<std::mutex> lock(size_cache_mutex);
-		auto it = size_cache.find(device_id);
-		if (it != size_cache.end() && !it->second.empty()) {
-			sizes = it->second;
-			probed = true;
-		}
-	}
-	if (!probed)
-		sizes.assign(std::begin(common_sizes), std::end(common_sizes));
+	HaikuVideoModes modes;
+	cached_modes(device_id, modes);
 
 	obs_property_list_clear(list);
-	obs_property_list_add_string(list, T_("DeviceDefaultSize"), HAIKU_MEDIA_DEFAULT_SIZE);
+	if (!modes.listed && !modes.suggested.IsDefault()) {
+		/* no list, but the producer says what its default is */
+		struct dstr label = {0};
+		dstr_printf(&label, T_("DeviceDefaultSize.Suggested"), modes.suggested.width, modes.suggested.height);
+		obs_property_list_add_string(list, label.array, HAIKU_MEDIA_DEFAULT_SIZE);
+		dstr_free(&label);
+	} else {
+		obs_property_list_add_string(list, T_("DeviceDefault"), HAIKU_MEDIA_DEFAULT_SIZE);
+	}
+
+	/* Each size once (a camera can send one as YUY2 and as MJPEG), largest first */
+	std::vector<HaikuVideoSize> sizes;
+	for (const HaikuVideoMode &mode : modes.modes)
+		if (std::find(sizes.begin(), sizes.end(), mode.size) == sizes.end())
+			sizes.push_back(mode.size);
+	std::stable_sort(sizes.begin(), sizes.end(), [](const HaikuVideoSize &a, const HaikuVideoSize &b) {
+		return (uint64_t)a.width * a.height > (uint64_t)b.width * b.height;
+	});
 	for (const HaikuVideoSize &size : sizes)
 		add_size(list, size);
 
 	const HaikuVideoSize cur = HaikuParseVideoSize(current);
 	if (!cur.IsDefault() && std::find(sizes.begin(), sizes.end(), cur) == sizes.end())
-		add_size(list, cur); /* keep the setting visible; the device falls back to its default */
+		add_size(list, cur); /* keep the setting visible; a device that refuses it uses its default */
+}
+
+void HaikuFillFrameRateList(obs_property_t *list, const std::string &device_id, const char *resolution,
+			    const char *current)
+{
+	obs_property_list_clear(list);
+	obs_property_list_add_string(list, T_("DeviceDefault"), HAIKU_MEDIA_DEFAULT_RATE);
+
+	std::vector<std::string> rates;
+	const HaikuVideoSize size = HaikuParseVideoSize(resolution);
+	HaikuVideoModes modes;
+	if (!size.IsDefault() && cached_modes(device_id, modes)) {
+		/* The rates of the first line with this size: usb_webcam sends a size as YUY2 if the camera has it
+		 * so, MJPEG only otherwise (UVCCamDevice::AcceptVideoFrame()), and chooses among the rates of the
+		 * encoding it uses (_ChooseInterval() on _CurrentFrame()); VideoModes() lists YUY2 first. */
+		for (const HaikuVideoMode &mode : modes.modes) {
+			if (mode.size == size) {
+				rates = mode.rates;
+				break;
+			}
+		}
+	}
+
+	struct dstr label = {0};
+	for (const std::string &rate : rates) {
+		dstr_printf(&label, T_("FrameRate.Fps"), rate.c_str());
+		obs_property_list_add_string(list, label.array, rate.c_str());
+	}
+	if (!size.IsDefault() && current && HaikuParseFrameRate(current) > 0.0f &&
+	    std::find(rates.begin(), rates.end(), std::string(current)) == rates.end()) {
+		/* keep the setting visible; the device uses its nearest rate */
+		dstr_printf(&label, T_("FrameRate.Fps"), current);
+		obs_property_list_add_string(list, label.array, current);
+	}
+	dstr_free(&label);
+}
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* This program's signature                                                                               */
+
+/* The signature of this program, as the system mixer sees it: the mixer names a stream's application with
+ * be_roster->GetRunningAppInfo() of the team that owns the stream's port (AudioMixer::_IdentifyApplication()). */
+static std::string lookup_own_signature()
+{
+	thread_info thread;
+	app_info app;
+	if (!be_roster || get_thread_info(find_thread(NULL), &thread) != B_OK ||
+	    be_roster->GetRunningAppInfo(thread.team, &app) != B_OK)
+		return std::string();
+	return app.signature;
+}
+
+/* A registrar round trip, so only once; the signature doesn't change while the program runs. Not cached
+ * while there is no be_roster yet (nothing to compare with then). */
+std::string HaikuOwnSignature()
+{
+	static std::mutex mutex;
+	static std::string signature;
+	static bool known = false;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (!known) {
+		signature = lookup_own_signature();
+		known = be_roster != nullptr;
+	}
+	return signature;
 }
 
 /* ------------------------------------------------------------------------------------------------------ */
@@ -240,6 +414,10 @@ static status_t acquire_node(const std::string &device_id, media_type type, medi
 	if (!roster)
 		return err;
 
+	/* OBS's own virtual camera: not opened, and no stand-in either (the source stays black) */
+	if (is_virtual_camera_id(device_id, type))
+		return B_NOT_ALLOWED;
+
 	if (device_id.empty() || device_id == HAIKU_MEDIA_DEFAULT_DEVICE) {
 		/* The devices selected in Haiku's Media preferences */
 		return type == B_MEDIA_RAW_AUDIO ? roster->GetAudioInput(node) : roster->GetVideoInput(node);
@@ -257,7 +435,7 @@ static status_t acquire_node(const std::string &device_id, media_type type, medi
 }
 
 /* The consumer ports of this module's recorders. BMediaRoster::Disconnect() sends B_MEDIA_CONNECTION_BROKEN
- * for every disconnect, ours included (each Close() and every probed size), so the watcher must not take
+ * for every disconnect, ours included (each Close()), so the watcher must not take
  * those for another application letting go of a device. A port stays listed for a while after its recorder
  * is gone: the notification travels through the media server. Port ids are not reused soon. */
 namespace {
@@ -340,54 +518,77 @@ static void set_size(media_format &format, const HaikuVideoSize &size)
 	format.u.raw_video.display.bytes_per_row = 0; /* wildcard: follows from the size */
 }
 
-/* Every size is tried (exact matches): there is no list to tell whether the device's sizes are monotonic,
- * and UVC cameras offer an arbitrary subset (one may take 1280x720 but refuse 800x600). */
-void HaikuRecorder::ProbeSizes(const std::string &key, media_output &output, const media_format &format)
+/* Supervisor thread, with the node acquired. */
+bool HaikuRecorder::IsVirtualCamera() const
 {
-	BMediaRoster *roster = BMediaRoster::Roster();
-	std::vector<HaikuVideoSize> accepted;
-	bool stuck = false;
-	media_format any_size = format;
-	set_size(any_size, HaikuVideoSize());
-	SetAcceptedFormat(any_size);
+	if (have_dormant && strcmp(dormant.name, VIRTUAL_CAMERA_FLAVOR_NAME) == 0)
+		return true;
+	BMediaRoster *roster = BMediaRoster::CurrentRoster();
+	BParameterWeb *web = nullptr;
+	bool found = false;
+	if (roster && roster->GetParameterWebFor(node, &web) == B_OK && web) {
+		for (int32 i = 0; !found && i < web->CountParameters(); i++)
+			found = strcmp(web->ParameterAt(i)->Kind(), VIRTUAL_CAMERA_STATUS_KIND) == 0;
+	}
+	delete web;
+	return found;
+}
 
-	for (const HaikuVideoSize &size : common_sizes) {
-		media_format request = any_size;
-		set_size(request, size);
-		/* Fails without connecting if the producer refuses the size in FormatProposal() or
-		 * PrepareToConnect(); nothing is started, so no buffers flow. */
-		if (BMediaRecorder::Connect(node, &output, &request) != B_OK) {
-			/* usb_webcam can return from a failed connection with its output still marked as
-			 * connected; then nothing can connect to it until the add-on is restarted */
-			media_output free_output;
-			int32 count = 0;
-			if (!roster ||
-			    roster->GetFreeOutputsFor(node, &free_output, 1, &count, B_MEDIA_RAW_VIDEO) != B_OK ||
-			    count < 1) {
-				stuck = true;
-				break;
+/* Supervisor thread, with the device's node acquired and a free output found, before connecting. Reads the
+ * camera's "renga:video_modes" (by kind, as PORTING.md says; it is a B_TEXT_PARAMETER) and caches it under `key`.
+ * A producer without it gets its suggested format instead: Renga's usb_webcam answers
+ * FormatSuggestionRequested() for raw video now (B_MEDIA_UNKNOWN_TYPE, which BMediaRoster::GetFormatFor() of an
+ * output sends, included); the demo producer still answers for B_MEDIA_ENCODED_VIDEO only, but it has the
+ * parameter. Returns true if this changed what was known about the device. */
+bool HaikuRecorder::ReadVideoModes(const std::string &key, const media_output &output)
+{
+	BMediaRoster *roster = BMediaRoster::CurrentRoster();
+	if (!roster)
+		return false;
+
+	HaikuVideoModes modes;
+	BParameterWeb *web = nullptr;
+	if (roster->GetParameterWebFor(node, &web) == B_OK && web) {
+		for (int32 i = 0; i < web->CountParameters(); i++) {
+			BParameter *parameter = web->ParameterAt(i);
+			if (parameter->Type() != BParameter::B_TEXT_PARAMETER ||
+			    strcmp(parameter->Kind(), "renga:video_modes") != 0)
+				continue;
+			/* usb_webcam's parameter holds up to 4096 bytes, the others 256 */
+			const size_t max_bytes = ((BTextParameter *)parameter)->MaxBytes();
+			std::vector<char> text(std::max<size_t>(max_bytes, 4096) + 1, 0);
+			size_t size = text.size() - 1;
+			bigtime_t when;
+			if (parameter->GetValue(text.data(), &size, &when) == B_OK) {
+				text[std::min(size, text.size() - 1)] = '\0';
+				modes.listed = true;
+				modes.modes = parse_video_modes(text.data());
 			}
-			output = free_output;
-			continue;
+			break;
 		}
-		const media_video_display_info got = MediaInput().format.u.raw_video.display;
-		BMediaRecorder::Disconnect();
-		if (got.line_width == size.width && got.line_count == size.height)
-			accepted.push_back(size);
+	}
+	delete web;
+
+	if (!modes.listed) {
+		media_format suggested;
+		if (roster->GetFormatFor(output, &suggested) == B_OK && suggested.type == B_MEDIA_RAW_VIDEO) {
+			modes.suggested.width = suggested.u.raw_video.display.line_width;
+			modes.suggested.height = suggested.u.raw_video.display.line_count;
+			modes.suggested_rate = suggested.u.raw_video.field_rate;
+		}
 	}
 
-	if (stuck) {
-		blog(LOG_WARNING,
-		     "[haiku-media] '%s' has no free output after refusing a frame size; not probing it again "
-		     "(restarting media services frees it)",
-		     key.c_str());
-		accepted.clear(); /* the common sizes are listed */
-	} else {
-		blog(LOG_INFO, "[haiku-media] '%s' accepts %zu of %zu common frame sizes", key.c_str(),
-		     accepted.size(), std::size(common_sizes));
+	const bool changed = cache_modes(key, modes);
+	if (changed) {
+		if (modes.listed)
+			blog(LOG_INFO, "[haiku-media] '%s' lists %zu video modes", key.c_str(), modes.modes.size());
+		else if (!modes.suggested.IsDefault())
+			blog(LOG_INFO, "[haiku-media] '%s' lists no video modes; it suggests %ux%u at %.2f fps",
+			     key.c_str(), modes.suggested.width, modes.suggested.height, modes.suggested_rate);
+		else
+			blog(LOG_INFO, "[haiku-media] '%s' lists no video modes", key.c_str());
 	}
-	std::lock_guard<std::mutex> lock(size_cache_mutex);
-	size_cache[key] = std::move(accepted);
+	return changed;
 }
 
 /* The rate to ask the loopback for. MixerTap converts the mix to whatever rate the connection has, but with
@@ -415,7 +616,7 @@ static status_t mixer_rate(BMediaRoster *roster, float *rate)
 	return B_OK;
 }
 
-HaikuOpenResult HaikuRecorder::OpenLoopback(const std::string &signature)
+HaikuOpenResult HaikuRecorder::OpenLoopback(const std::string &signature, const HaikuOpenParams &params)
 {
 	HaikuOpenResult result;
 	BMediaRoster *roster = BMediaRoster::CurrentRoster(); /* Open() made sure there is one */
@@ -445,6 +646,37 @@ HaikuOpenResult HaikuRecorder::OpenLoopback(const std::string &signature)
 	}
 	have_node = true;
 	have_dormant = roster->GetDormantNodeFor(node, &dormant) == B_OK;
+
+	/* Before any buffer: the loopback's "renga:loopback_exclude" parameter (F-58, O-1), set through
+	 * AudioStreamControl::SetLoopbackExclusions(), which finds it by kind. BParameter::SetValue() waits for the
+	 * node's reply, which comes after MixerTap::SetParameterValue() has taken the list, so B_OK means it
+	 * applies. Without it the source must not run: Desktop Audio leaves OBS out so that monitoring (which
+	 * libobs/audio-monitoring/haiku now allows on it) does not feed back into it. */
+	std::string exclude = params.loopback_exclude;
+	if (params.loopback_exclude_self) {
+		/* this thread may ask the registrar; the UI thread that configured the source should not */
+		const std::string self = HaikuOwnSignature();
+		bool listed = self.empty();
+		for (size_t start = 0; !listed && start < exclude.size();) {
+			size_t end = exclude.find('\n', start);
+			if (end == std::string::npos)
+				end = exclude.size();
+			listed = end - start == self.size() &&
+				 strncasecmp(exclude.c_str() + start, self.c_str(), self.size()) == 0;
+			start = end + 1;
+		}
+		if (!listed)
+			exclude += self + "\n";
+	}
+	if (!exclude.empty()) {
+		err = BPrivate::AudioStreamControl::SetLoopbackExclusions(node, exclude.c_str());
+		if (err != B_OK) {
+			result.error = err;
+			result.reason = "the loopback cannot leave applications out (renga:loopback_exclude)";
+			Close();
+			return result;
+		}
+	}
 
 	media_output output;
 	int32 count = 0;
@@ -491,8 +723,7 @@ HaikuOpenResult HaikuRecorder::OpenLoopback(const std::string &signature)
 	return result;
 }
 
-HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, HaikuVideoSize size, bool probe,
-				    bool allow_fallback)
+HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, const HaikuOpenParams &params, bool allow_fallback)
 {
 	HaikuOpenResult result;
 	Close();
@@ -512,12 +743,13 @@ HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, HaikuVideoSize
 	}
 
 	if (kind == HaikuCaptureKind::Loopback)
-		return OpenLoopback(device_id);
+		return OpenLoopback(device_id, params);
 
 	err = acquire_node(device_id, type, &node, &result.used_fallback, allow_fallback);
 	if (err != B_OK) {
 		result.error = err;
-		result.reason = "no capture device available";
+		result.reason = err == B_NOT_ALLOWED ? "it is Renga's Virtual Camera, which shows OBS's own output"
+						     : "no capture device available";
 		return result;
 	}
 	have_node = true;
@@ -546,6 +778,16 @@ HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, HaikuVideoSize
 		have_dormant = roster->GetDormantNodeFor(node, &dormant) == B_OK;
 	}
 
+	/* The media server may make the Virtual Camera the default video input (VirtualCameraAddOn.cpp), and a
+	 * fallback lands on the default: refuse it by its flavor name, and by the status parameter only its node
+	 * has (VIRTUAL_CAMERA_STATUS_KIND), in case the node is not an add-on flavor we can name. */
+	if (type == B_MEDIA_RAW_VIDEO && IsVirtualCamera()) {
+		result.error = B_NOT_ALLOWED;
+		result.reason = "it is Renga's Virtual Camera, which shows OBS's own output";
+		Close();
+		return result;
+	}
+
 	media_output output;
 	int32 count = 0;
 	err = roster->GetFreeOutputsFor(node, &output, 1, &count, type);
@@ -562,35 +804,48 @@ HaikuOpenResult HaikuRecorder::Open(const std::string &device_id, HaikuVideoSize
 	else
 		format.u.raw_video = output.format.u.raw_video;
 
-	if (type == B_MEDIA_RAW_VIDEO && probe) {
-		/* the device actually acquired, by the id the device list uses (its node name): with the
-		 * fallback that is the default device, not the one asked for */
+	if (type == B_MEDIA_RAW_VIDEO) {
+		/* Keyed on the device actually acquired, by the id the device list uses (its node name): with the
+		 * fallback that is the default device, not the one asked for. "default" is also kept under its own
+		 * id: the properties ask by the setting's value. */
 		const std::string key = have_dormant ? std::string(dormant.name) : device_id;
-		if (!sizes_probed(key)) {
-			ProbeSizes(key, output, format);
-			if (!result.used_fallback && key != device_id) {
-				/* "default": the settings list asks by the setting's value */
-				std::lock_guard<std::mutex> lock(size_cache_mutex);
-				size_cache[device_id] = size_cache[key];
-			}
+		result.modes_changed = ReadVideoModes(key, output);
+		if (!result.used_fallback && key != device_id) {
+			HaikuVideoModes modes;
+			if (cached_modes(key, modes))
+				result.modes_changed = cache_modes(device_id, modes) || result.modes_changed;
 		}
 	}
 
 	err = B_ERROR;
-	if (type == B_MEDIA_RAW_VIDEO && !size.IsDefault()) {
-		/* accept whatever size the producer makes of the request, so a camera that adjusts it still
-		 * connects; the negotiated format below says what it picked */
-		media_format any_size = format;
-		set_size(any_size, HaikuVideoSize());
-		media_format request = any_size;
-		set_size(request, size);
-		SetAcceptedFormat(any_size);
-		err = BMediaRecorder::Connect(node, &output, &request);
-		if (err != B_OK)
-			result.size_refused = true;
-	}
-	if (err != B_OK) {
-		/* the device's own format, as before there was a size setting */
+	if (type == B_MEDIA_RAW_VIDEO) {
+		/* Accept any size and any rate: field_rate must be a wildcard here. The output's format carries the
+		 * producer's last field_rate (usb_webcam's FIELD_RATE, 5), and Renga's FormatProposal() now puts the
+		 * camera's actual rate into the proposal, which media_format::Matches() would refuse against a fixed
+		 * one. The negotiated format below says what the producer picked. */
+		media_format accept = format;
+		set_size(accept, HaikuVideoSize());
+		accept.u.raw_video.field_rate = 0.0f;
+		SetAcceptedFormat(accept);
+		result.requested_rate = params.size.IsDefault() ? 0.0f : params.field_rate;
+		if (!params.size.IsDefault()) {
+			media_format request = accept;
+			set_size(request, params.size);
+			request.u.raw_video.field_rate = params.field_rate;
+			err = BMediaRecorder::Connect(node, &output, &request);
+			if (err != B_OK) {
+				result.size_refused = true;
+				result.requested_rate = 0.0f;
+			}
+		}
+		if (err != B_OK) {
+			/* The device's own size, which the output's format has (usb_webcam treats 0 x 0 as 320 x 240,
+			 * UVCCamDevice::AcceptVideoFrame()), at its default rate for it (field_rate 0). */
+			media_format request = format;
+			request.u.raw_video.field_rate = 0.0f;
+			err = BMediaRecorder::Connect(node, &output, &request);
+		}
+	} else {
 		SetAcceptedFormat(format);
 		err = BMediaRecorder::Connect(node, &output, &format);
 	}
@@ -783,8 +1038,8 @@ public:
 			wake_captures(false, true);
 			return;
 		case B_MEDIA_CONNECTION_BROKEN:
-			/* another application may have let go of a busy device; our own disconnects (Close(), size
-			 * probing) say nothing */
+			/* another application may have let go of a busy device; our own disconnects (Close()) say
+			 * nothing */
 			if (!own_connection(msg))
 				wake_captures(false, false, true);
 			return;
@@ -880,16 +1135,16 @@ HaikuCapture::~HaikuCapture()
 		thread.join();
 }
 
-void HaikuCapture::Configure(const std::string &device_id, HaikuVideoSize size, bool active)
+void HaikuCapture::Configure(const std::string &device_id, const HaikuOpenParams &params, bool active)
 {
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		if (desired.device_id == device_id && desired.size == size && desired.active == active)
+		if (desired.device_id == device_id && desired.params == params && desired.active == active)
 			return;
-		if (desired.device_id != device_id || !(desired.size == size))
+		if (desired.device_id != device_id || !(desired.params == params))
 			generation++;
 		desired.device_id = device_id;
-		desired.size = size;
+		desired.params = params;
 		desired.active = active;
 		changed = true;
 	}
@@ -1005,6 +1260,10 @@ void HaikuCapture::Opened(const Config &want, const HaikuOpenResult &result)
 
 	if (on_opened)
 		on_opened(recorder->ConnectedFormat(), result);
+	/* the resolution and frame rate lists come from what the device listed just now; the frontend queues
+	 * the reload to the UI thread (see DevicesChanged()) */
+	if (result.modes_changed && kind == HaikuCaptureKind::Device)
+		obs_source_update_properties(source);
 }
 
 /* The named device is listed again while the default device stands in for it. It is opened next to the
@@ -1014,7 +1273,7 @@ bool HaikuCapture::SwitchFromFallback(const Config &want)
 {
 	HaikuRecorderPtr candidate(new HaikuRecorder(recorder_name.c_str(), type, kind, on_buffer));
 	candidate->SetDelivering(false);
-	const HaikuOpenResult result = candidate->Open(want.device_id, want.size, type == B_MEDIA_RAW_VIDEO, false);
+	const HaikuOpenResult result = candidate->Open(want.device_id, want.params, false);
 	if (result.error != B_OK) {
 		if (!switch_failed_logged) {
 			blog(LOG_WARNING, "[haiku-media] '%s': '%s' is available but cannot be opened: %s (%s); "
@@ -1120,11 +1379,13 @@ bigtime_t HaikuCapture::Step(const Config &want, uint64_t gen, bool retry, bool 
 
 	last_attempt = now;
 	recorder.reset(new HaikuRecorder(recorder_name.c_str(), type, kind, on_buffer));
-	/* Open() probes only a device that hasn't been probed yet */
-	const HaikuOpenResult result = recorder->Open(want.device_id, want.size, type == B_MEDIA_RAW_VIDEO);
+	const HaikuOpenResult result = recorder->Open(want.device_id, want.params);
 	if (result.error != B_OK) {
 		StartStreak("cannot open", want, &result);
 		recorder.reset();
+		/* the modes may have been read before connecting failed */
+		if (result.modes_changed && kind == HaikuCaptureKind::Device)
+			obs_source_update_properties(source);
 		backoff = backoff ? std::min<bigtime_t>(backoff * 2, RETRY_MAX_US) : RETRY_FIRST_US;
 		next_attempt = system_time() + backoff;
 		return backoff;

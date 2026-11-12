@@ -5,7 +5,9 @@ add_library(OBS::haiku-media ALIAS haiku-media)
 
 # Renga's private Media Kit headers (haiku_devel): AudioStreamControl.h, the header-only wrapper around the
 # system mixer's per-application streams and its loopback flavor (3rdparty/ce/PORTING.md, "Per-application
-# audio, routing and loopback"). It only uses public Media Kit API, so nothing but libmedia is linked.
+# audio, routing and loopback"), and VirtualCamera.h, of which only the constants naming the Virtual Camera are
+# used (no feeder code, so neither libgnu nor libnetwork is needed). Only public Media Kit API is called, so
+# nothing but libmedia is linked.
 find_path(
   RengaMediaPrivate_INCLUDE_DIR
   NAMES AudioStreamControl.h

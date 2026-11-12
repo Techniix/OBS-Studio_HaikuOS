@@ -25,9 +25,13 @@
  *
  * Every player is a stream of Renga's system mixer, in OBS's own rate and channel layout (the mixer
  * converts). Devices: "default" (added by the frontend) is the default output; the other entries are the
- * mixer's output devices by name, and OBS's streams are routed to the chosen one with the mixer's per-stream
- * routing (haiku-sound-player.cpp). The mixer's clock is the default output's; a stream routed to another
- * device goes through the mixer's sink for it, which absorbs the drift between the two cards.
+ * mixer's output devices by name, and OBS's streams are routed to the chosen one by name with the mixer's
+ * "renga:routes" (haiku-sound-player.cpp), which also holds a device that is unplugged. The mixer's clock is
+ * the default output's; a stream routed to another device goes through the mixer's sink for it, which absorbs
+ * the drift between the two cards.
+ *
+ * Desktop Audio (plugins/haiku-media) leaves OBS's streams out of its loopback (renga:loopback_exclude), so
+ * whatever device monitoring plays on, it never comes back through Desktop Audio: see devices_match().
  */
 
 #include "../../media-io/audio-resampler.h"
@@ -76,11 +80,24 @@ void obs_enum_audio_monitoring_devices(obs_enum_audio_device_cb cb, void *data)
 	obs_haiku_enum_output_devices(cb, data);
 }
 
+/* libobs asks this about an "audio output capture" source (one with OBS_SOURCE_DO_NOT_SELF_MONITOR: Desktop
+ * Audio) whether it records the monitoring device: id1 is the source's "device_id", id2 the monitoring device.
+ * If it does, monitoring the source would feed back into it (audio_monitor_init() below, as on the other
+ * platforms), and libobs silences monitored sources in the output mix while the source records
+ * (obs_source_audio_output_capture_device_changed(), should_silence_monitored_source() in obs-audio.c),
+ * because the capture has them already.
+ *
+ * On Renga the answer is no for every pair. Desktop Audio's device is always "default", the system mixer's
+ * loopback, which records the mix of every output; but it leaves OBS's own streams out (the loopback's
+ * "renga:loopback_exclude", Renga F-58 / O-1, set in plugins/haiku-media before the loopback starts, which
+ * fails to open without it). The monitoring streams are OBS's, so they never reach Desktop Audio, whatever
+ * device they play on: comparing the ids ("default" == "default") would silence monitored sources in
+ * recordings and keep Desktop Audio from being monitored for nothing. */
 bool devices_match(const char *id1, const char *id2)
 {
-	if (!id1 || !id2)
-		return false;
-	return strcmp(id1, id2) == 0;
+	UNUSED_PARAMETER(id1);
+	UNUSED_PARAMETER(id2);
+	return false;
 }
 
 static void fill_buffer(void *param, float *buffer, size_t frames)
@@ -181,13 +198,22 @@ static bool audio_monitor_init(struct audio_monitor *monitor, obs_source_t *sour
 	if (!id || !*id)
 		return false;
 
-	/* Sources that capture what plays are not monitored (Desktop Audio, plugins/haiku-media). Other
-	 * platforms skip them only when monitoring plays on the device they capture; on Renga the system
-	 * mixer's loopback records every stream whatever device it is routed to (MixerCore::_FeedTaps()), so
-	 * monitoring such a source anywhere would feed it back into itself. */
+	/* A source that captures what plays (Desktop Audio) is not monitored when monitoring would play into it,
+	 * as on the other platforms. On Renga that is never (devices_match()); the check stays so that the rule
+	 * is in one place. One more condition is Renga's: the loopback leaves OBS out by its application
+	 * signature, so without one (the registrar knows none for OBS) the mixer could not tell OBS's streams
+	 * apart, and monitoring Desktop Audio would feed back into it. */
 	if (source->info.output_flags & OBS_SOURCE_DO_NOT_SELF_MONITOR) {
-		monitor->ignore = true;
-		return true;
+		obs_data_t *s = obs_source_get_settings(source);
+		const char *s_dev_id = obs_data_get_string(s, "device_id");
+		bool match = devices_match(s_dev_id, id) || !obs_haiku_have_signature();
+		obs_data_release(s);
+
+		if (match) {
+			monitor->ignore = true;
+			blog(LOG_INFO, "Prevented feedback-loop in '%s'", obs_source_get_name(source));
+			return true;
+		}
 	}
 
 	char name[128];

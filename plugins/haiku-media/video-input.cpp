@@ -16,7 +16,11 @@
 ******************************************************************************/
 
 /* Video capture devices through the Media Kit's producer nodes: UVC webcams (Renga's usb_webcam add-on
- * delivers B_RGB32, converting YUY2 and decoding MJPEG itself), "Demo Video Producer", TV tuners, ... */
+ * delivers B_RGB32, converting YUY2 and decoding MJPEG itself), "Demo Video Producer", TV tuners, ...
+ *
+ * Resolution and frame rate: the lists are what the camera says it can send (its "renga:video_modes"
+ * parameter, Renga F-58 / O-5; read by the capture thread when it opens the device, media-device.cpp), and the
+ * rate is asked for with the connection's field_rate. */
 
 #include "media-device.hpp"
 
@@ -31,6 +35,7 @@
 
 #define S_DEVICE_ID "device_id"
 #define S_RESOLUTION "resolution"
+#define S_FRAME_RATE "frame_rate"
 #define S_ACTIVE_ONLY_WHEN_SHOWN "deactivate_when_not_showing"
 
 #define T_(text) obs_module_text(text)
@@ -47,6 +52,7 @@ struct VideoInput {
 	std::mutex settings_mutex;
 	std::string device_id;
 	std::string resolution;
+	std::string frame_rate;
 	bool active_only_when_shown = false;
 	bool shown = false;
 
@@ -87,14 +93,25 @@ void VideoInput::OnOpened(const media_format &format, const HaikuOpenResult &res
 	if (result.size_refused)
 		blog(LOG_WARNING, "[haiku-media] '%s': the device refused the requested frame size; using its default",
 		     obs_source_get_name(source));
-	blog(LOG_INFO, "[haiku-media] '%s': capturing (%ux%u, color space 0x%x, %.2f fps)",
-	     obs_source_get_name(source), raw.display.line_width, raw.display.line_count,
-	     (unsigned)raw.display.format, raw.field_rate);
+	/* field_rate of the connected format: the rate the device granted (its nearest to the one asked for) */
+	if (result.requested_rate > 0.0f)
+		blog(LOG_INFO, "[haiku-media] '%s': capturing (%ux%u, color space 0x%x, %.2f fps; %.2f fps asked for)",
+		     obs_source_get_name(source), raw.display.line_width, raw.display.line_count,
+		     (unsigned)raw.display.format, raw.field_rate, result.requested_rate);
+	else
+		blog(LOG_INFO,
+		     "[haiku-media] '%s': capturing (%ux%u, color space 0x%x, %.2f fps, the device's default)",
+		     obs_source_get_name(source), raw.display.line_width, raw.display.line_count,
+		     (unsigned)raw.display.format, raw.field_rate);
 }
 
 void VideoInput::Refresh()
 {
-	capture->Configure(device_id, HaikuParseVideoSize(resolution.c_str()), !active_only_when_shown || shown);
+	HaikuOpenParams params;
+	params.size = HaikuParseVideoSize(resolution.c_str());
+	/* a rate belongs to a size: with the device's default size, its default rate */
+	params.field_rate = params.size.IsDefault() ? 0.0f : HaikuParseFrameRate(frame_rate.c_str());
+	capture->Configure(device_id, params, !active_only_when_shown || shown);
 }
 
 void VideoInput::OnBuffer(const void *data, size_t size, const media_format &format)
@@ -148,6 +165,7 @@ void video_input_update(void *data, obs_data_t *settings)
 	std::lock_guard<std::mutex> lock(vi->settings_mutex);
 	vi->device_id = obs_data_get_string(settings, S_DEVICE_ID);
 	vi->resolution = obs_data_get_string(settings, S_RESOLUTION);
+	vi->frame_rate = obs_data_get_string(settings, S_FRAME_RATE);
 	vi->active_only_when_shown = obs_data_get_bool(settings, S_ACTIVE_ONLY_WHEN_SHOWN);
 	vi->Refresh();
 }
@@ -194,17 +212,30 @@ void video_input_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, S_DEVICE_ID, HAIKU_MEDIA_DEFAULT_DEVICE);
 	obs_data_set_default_string(settings, S_RESOLUTION, HAIKU_MEDIA_DEFAULT_SIZE);
+	obs_data_set_default_string(settings, S_FRAME_RATE, HAIKU_MEDIA_DEFAULT_RATE);
 	obs_data_set_default_bool(settings, S_ACTIVE_ONLY_WHEN_SHOWN, false);
 }
 
+/* The frame rates depend on the frame size (and the device). Lists only: the cache is read, nothing is asked
+ * of the Media Kit, so this is fine on the UI thread. */
+bool video_input_resolution_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	obs_property_t *rates = obs_properties_get(props, S_FRAME_RATE);
+	if (rates)
+		HaikuFillFrameRateList(rates, obs_data_get_string(settings, S_DEVICE_ID),
+				       obs_data_get_string(settings, S_RESOLUTION),
+				       obs_data_get_string(settings, S_FRAME_RATE));
+	return true;
+}
+
 /* the frame sizes depend on the device */
-bool video_input_device_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+bool video_input_device_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	obs_property_t *sizes = obs_properties_get(props, S_RESOLUTION);
 	if (sizes)
 		HaikuFillVideoSizeList(sizes, obs_data_get_string(settings, S_DEVICE_ID),
 				       obs_data_get_string(settings, S_RESOLUTION));
-	return true;
+	return video_input_resolution_modified(props, property, settings);
 }
 
 obs_properties_t *video_input_properties(void *data)
@@ -212,11 +243,13 @@ obs_properties_t *video_input_properties(void *data)
 	VideoInput *vi = static_cast<VideoInput *>(data);
 	obs_properties_t *props = obs_properties_create();
 
-	std::string device_id = HAIKU_MEDIA_DEFAULT_DEVICE, resolution = HAIKU_MEDIA_DEFAULT_SIZE;
+	std::string device_id = HAIKU_MEDIA_DEFAULT_DEVICE, resolution = HAIKU_MEDIA_DEFAULT_SIZE,
+		    frame_rate = HAIKU_MEDIA_DEFAULT_RATE;
 	if (vi) {
 		std::lock_guard<std::mutex> lock(vi->settings_mutex);
 		device_id = vi->device_id;
 		resolution = vi->resolution;
+		frame_rate = vi->frame_rate;
 	}
 
 	/* reloaded whenever a camera is plugged in or removed (HaikuCapture::DevicesChanged()) */
@@ -229,6 +262,12 @@ obs_properties_t *video_input_properties(void *data)
 							OBS_COMBO_FORMAT_STRING);
 	HaikuFillVideoSizeList(sizes, device_id, resolution.c_str());
 	obs_property_set_long_description(sizes, T_("Resolution.Description"));
+	obs_property_set_modified_callback(sizes, video_input_resolution_modified);
+
+	obs_property_t *rates = obs_properties_add_list(props, S_FRAME_RATE, T_("FrameRate"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
+	HaikuFillFrameRateList(rates, device_id, resolution.c_str(), frame_rate.c_str());
+	obs_property_set_long_description(rates, T_("FrameRate.Description"));
 
 	obs_properties_add_bool(props, S_ACTIVE_ONLY_WHEN_SHOWN, T_("DeactivateWhenNotShowing"));
 

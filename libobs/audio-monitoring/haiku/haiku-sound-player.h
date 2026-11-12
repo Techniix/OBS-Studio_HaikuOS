@@ -18,8 +18,8 @@
 #pragma once
 
 /* Minimal C interface to the Media Kit for haiku-output.c: BSoundPlayer streams into Renga's system mixer and
- * the mixer's per-stream output routing (3rdparty/ce/PORTING.md, "Per-application audio, routing and
- * loopback"). */
+ * the mixer's routes by device name (3rdparty/ce/PORTING.md, "Per-application audio, routing and loopback";
+ * F-58, O-4). */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 /* Monitoring device id meaning "the system's default output" (what the frontend stores for its Default
- * entry); the mixer's routing index 0. */
+ * entry); the empty route of the mixer's "renga:routes". */
 #define OBS_HAIKU_MONITOR_DEFAULT_ID "default"
 
 /* Called on a sound player thread: fill `frames` interleaved float frames (the channel count and rate the
@@ -59,13 +59,17 @@ bool obs_haiku_sound_player_start(struct obs_haiku_sound_player *player);
  * the player. Accepts NULL. */
 void obs_haiku_sound_player_destroy(struct obs_haiku_sound_player *player);
 
-/* Routes every stream of this program in the system mixer to `device_id` (OBS_HAIKU_MONITOR_DEFAULT_ID, NULL
- * or "" for the default output). Returns false if the mixer has no such device now or no stream of OBS; the
- * failure is logged once per device. */
+/* Routes every stream of this program in the system mixer to the device named `device_id`, present or not
+ * (OBS_HAIKU_MONITOR_DEFAULT_ID, NULL or "" for the default output). Returns false if the mixer has no stream
+ * of OBS or refused a route; the failure is logged once per device. */
 bool obs_haiku_route_streams(const char *device_id);
 
-/* The same on a worker thread of its own; returns at once. Requests made while one is being carried out are
- * coalesced: only the latest one runs next. */
+/* Whether the registrar knows an application signature for this program, which the system mixer tells its
+ * streams apart by (routing, and Desktop Audio leaving OBS out). A registrar round trip the first time. */
+bool obs_haiku_have_signature(void);
+
+/* The same as obs_haiku_route_streams() on a worker thread of its own; returns at once. Requests made while one
+ * is being carried out are coalesced: only the latest one runs next. */
 void obs_haiku_route_streams_async(const char *device_id);
 
 #ifdef __cplusplus

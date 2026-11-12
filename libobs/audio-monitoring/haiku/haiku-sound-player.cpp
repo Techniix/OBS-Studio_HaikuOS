@@ -19,24 +19,27 @@
  * Audio monitoring through Renga's system mixer.
  *
  * Every monitored source plays as a plain BSoundPlayer stream into the system mixer, which mixes, resamples
- * and follows the default output. The monitoring device is chosen with the mixer's per-stream routing: each
- * stream has a B_OUTPUT_MUX parameter "Output" (0 the default output, n the n-th output device), and the
- * mixer plays a routed stream through a sink of its own on that device (AudioMixer::_RouteOnce()). Nothing
- * here opens a sound card, so there is no direct-to-card player any more, no format conversion, and a device
- * that is unplugged or busy just means the stream plays on the default output until it is back (the mixer
- * handles that; PORTING.md "Sound cards and cameras that come and go").
+ * and follows the default output. The monitoring device is chosen with the mixer's routes by device name
+ * (Renga F-58, OBS Studio's O-4): the mixer's hidden text parameter "renga:routes" takes a line
+ * "<input id> <device name>" ("<input id> " for the default output), through AudioStreamControl::SetRoute().
+ * Any name is taken, also of a device that is not there: the stream plays on the default output meanwhile and
+ * moves to the device when it appears (MixerInput::SetRoute(), AudioMixer::SetParameterValue()
+ * PARAM_ETC_ROUTES, the router woken). So OBS does not need to watch devices come and go, and the mixer plays
+ * a routed stream through a sink of its own on that device (AudioMixer::_RouteOnce()). Nothing here opens a
+ * sound card, so there is no direct-to-card player, no format conversion, and an unplugged or busy device is
+ * the mixer's business (PORTING.md "Sound cards and cameras that come and go").
  *
  * How the mixer keys a route, read in the mixer add-on: the route is a property of each mixer input
- * (MixerInput::SetRoute()), set through that input's "Output" parameter (AudioMixer::SetParameterValue()),
- * and saved in the mixer's settings entry for the input's application signature
- * (MixerSettings::SaveConnectionSettings() and _FindInputSetting()). A new input of the same application gets
- * the saved route when it connects (AudioMixer::Connected() -> LoadConnectionSettings()). So:
+ * (MixerInput::fRoute), and setting it saves it in the mixer's settings entry for the input's application
+ * signature (MixerSettings::SaveConnectionSettings(), _FindInputSetting()). A new input of the same
+ * application gets the saved route when it connects (AudioMixer::Connected() -> LoadConnectionSettings()).
+ * So:
  *  - all of OBS's monitor streams share one route (they have one signature), which is what OBS wants;
  *  - setting it on one stream does not move OBS's other streams that are already connected, so
  *    obs_haiku_route_streams() sets it on every stream of OBS;
  *  - a stream that appears later inherits the route the mixer last saved for OBS; it is set again anyway
- *    after each player starts (haiku-output.c), so that a route changed elsewhere (Media preferences) is
- *    brought back to OBS's setting.
+ *    after each player starts (haiku-output.c), so that a route changed elsewhere (Media preferences, the
+ *    Deskbar volume popup, including "None (loopback only)") is brought back to OBS's setting.
  *
  * Setting a route reads the mixer's whole parameter web and sets a parameter on the mixer: round trips that
  * audio_monitor_init() would otherwise make on whatever thread creates or resets a monitor (the UI thread,
@@ -127,16 +130,30 @@ extern "C" void obs_haiku_enum_output_devices(obs_haiku_device_cb cb, void *para
 }
 
 /* The signature the mixer knows OBS's streams by: AudioMixer::_IdentifyApplication() asks the registrar for
- * the application of the team that owns the stream's port. */
+ * the application of the team that owns the stream's port. A registrar round trip, so once (it does not change
+ * while OBS runs); not cached while there is no be_roster yet. */
 static bool own_signature(std::string &signature)
 {
-	thread_info thread;
-	app_info app;
-	if (!be_roster || get_thread_info(find_thread(NULL), &thread) != B_OK ||
-	    be_roster->GetRunningAppInfo(thread.team, &app) != B_OK || !app.signature[0])
-		return false;
-	signature = app.signature;
-	return true;
+	static std::mutex mutex;
+	static std::string cached;
+	static bool known = false;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (!known && be_roster) {
+		thread_info thread;
+		app_info app;
+		if (get_thread_info(find_thread(NULL), &thread) == B_OK &&
+		    be_roster->GetRunningAppInfo(thread.team, &app) == B_OK)
+			cached = app.signature;
+		known = true;
+	}
+	signature = cached;
+	return !signature.empty();
+}
+
+extern "C" bool obs_haiku_have_signature(void)
+{
+	std::string signature;
+	return own_signature(signature);
 }
 
 static std::mutex warn_mutex;
@@ -162,7 +179,7 @@ static void route_ok()
 
 extern "C" bool obs_haiku_route_streams(const char *device_id)
 {
-	if (!device_id || !*device_id || strcmp(device_id, OBS_HAIKU_MONITOR_DEFAULT_ID) == 0)
+	if (!device_id || strcmp(device_id, OBS_HAIKU_MONITOR_DEFAULT_ID) == 0)
 		device_id = "";
 	const char *label = *device_id ? device_id : OBS_HAIKU_MONITOR_DEFAULT_ID;
 
@@ -183,28 +200,22 @@ extern "C" bool obs_haiku_route_streams(const char *device_id)
 		return false;
 	}
 
-	/* index 0 is the default output; the device's index in the list the mixer offers its streams */
-	int32 index = 0;
-	if (*device_id) {
-		index = control.Outputs().IndexOf(device_id);
-		if (index <= 0) {
-			/* The parameter only takes devices that are there now; a stream routed to a device that
-			 * goes away later does come back to it by itself. */
-			warn_route(label, "the system mixer does not list this device now");
-			return false;
-		}
-	}
-
+	/* By name, whether the device is there or not; "" is the default output. hasRoute: the stream is listed
+	 * in the mixer's "renga:routes" (Renga's mixer since F-58). */
 	int routed = 0, failed = 0;
 	for (int32 i = 0; i < control.CountStreams(); i++) {
 		const BPrivate::AudioStream *stream = control.StreamAt(i);
-		if (stream->signature != self.c_str() || !stream->hasOutput)
+		if (stream->signature != self.c_str())
 			continue;
-		if (stream->output == index) {
+		if (!stream->hasRoute) {
+			failed++;
+			continue;
+		}
+		if (stream->route == device_id) {
 			routed++;
 			continue;
 		}
-		if (control.SetOutput(stream->id, index) == B_OK)
+		if (control.SetRoute(stream->id, device_id) == B_OK)
 			routed++;
 		else
 			failed++;

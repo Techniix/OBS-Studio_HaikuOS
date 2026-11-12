@@ -27,6 +27,10 @@
  * system's audio path, so there is no helper process, nothing to repair after a crash, and the default
  * output can change freely: the mixer keeps feeding the loopback.
  *
+ * Desktop Audio leaves OBS's own streams out (the loopback's "renga:loopback_exclude", Renga F-58 / O-1): they
+ * are audio monitoring, i.e. sources OBS records directly already. So monitored sources are not recorded twice,
+ * and Desktop Audio itself can be monitored without feeding back into itself.
+ *
  * Time stamps: the mixer stamps each loopback buffer with the performance time at which its first frame
  * reaches the output, in the mixer's time source (MixerCore::_FeedTaps() passes its event time and time
  * source; MixerTap::_SendBuffers() writes both into the buffer header and advances the time by the frames
@@ -67,9 +71,13 @@
  * capture source and stores its value (frontend/settings/OBSBasicSettings.cpp); the system mixer is the one
  * thing there is to capture, whatever devices its streams are routed to. */
 #define S_DEVICE_ID "device_id"
-#define S_NOTE "monitoring_note"
 #define S_APPLICATION "application"
 #define S_REFRESH "refresh"
+
+/* OBS's application signature: OBS_HAIKU_APP_SIGNATURE in frontend/cmake/os-haiku.cmake, which goes into the
+ * executable's resources (frontend/cmake/haiku/obs-studio.rdef.in). The mixer knows OBS's monitoring streams
+ * by it (AudioMixer::_IdentifyApplication() asks the registrar). */
+#define OBS_APP_SIGNATURE "application/x-vnd.obs-studio"
 
 /* a converted time further than this from now is not believed (libobs gives up at 2 s, MAX_TS_VAR) */
 #define MAX_CLOCK_OFFSET_US 1000000
@@ -139,34 +147,6 @@ private:
 	BTimeSource *source = nullptr;
 	bigtime_t last_lookup = 0;
 };
-
-/* The signature of this program, as the system mixer sees it: the mixer names a stream's application with
- * be_roster->GetRunningAppInfo() of the team that owns the stream's port
- * (AudioMixer::_IdentifyApplication()). */
-std::string lookup_own_signature()
-{
-	thread_info thread;
-	app_info app;
-	if (!be_roster || get_thread_info(find_thread(NULL), &thread) != B_OK ||
-	    be_roster->GetRunningAppInfo(thread.team, &app) != B_OK)
-		return std::string();
-	return app.signature;
-}
-
-/* A registrar round trip, so only once; the signature doesn't change while the program runs. Not cached
- * while there is no be_roster yet (nothing to compare with then). */
-std::string own_signature()
-{
-	static std::mutex mutex;
-	static std::string signature;
-	static bool known = false;
-	std::lock_guard<std::mutex> lock(mutex);
-	if (!known) {
-		signature = lookup_own_signature();
-		known = be_roster != nullptr;
-	}
-	return signature;
-}
 
 struct LoopbackAudio {
 	obs_source_t *source;
@@ -248,12 +228,26 @@ void LoopbackAudio::OnBuffer(const void *data, size_t size, const media_format &
 	obs_source_output_audio(source, &audio);
 }
 
+/* What Desktop Audio leaves out: OBS's streams, which are its audio monitoring (libobs/audio-monitoring/haiku),
+ * by the signature OBS is built with; HaikuRecorder::OpenLoopback() adds the one the registrar has for this team
+ * if it differs (an executable run without its resources gets one made up by Qt). The browser helper
+ * (application/x-vnd.obs-studio-browser-helper) is not left out: a browser source's page audio plays through
+ * the system mixer and is meant to reach recordings through Desktop Audio, as on other platforms with "Control
+ * audio via OBS" off. */
+HaikuOpenParams desktop_audio_params()
+{
+	HaikuOpenParams params;
+	params.loopback_exclude = OBS_APP_SIGNATURE "\n";
+	params.loopback_exclude_self = true;
+	return params;
+}
+
 void loopback_update(void *data, obs_data_t *settings)
 {
 	LoopbackAudio *la = static_cast<LoopbackAudio *>(data);
 	/* no Media Kit work here: the capture's thread (re)opens the loopback */
 	if (!la->per_application) {
-		la->capture->Configure(std::string(), HaikuVideoSize(), true);
+		la->capture->Configure(std::string(), desktop_audio_params(), true);
 		return;
 	}
 
@@ -261,11 +255,12 @@ void loopback_update(void *data, obs_data_t *settings)
 	 * application this source is silent. So is OBS itself: capturing its own monitoring playback would
 	 * feed a monitored source back into itself. */
 	std::string signature = obs_data_get_string(settings, S_APPLICATION);
-	if (!signature.empty() && signature == own_signature()) {
+	if (!signature.empty() && signature == HaikuOwnSignature()) {
 		blog(LOG_WARNING, "[haiku-media] '%s': not capturing OBS's own audio", obs_source_get_name(la->source));
 		signature.clear();
 	}
-	la->capture->Configure(signature, HaikuVideoSize(), !signature.empty());
+	/* No exclusions: the loopback records the one application chosen, never OBS (refused above). */
+	la->capture->Configure(signature, HaikuOpenParams(), !signature.empty());
 }
 
 void *loopback_create(obs_data_t *settings, obs_source_t *source, bool per_application)
@@ -316,13 +311,7 @@ obs_properties_t *desktop_audio_properties(void *)
 	obs_property_t *list = obs_properties_add_list(props, S_DEVICE_ID, T_("Device"), OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(list, T_("SystemMixer"), "default");
-
-	/* The loopback records every stream of the mixer, OBS's monitoring playback included: MixerCore mixes
-	 * all inputs for a loopback without a signature (kMixAll in MixerCore::_InputFade()) and has no way
-	 * to leave one application out. Until it has (requested from Renga), the user has to know. */
-	obs_property_t *note = obs_properties_add_text(props, S_NOTE, T_("DesktopAudio.MonitoringNote"), OBS_TEXT_INFO);
-	obs_property_text_set_info_type(note, OBS_TEXT_INFO_WARNING);
-	obs_property_text_set_info_word_wrap(note, true);
+	obs_property_set_long_description(list, T_("SystemMixer.Description"));
 	return props;
 }
 
@@ -482,7 +471,7 @@ private:
 
 	static std::vector<ApplicationEntry> Read(BPrivate::AudioStreamControl &control)
 	{
-		const std::string self = own_signature();
+		const std::string self = HaikuOwnSignature();
 		std::vector<ApplicationEntry> list;
 
 		auto wanted = [&](const char *signature) {
@@ -565,7 +554,7 @@ void fill_application_list(obs_property_t *list, const char *current)
 		current_listed = current_listed || entry.signature == current;
 	}
 
-	if (current && *current && !current_listed && own_signature() != current) {
+	if (current && *current && !current_listed && HaikuOwnSignature() != current) {
 		dstr_printf(&label, T_("Application.NotRunning"), current);
 		obs_property_list_add_string(list, label.array, current);
 	}
@@ -608,8 +597,9 @@ void haiku_register_desktop_audio(void)
 	 * frontend/OBSApp.cpp) and that existing scene collections name */
 	info.id = "haiku_desktop_audio_capture";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	/* DO_NOT_SELF_MONITOR: monitoring plays into the mixer the loopback records; monitoring this source
-	 * would feed it back into itself (libobs/audio-monitoring/haiku honors the flag for every device) */
+	/* DO_NOT_SELF_MONITOR marks it as an "audio output capture" for libobs, which then asks the platform's
+	 * devices_match() whether monitoring plays into it (feedback, and deduplication of monitored sources).
+	 * On Renga it never does, OBS's streams being excluded (libobs/audio-monitoring/haiku/haiku-output.c). */
 	info.output_flags = OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_DO_NOT_SELF_MONITOR;
 	info.icon_type = OBS_ICON_TYPE_AUDIO_OUTPUT;
 	info.get_name = desktop_audio_get_name;

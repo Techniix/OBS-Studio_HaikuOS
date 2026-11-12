@@ -37,6 +37,8 @@
 #define HAIKU_MEDIA_DEFAULT_DEVICE "default"
 /* value of the video "resolution" setting that keeps the size the device picks itself */
 #define HAIKU_MEDIA_DEFAULT_SIZE "default"
+/* value of the video "frame_rate" setting that keeps the rate the device picks for the size */
+#define HAIKU_MEDIA_DEFAULT_RATE "default"
 
 /* The system mixer's loopback flavor (Renga, PORTING.md "Per-application audio, routing and loopback"):
  * RENGA_LOOPBACK_FLAVOR_NAME of <AudioStreamControl.h>. It is a B_PHYSICAL_INPUT so that recorders list it;
@@ -72,6 +74,53 @@ struct HaikuVideoSize {
 	bool operator==(const HaikuVideoSize &o) const { return width == o.width && height == o.height; }
 };
 
+/* What a HaikuRecorder opens a device with, besides the device itself. */
+struct HaikuOpenParams {
+	/* video: the frame size to ask for (default: the device's own) */
+	HaikuVideoSize size;
+	/* video: the frame rate to ask for, as the connection's field_rate (0: the device's default for the size).
+	 * Renga's camera producers use their nearest rate and put it in the connected format (F-58, O-5). */
+	float field_rate = 0.0f;
+	/* loopback: signatures of the applications it leaves out, one per line (renga:loopback_exclude, F-58,
+	 * O-1); empty: none */
+	std::string loopback_exclude;
+	/* loopback: also leave out this program by the signature the registrar has for it (HaikuOwnSignature(),
+	 * looked up on the capture's thread) */
+	bool loopback_exclude_self = false;
+
+	bool operator==(const HaikuOpenParams &o) const
+	{
+		return size == o.size && field_rate == o.field_rate && loopback_exclude == o.loopback_exclude &&
+		       loopback_exclude_self == o.loopback_exclude_self;
+	}
+};
+
+/* One line of a camera's "renga:video_modes" parameter (Renga F-58, O-5; PORTING.md "Sound cards and cameras
+ * that come and go"): a frame size, what crosses the bus for it ("YUY2", "MJPEG"; the demo and virtual cameras
+ * say "RGB32") and the frame rates, fastest first, as the device writes them ("30", "29.97", "7.5"). */
+struct HaikuVideoMode {
+	HaikuVideoSize size;
+	std::string encoding;
+	std::vector<std::string> rates;
+};
+
+/* What a video device says it can do, read when it was last opened (HaikuRecorder::Open()). */
+struct HaikuVideoModes {
+	/* the device has a renga:video_modes parameter; `modes` is what it said (in its order) */
+	bool listed = false;
+	std::vector<HaikuVideoMode> modes;
+	/* without the parameter: the format the producer suggests (BMediaRoster::GetFormatFor() of its output,
+	 * i.e. FormatSuggestionRequested()); 0 x 0 if it suggests none */
+	HaikuVideoSize suggested;
+	float suggested_rate = 0.0f;
+
+	bool operator==(const HaikuVideoModes &o) const;
+};
+
+/* The signature of this program as the registrar (and so the system mixer) knows it; empty if it has none.
+ * A registrar round trip the first time, cached afterwards. */
+std::string HaikuOwnSignature();
+
 /* Lists physical input devices that produce raw buffers of the given type (without the mixer's loopback). */
 std::vector<HaikuMediaDevice> HaikuEnumerateCaptureDevices(media_type type);
 
@@ -82,10 +131,19 @@ void HaikuFillDeviceList(obs_property_t *list, media_type type, const char *curr
 /* "640x480" -> 640 x 480; anything else (HAIKU_MEDIA_DEFAULT_SIZE, "") is the device default. */
 HaikuVideoSize HaikuParseVideoSize(const char *text);
 
-/* Fills an OBS list property with "Device default" plus the frame sizes for a device: the ones the device
- * accepted when it was last opened (probed, see HaikuRecorder::Open()), or a list of common sizes if it has
- * not been opened yet. The `current` setting is always listed so it isn't lost. */
+/* "29.97" -> 29.97; anything else (HAIKU_MEDIA_DEFAULT_RATE, "", nonsense) is 0, the device default. */
+float HaikuParseFrameRate(const char *text);
+
+/* Fills an OBS list property with "Device default" plus the frame sizes the device listed when it was last
+ * opened; nothing more while it has not been opened yet in this session or has no list (then the default's
+ * label shows the size the device suggests, if it does). The `current` setting is always listed so that it
+ * isn't lost. Reads the module's cache only: no Media Kit call, so it can run on the UI thread. */
 void HaikuFillVideoSizeList(obs_property_t *list, const std::string &device_id, const char *current);
+
+/* The same for the frame rates the device listed for the frame size `resolution` ("Device default" only for
+ * the default size). */
+void HaikuFillFrameRateList(obs_property_t *list, const std::string &device_id, const char *resolution,
+			    const char *current);
 
 /* Outcome of HaikuRecorder::Open(); the caller decides what to log (it retries, see HaikuCapture). */
 struct HaikuOpenResult {
@@ -93,6 +151,8 @@ struct HaikuOpenResult {
 	std::string reason;         /* what failed, for the log */
 	bool used_fallback = false; /* the named device wasn't there; the Media preferences default is used */
 	bool size_refused = false;  /* the requested frame size was refused; the device default is used */
+	bool modes_changed = false; /* video: what the device lists differs from what was known before */
+	float requested_rate = 0.0f; /* video: the field_rate asked for (0: the device's default) */
 };
 
 /* BMediaRecorder that forwards buffers together with the format negotiated for the connection. Not
@@ -117,12 +177,11 @@ public:
 
 	/* Device: acquires the device's node (or, unless `allow_fallback` is false, the system default for the
 	 * type if the named device isn't plugged in), connects to a free output and starts the producer. For
-	 * video, `size` asks for a frame size (falls back to the device default if refused) and `probe` first
-	 * tries a list of common sizes and remembers which the device accepts (for HaikuFillVideoSizeList()),
-	 * unless the device actually acquired was already probed this session.
-	 * Loopback: instantiates a loopback node, selects the application `device_id` and connects with float
-	 * stereo at the mixer's rate; the other arguments are ignored. */
-	HaikuOpenResult Open(const std::string &device_id, HaikuVideoSize size = HaikuVideoSize(), bool probe = false,
+	 * video, it first reads what the device lists (HaikuVideoModes, for HaikuFillVideoSizeList()), then asks
+	 * for `params.size` and `params.field_rate` (the device default if the size is refused).
+	 * Loopback: instantiates a loopback node, selects the application `device_id`, leaves out
+	 * `params.loopback_exclude` and connects with float stereo at the mixer's rate. */
+	HaikuOpenResult Open(const std::string &device_id, const HaikuOpenParams &params = HaikuOpenParams(),
 			     bool allow_fallback = true);
 	void Close();
 
@@ -142,9 +201,10 @@ protected:
 	void BufferReceived(void *buffer, size_t size, const media_header &header) override;
 
 private:
-	HaikuOpenResult OpenLoopback(const std::string &signature);
+	HaikuOpenResult OpenLoopback(const std::string &signature, const HaikuOpenParams &params);
 	void SetConnectedFormat(const media_format &format);
-	void ProbeSizes(const std::string &key, media_output &output, const media_format &format);
+	bool ReadVideoModes(const std::string &key, const media_output &output);
+	bool IsVirtualCamera() const;
 
 	/* read by the recorder thread; see the class comment */
 	struct Shared {
@@ -180,8 +240,8 @@ using HaikuRecorderPtr = std::unique_ptr<HaikuRecorder, HaikuRecorder::Deleter>;
  *    health check any more: Renga's media services report hot-plug.
  *  - A named device that was missing (so the Media preferences default is used) is switched to when it
  *    appears; the default stays open until the named device has opened, and is kept if it can't be.
- *  - When the set of devices changes, the source's properties are reloaded so that an open properties
- *    window lists the devices there are now.
+ *  - When the set of devices changes, or a camera opened lists other modes than known before, the source's
+ *    properties are reloaded so that an open properties window lists the devices and modes there are now.
  * Each failure streak is logged once, and its end. */
 class HaikuCapture {
 public:
@@ -196,9 +256,9 @@ public:
 	HaikuCapture(const HaikuCapture &) = delete;
 	HaikuCapture &operator=(const HaikuCapture &) = delete;
 
-	/* Any thread; returns immediately. A change of device or size reopens the device; `active` false
+	/* Any thread; returns immediately. A change of device or parameters reopens the device; `active` false
 	 * closes it. */
-	void Configure(const std::string &device_id, HaikuVideoSize size, bool active);
+	void Configure(const std::string &device_id, const HaikuOpenParams &params, bool active);
 
 	/* Media Kit notification relay (media-device.cpp); `retry` events may have made a device available,
 	 * `broken` (another application's connection broken) may have freed a busy one: it brings a pending
@@ -210,7 +270,7 @@ public:
 private:
 	struct Config {
 		std::string device_id;
-		HaikuVideoSize size;
+		HaikuOpenParams params;
 		bool active = false;
 	};
 

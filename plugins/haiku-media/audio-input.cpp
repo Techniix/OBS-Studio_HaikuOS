@@ -78,7 +78,7 @@ void audio_input_update(void *data, obs_data_t *settings)
 {
 	AudioInput *ai = static_cast<AudioInput *>(data);
 	/* no Media Kit work here: the capture's thread (re)opens the device, also when it is busy now */
-	ai->capture->Configure(obs_data_get_string(settings, S_DEVICE_ID), HaikuVideoSize(), true);
+	ai->capture->Configure(obs_data_get_string(settings, S_DEVICE_ID), HaikuOpenParams(), true);
 }
 
 void *audio_input_create(obs_data_t *settings, obs_source_t *source)
