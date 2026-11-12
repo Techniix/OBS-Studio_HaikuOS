@@ -34,8 +34,8 @@ open and close by themselves. Every step has a time limit; hangs are recorded wi
 Each OBS run uses a throwaway configuration (`XDG_CONFIG_HOME`), so your own OBS settings, profiles and scenes
 are not touched. See `build-aux/haiku/test/make-config.sh` for what it contains.
 
-**Screen recording permission.** The first capture of an application shows the *Screen recording* prompt and waits
-up to 2 minutes for an answer, which would stall an unattended run. On this branch `test.sh` therefore runs the step
+**Screen recording permission.** The first capture of an application shows the *Screen recording* prompt, and the
+capture sources wait for the answer, which would leave an unattended run without a picture. On this branch `test.sh` therefore runs the step
 `screen-permission` first: it saves the current decisions (`screen-recording-before.txt` and
 `screen-recording-after.txt` in the archive) and allows OBS with
 
@@ -207,16 +207,18 @@ Add each with the **+** button under *Sources*.
 - [ ] **Screen Capture** (haiku-capture). The screen recording permission applies; if `test.sh` ran earlier on
       this machine, OBS is already allowed (see "Screen recording permission" below). To test the prompt, first run
       `ScreenRecording --set application/x-vnd.obs-studio ask`.
-  - [ ] Adding the source shows the *Screen recording* prompt and the properties say it is waiting; OBS's UI stays
-        responsive meanwhile apart from app_server calls (known: O-6). *Allow* starts the capture and the desktop
-        shows in the preview.
-  - [ ] *Deny* (or let the prompt time out): the properties explain it and show *Try again*; pressing it asks again.
-        *Deny* without "Remember my decision" shows the prompt only once (no second prompt right after it).
-  - [ ] Quit OBS while the prompt is still open: OBS quits normally, without a crash dialog (the permission thread
-        is stopped within about a second at module unload).
-  - [ ] Known: the Screen recording indicator appears as soon as the permission is known (granted), a moment
-        before the sources start, because the permission is asked through a one-pixel session of its own. Note if it
-        flashes (appears, disappears and appears again) rather than staying up.
+  - [ ] Adding the source shows the *Screen recording* prompt and the properties say it is waiting; OBS's UI
+        (preview, menus, other dialogs) stays fully responsive meanwhile. *Allow* starts the capture at once and the
+        desktop shows in the preview.
+  - [ ] *Deny*: the properties say OBS isn't allowed and show *Try again*; pressing it shows the prompt again
+        (exactly once). *Deny* with "Remember my decision": *Try again* shows no prompt and the properties stay
+        "not allowed" until the ScreenRecording preferences allow OBS.
+  - [ ] Close the prompt without answering: the properties say the prompt was closed without an answer (not "not
+        allowed") and show *Try again*, which shows the prompt again.
+  - [ ] Quit OBS while the prompt is still open: OBS quits at once and normally, without a crash dialog.
+  - [ ] With OBS allowed and a source capturing, run `ScreenRecording --set application/x-vnd.obs-studio ask` and
+        hide and show the source (or toggle *Capture Cursor*): the prompt appears and the properties say "waiting",
+        not "not allowed".
   - [ ] While capturing, the Screen recording indicator is shown. *Stop* from the indicator ends the capture; the
         properties show the "stopped" message with *Start capture*, and it does not restart by itself. *Start capture*
         resumes.
@@ -225,8 +227,10 @@ Add each with the **+** button under *Sources*.
   - [ ] *Capture* = *Region*: set Left/Top/Width/Height; the source shows exactly that part of the screen and
         follows changes to the numbers. A region outside the screen shows the "outside the screen" message.
   - [ ] Toggling *Capture Cursor* shows/hides the mouse pointer.
-  - [ ] An idle desktop produces no new frames (the 10 s `LOG_DEBUG` line, with `--verbose`, shows few changed
-        frames); moving a window produces them. Note polls, changed frames and `NextFrame()` average/max times.
+  - [ ] An idle desktop produces no new frames: the 10 s `LOG_DEBUG` line (with `--verbose`) shows about 10
+        frames read (the once-a-second idle check) and few wakeups. Moving a window produces wakeups and changed
+        frames, never more frames read than the frame rate allows. Note wakeups, frames read, changed and output
+        frames and the `NextFrame()` average/max times.
   - [ ] At 1920×1080 and 30 fps, ProcessController shows reasonable CPU usage, and the desktop and pointer stay
         smooth while recording. Try 60 fps as well.
 - [ ] **Window Capture (screen region)** (haiku-capture):
@@ -234,12 +238,16 @@ Add each with the **+** button under *Sources*.
         *Refresh window list* updates it.
   - [ ] Pick a Terminal window: the source shows exactly that window. Move and resize the window: the source
         follows.
-  - [ ] Minimize the window or switch to another workspace: the source pauses (keeps the last frame); restoring
-        it resumes.
+  - [ ] Minimize the window, hide it, or switch to another workspace: the source pauses (keeps the last frame;
+        the log says why); restoring it resumes at once.
+  - [ ] Close the window while it is minimized or on another workspace: within about a second the picture is
+        cleared and the properties say the window isn't open.
   - [ ] Close the window: the picture is cleared and the properties say the window isn't open. Open it again
         (same application and title): the capture resumes without touching the source.
-  - [ ] Put another window over it: the covering window appears in the capture (expected until the compositor,
-        F-33).
+  - [ ] Put another window over part of it: with *When the window is covered* = *Capture anyway* (the default)
+        the covering window appears in the capture (expected until the compositor, F-33). With *Pause while any
+        part of it is covered* the source pauses until the window is uncovered; with *Pause while it is fully
+        covered* it pauses only when another window hides all of it.
   - [ ] *Include window border and tab* on/off changes whether the tab and border are captured.
   - [ ] Quit and restart OBS: the source finds the same window again.
 - [ ] **Audio Input Capture (Media Kit)**:
@@ -251,8 +259,16 @@ Add each with the **+** button under *Sources*.
   - [ ] Hot-plug: with a USB microphone selected, unplug it. The list shows "<name> (not connected)" and the source
         goes silent without errors in a loop. Plug it in again: capture resumes without re-saving the source. A microphone plugged in later appears in the list.
 - [ ] **Video Capture Device (Media Kit)** (only with a webcam supported by Haiku):
-  - [ ] The device appears in the list and video shows in the preview.
-  - [ ] Note the `capturing from ... (WxH, color space 0x...)` log line.
+  - [ ] The device appears in the list and video shows in the preview. The list does not contain "Virtual Camera".
+  - [ ] Note the `lists N video modes` and `capturing (WxH, color space 0x..., F fps, ...)` log lines.
+  - [ ] *Resolution* lists the camera's sizes (after it was opened once; the dialog refills by itself) and
+        *Frame rate* the rates of the chosen size. Pick a size and a lower rate (for example 15 fps): the picture
+        changes size, it moves visibly slower, and the log line says `15.00 fps; 15.00 fps asked for` (or the
+        camera's nearest rate). "Device default" for both gives the camera's own choice.
+  - [ ] With Demo Video Producer: *Resolution* lists 640 x 480 and 320 x 240, *Frame rate* 29.97, 15 and 5 fps.
+  - [ ] With OBS's virtual camera running, a scene collection whose source names "Virtual Camera" shows it as
+        "(shows OBS's own output; not available)" and stays black (no picture of OBS's own output). If Media
+        preferences has the Virtual Camera as the video input, "Default" stays black too and the log says why.
   - [ ] Hot-plug: unplug the camera while it is shown. The entry stays as "(not connected)"; plug it in again and the
         picture returns. A camera plugged in later appears in the list. The list also contains Demo Video Producer.
   - [ ] *Deactivate when not showing*: hide the source with the eye icon; the camera LED should go off.
@@ -278,9 +294,13 @@ is needed if OBS crashes.
 - [ ] Changing the default output in Media preferences while capturing: capture keeps working (the loopback
       records every output), and the audio stays in sync with the video (no audible jump). The log may show
       "time stamps from the mixer's time source, as last converted" and then "... the mixer's time source" again.
-- [ ] **Known limitation (O-1).** Add a Media Source and set it to *Monitor and Output*. The recording contains
-      that source **twice** (echo): once directly, once through Desktop Audio. Expected until O-1 lands. Note it,
-      do not report it as a bug.
+- [ ] **OBS's monitoring is left out.** Add a Media Source and set it to *Monitor and Output*, with Desktop Audio
+      active. You hear the source, and the recording contains it **once** (no echo). Set the monitoring device
+      to another output and record again: still once.
+- [ ] *Monitor and Output* on Desktop Audio itself: you hear the played sound a second time, slightly delayed,
+      and there is **no** feedback howl; the recording has it once. The log has no `Prevented feedback-loop` line
+      (it would mean OBS has no application signature).
+- [ ] A browser source with sound (page audio) is still recorded through Desktop Audio.
 - [ ] **Application Audio Capture**: add the source. The *Application* list shows applications that play audio
       ("(playing audio)") and running GUI applications; OBS itself is not listed. The list is read in the
       background: on the first opening it may fill in a moment after the dialog appears. *Refresh* updates it
@@ -298,8 +318,8 @@ is needed if OBS crashes.
 
 ## 5. Audio monitoring
 
-Monitoring plays through the system mixer (one `BSoundPlayer` per source); the chosen device is applied with the
-mixer's per-stream *Output* routing.
+Monitoring plays through the system mixer (one `BSoundPlayer` per source); OBS's streams are routed to the
+chosen device by name (the mixer's `renga:routes`).
 
 1. *Settings → Audio → Advanced → Monitoring Device*: "Default".
 2. In the Audio Mixer, open the gear menu of the mic source → *Advanced Audio Properties* →
@@ -314,12 +334,14 @@ mixer's per-stream *Output* routing.
       the default output; Media preferences or Cortex show the OBS stream routed to that output. Choose "Default"
       again and the sound comes back. The route is set in the background, so the sound may start on the default
       output and move within a moment; the Settings dialog applies without a pause.
-- [ ] Choose a device, unplug it, then plug it in: note where monitoring plays meanwhile (default output) and
-      whether it returns to the device. It returns only after monitoring is reset (O-4); resetting means switching
-      the source's monitoring off and on.
+- [ ] Choose a device, unplug it, then plug it in: monitoring plays on the default output meanwhile and moves
+      back to the device by itself within a few seconds, without touching OBS. Also start OBS with the device
+      unplugged (the settings show it as invalid): monitoring plays on the default output and moves to the device
+      when it is plugged in.
+- [ ] Set OBS's stream to another output in Media preferences, then switch a source's monitoring off and on: it
+      returns to OBS's monitoring device.
 - [ ] If the log says OBS has no application signature the mixer could know its streams by, routing cannot work;
       send the log line.
-- [ ] Desktop Audio is never monitored (no echo or feedback when *Monitor and Output* is chosen on it).
 
 ## 6. Browser source and docks
 
@@ -353,8 +375,21 @@ mixer's per-stream *Output* routing.
       restarts the helper and the page comes back.
 - [ ] A page whose size grows (change Width/Height while the page is shown) keeps rendering with no flicker to a
       stale size.
-- [ ] "Control audio via OBS" is unavailable/disabled (expected, O-2 and O-3); the page's sound reaches recordings through
-      Desktop Audio only.
+- [ ] **Control audio via OBS**: open a page that plays sound (a YouTube video, or a local file with an
+      `<audio autoplay loop>` element). Without the option, the sound is heard and Desktop Audio's meter moves; the
+      source is not in the audio mixer. Turn the option on: the page reloads, the source appears in the audio mixer
+      and its meter moves, the speakers stay silent (after at most a second the first time) and Desktop Audio's
+      meter does not move. The log shows `started browser helper (team N, page audio controlled by OBS)`,
+      `recording the page's audio ... (team N, ... Hz)` and, the first time, `page audio stream ... is now
+      loopback-only`. Audio preferences show the stream with Output "None (loopback only)". Record a few seconds:
+      the page's sound is in the recording once, in sync with the picture.
+- [ ] With the option on, kill the helper in ProcessController: after it restarts, the log shows `page audio now
+      follows browser helper team M` and the sound comes back in the source only. Two rerouted sources with
+      different pages: each source's meter shows only its own page.
+- [ ] Turn the option off again: the page reloads, its sound is heard and recorded by Desktop Audio, and the source
+      leaves the audio mixer. A browser dock playing sound is heard and recorded by Desktop Audio at all times.
+- [ ] Restart the media services (Media preferences) with a rerouted source playing: the log shows `the page audio
+      loopback went away` and the sound returns in the source within a few seconds.
 - [ ] Twitch/StreamElements-style alert page or a chat overlay URL you normally use: note whether it renders and
       animates (HaikuWebKit has no WebGL, so WebGL-based overlays won't).
 - [ ] **Custom browser docks**: *Docks → Custom Browser Docks...*, add one with `https://obsproject.com`. The dock
@@ -423,6 +458,43 @@ back end encodes VP9 only (its FFmpeg has no H.264/HEVC/AV1 encoder), so the enc
       on the other machine (e.g. `ffplay -i "srt://0.0.0.0:9000?mode=listener"` or OBS's own Media Source in
       listener mode on another computer). The stream plays.
 - [ ] **RIST**: server `rist://<other-machine>:9000`, receiver `ffplay rist://@:9000`. The stream plays.
+
+### Virtual camera (haiku-virtualcam)
+
+Needs a Renga image with the virtual camera add-on (`d6f1bc7b` or later). CodyCam is the reference consumer.
+
+- [ ] The log has no `[haiku-virtualcam] virtual_camera.media_addon not found`, and the controls dock shows
+      *Start Virtual Camera* with its gear button. (On an image without the add-on the button is absent and the
+      log has that line.)
+- [ ] With a scene that has a recognisable picture, click *Start Virtual Camera*. The log has
+      `[haiku-virtualcam] feeding the Virtual Camera with WxH at F fps` (the output resolution and FPS from
+      *Settings → Video*) and `==== Virtual Camera Start`. The button changes to *Stop Virtual Camera*.
+- [ ] Open CodyCam, choose *Camera → Virtual Camera*: it shows OBS's program, moving, in the right colours (red is
+      red, not blue) and the right way up. Change scenes in OBS: CodyCam follows within a frame or two.
+- [ ] While it runs, a second consumer shows the same feed: e.g. the Media preferences' video input set to
+      "Virtual Camera", or a second CodyCam.
+- [ ] Gear button: Output Type "Preview", "Scene" and "Source" each show the chosen picture in
+      CodyCam (the camera restarts when the type is changed while running).
+- [ ] *Stop Virtual Camera*: CodyCam shows the dark grey "no signal" frame within about a second; the log has
+      `[haiku-virtualcam] stopped` and `==== Virtual Camera Stop`. Start and stop five times in a row: no hang,
+      no crash, and the camera works each time.
+- [ ] Change *Settings → Video → Output (Scaled) Resolution* (e.g. 1920x1080 to 1280x720) while stopped, then start
+      again: the log names the new size and CodyCam still shows a full, undistorted picture.
+- [ ] **Busy**: while OBS feeds the camera, run the Renga test `media_vcam_test` (or a second OBS instance with
+      `--multi`) and start its virtual camera: it is refused (`B_BUSY`). The reverse: start the other feeder
+      first, then *Start Virtual Camera* in OBS: OBS shows "Failed to start virtual camera" with "Another
+      application is already feeding Renga's Virtual Camera ...", and the button stays *Start Virtual Camera*.
+- [ ] **Media services gone**: while the camera runs, restart the media services (Media preferences → *Restart
+      media services*). Within a second or two OBS shows "Virtual camera stopped" with "The connection to Renga's
+      Virtual Camera was lost ...", the button returns to *Start Virtual Camera*, and OBS keeps running (no
+      SIGPIPE). After the services are back, *Start Virtual Camera* works again.
+- [ ] **Media services not running**: quit media_server and media_addon_server (e.g. with ProcessController),
+      then *Start Virtual Camera*: the error says the media services are not running.
+- [ ] Quit OBS while the virtual camera runs: no hang on exit; CodyCam falls back to "no signal".
+- [ ] Note the *Stats* dock's render/encode lag with the camera running at the canvas size (the output converts
+      to BGRA on the CPU and copies each frame twice).
+- [ ] Do **not** add the "Virtual Camera" device as a *Video Capture Device* source in the OBS that feeds it
+      (it would show itself, a feedback loop). Just check it is listed there.
 
 ## 10. Hotkeys
 

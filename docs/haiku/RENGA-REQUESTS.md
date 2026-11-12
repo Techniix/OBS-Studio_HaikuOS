@@ -34,6 +34,11 @@ that file are kept consistent.
 | O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Landed (`fcac2cd7`) | F-15 |
 | O-14 | `VideoAccelEncoder` details: bitstream formats, dts/B-frames, rate control, colour, surface release, roster locking | Encoding | 2 | Proposed | F-31 phase 5 |
 | O-15 | H.264 (and HEVC/AV1) in the software reference back end | Encoding | 3 | Proposed | F-31 phase 5 |
+| O-16 | A leftover permission request must not answer the next request | Capture | 3 | Proposed | F-58 follow-up |
+| O-17 | Team of each mixer stream | Audio, browser source | 2 | Proposed | F-58 follow-up |
+| O-18 | Loopback-only routing by team, not remembered | Browser source | 2 | Proposed | F-58 follow-up |
+| O-19 | Refuse oversize UNIX datagram/seqpacket messages with EMSGSIZE | Platform | 3 | Proposed | F-58 follow-up |
+| O-20 | A timeout for VirtualCameraFeeder::WriteFrame() | Virtual camera | 3 | Proposed | F-58 follow-up |
 
 **Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
 Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
@@ -55,7 +60,8 @@ for OBS are in `docs/partners/OBS.md` there. Interface differences from the prop
 - O-9: `NextFrame(..., &flags)` with `SCREEN_CAPTURE_FRAME_*` flags.
 - O-12: `BPrivate::VirtualCameraFeeder` (`headers/private/media/VirtualCamera.h`).
 - O-13: three kernel fixes came with the tests (empty messages, descriptors with empty messages, MSG_CTRUNC).
-OBS adapts to each in the commits that follow; the request text below is kept as the original proposal.
+OBS has adapted to each (OBS commits ab7b54e capture, 13ad317 audio and webcam, 73d1ed8 browser audio, 1237ec5
+virtual camera); the request text below is kept as the original proposal. O-16 to O-20 came up while adapting.
 
 Suggested order: O-1 (the most noticeable everyday problem, a small change in the mixer's loopback), then
 O-7 with O-6 (removes a fragile workaround in OBS and a UI freeze), then O-4, then O-5 and O-12 (the
@@ -193,6 +199,46 @@ gaps make it guess or limit features:
 The software reference back end encodes VP8/VP9 only, so the H.264/HEVC/AV1 paths of hardware encoder
 clients cannot be tested without a GPU back end. An H.264 encoder in it (for example openh264), and HEVC/AV1
 if practical, would let OBS's main codecs be tested end to end. OBS tests with VP9 meanwhile.
+
+### O-16 Leftover permission requests
+
+- **Need.** After a "Don't allow" that was not remembered, or a prompt closed without an answer, the app_server
+  keeps the request (`ScreenCaptureManager` `_AnswerRequest`/`_Decide`), and the next `RequestPermission()`
+  is answered "no" from it without a prompt. OBS's "Try again" therefore asks twice when the first answer is
+  an immediate "no" with request -1.
+- **Proposed interface.** None new: a request answered or cancelled is consumed and never answers a later one.
+
+### O-17 Team of each mixer stream
+
+- **Need.** OBS's browser sources run in helper processes that share one executable. The mixer's stream list
+  (`AudioStreamControl::Update()`, the parameter web) names streams by signature only, so OBS cannot find the
+  streams of one helper to route them.
+- **Proposed interface.** A hidden per-stream parameter `renga:app_team` and an `AudioStream::team` field.
+
+### O-18 Loopback-only routing by team
+
+- **Need.** Routes are remembered by signature, so routing one helper's streams "loopback only" would apply to
+  every later helper and to browser docks. OBS works around it by starting helpers of sources with "Control
+  audio via OBS" under a second signature.
+- **Proposed interface.** A route by team that the mixer does not remember, or automatic "loopback only" for
+  a team's streams while a loopback selecting that team (and asking for it, e.g. a `renga:loopback_exclusive`
+  flag) exists. With O-17 and O-18 the second signature goes away, and no page sound reaches the speakers
+  before OBS has set the route (up to about 1 s today).
+
+### O-19 Oversize UNIX messages
+
+- **Need.** A `SOCK_SEQPACKET`/`SOCK_DGRAM` UNIX message larger than the receiver's buffer (64 KiB default,
+  128 KiB maximum) is not refused: the send waits forever (`net_socket.cpp`, `UnixFifo.cpp`), because the
+  module does not mark the protocol as atomic. The browser helper IPC stays on `SOCK_STREAM` because custom CSS
+  and scripts can be megabytes.
+- **Proposed interface.** `EMSGSIZE` for messages that can never fit, as on Linux, and the limit documented.
+
+### O-20 WriteFrame() timeout
+
+- **Need.** `VirtualCameraFeeder::WriteFrame()` ends in a blocking `send()`. If media_addon_server stops
+  reading without closing the socket, OBS's writer thread blocks, and stopping the virtual camera hangs.
+- **Proposed interface.** A timeout argument (or `SetTimeout()`), or `MSG_NOSIGNAL` with a non-blocking mode
+  returning `B_WOULD_BLOCK`.
 
 ### Planned Renga work OBS will use as it lands
 
