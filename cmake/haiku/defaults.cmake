@@ -15,6 +15,37 @@ if(NOT DEFINED ENABLE_WHATSNEW)
   set(ENABLE_WHATSNEW OFF CACHE BOOL "Enable WhatsNew dialog")
 endif()
 
+# This branch builds against Renga's private APIs (Techniix/haiku, ce/main): the screen capture API (2026-11-10),
+# the mixer's stream control and loopback (2026-11-09) and the hardware video interface (2026-11-11). They come
+# with Renga's haiku_devel package, which must match the installed Renga build. Check for all of them up front so
+# an older Renga, or a stock Haiku haiku_devel, fails with one clear message instead of a missing header deep in
+# the configure or build.
+set(_renga_missing "")
+foreach(_renga_header IN ITEMS interface/ScreenCapture.h media/AudioStreamControl.h media/VideoAcceleration.h)
+  get_filename_component(_renga_name "${_renga_header}" NAME)
+  string(MAKE_C_IDENTIFIER "RENGA_HEADER_${_renga_name}" _renga_var)
+  find_file(
+    ${_renga_var}
+    NAMES ${_renga_name}
+    PATHS /boot/system/develop/headers/private/${_renga_header}/..
+    NO_DEFAULT_PATH
+  )
+  if(NOT ${_renga_var})
+    list(APPEND _renga_missing "private/${_renga_header}")
+  endif()
+  unset(${_renga_var} CACHE)
+endforeach()
+if(_renga_missing)
+  string(REPLACE ";" ", " _renga_missing "${_renga_missing}")
+  message(
+    FATAL_ERROR
+    "This is the Renga branch of OBS Studio. It needs Renga (Techniix/haiku, ce/main, 2026-11-11 or later) with "
+    "the matching haiku_devel package installed. Missing: ${_renga_missing}.\n"
+    "Check with: pkgman search -i -D haiku  (haiku and haiku_devel must be the same Renga build).\n"
+    "For stock Haiku, build the main branch instead."
+  )
+endif()
+
 option(ENABLE_RELOCATABLE "Enable relocatable build" OFF)
 option(ENABLE_PORTABLE_CONFIG "Enable support for portable config file location" OFF)
 
