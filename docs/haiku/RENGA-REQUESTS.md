@@ -19,19 +19,19 @@ that file are kept consistent.
 
 | ID | Request | Area | Priority | State | Roadmap |
 | --- | --- | --- | --- | --- | --- |
-| O-1 | Exclude applications from a loopback | Audio | 1 | Accepted (F-58) | F-31 |
-| O-2 | "Loopback only" stream route | Audio, browser source | 2 | Accepted (F-58) | F-31 |
-| O-3 | Loopback selection by team | Browser source | 2 | Accepted (F-58) | F-31 |
-| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | 1 | Accepted (F-58) | F-31, F-32 |
-| O-5 | Camera mode lists and frame rates | Webcam | 2 | Accepted (F-58) | F-31 phase 2 |
-| O-6 | Screen capture permission without blocking the app_server link | Capture | 1 | Accepted (F-58) | F-31 phase 3 |
-| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | 1 | Accepted (F-58) | F-31 phase 3 |
-| O-8 | Frame notification instead of polling | Capture | 3 | Accepted (F-58) | F-31 phase 3 |
-| O-9 | Window visibility in capture frames | Capture | 3 | Accepted (F-58) | F-31 phase 3, F-33 |
+| O-1 | Exclude applications from a loopback | Audio | 1 | Landed (`d97f5a34`) | F-31 |
+| O-2 | "Loopback only" stream route | Audio, browser source | 2 | Landed (`34526255`) | F-31 |
+| O-3 | Loopback selection by team | Browser source | 2 | Landed (`34526255`) | F-31 |
+| O-4 | Stream route to a device by name, kept while it is absent | Audio monitoring | 1 | Landed (`805d2929`) | F-31, F-32 |
+| O-5 | Camera mode lists and frame rates | Webcam | 2 | Landed (`ab6f163f`) | F-31 phase 2 |
+| O-6 | Screen capture permission without blocking the app_server link | Capture | 1 | Landed (`b92ace62`) | F-31 phase 3 |
+| O-7 | Distinguish a permission timeout from a denial; asynchronous permission request | Capture | 1 | Landed (`b92ace62`) | F-31 phase 3 |
+| O-8 | Frame notification instead of polling | Capture | 3 | Landed (`23d36b26`) | F-31 phase 3 |
+| O-9 | Window visibility in capture frames | Capture | 3 | Landed (`23d36b26`) | F-31 phase 3, F-33 |
 | O-10 | GPU buffers from capture (scanout, windows) | Capture | Roadmap | Accepted (GPU stage, with R-2 and F-47) | F-47 (with Quasar R-2) |
 | O-11 | Hardware video encode behind the Media Kit (`VideoAcceleration.h`) | Encoding | 2 | Interface landed (`446221a6`); GPU back end waits on Q-3 | F-31 phase 5 |
-| O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Accepted (F-58) | F-31 |
-| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Accepted (F-58) | F-15 |
+| O-12 | A virtual camera producer that applications can feed | Virtual camera | 2 | Landed (`d6f1bc7b`) | F-31 |
+| O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Landed (`fcac2cd7`) | F-15 |
 | O-14 | `VideoAccelEncoder` details: bitstream formats, dts/B-frames, rate control, colour, surface release, roster locking | Encoding | 2 | Proposed | F-31 phase 5 |
 | O-15 | H.264 (and HEVC/AV1) in the software reference back end | Encoding | 3 | Proposed | F-31 phase 5 |
 
@@ -40,6 +40,22 @@ Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchrono
 `BScreenCapture::RequestPermission(BMessenger, uint32)`); O-4; O-5 and O-12; O-2 and O-3; O-8 and O-9; O-13.
 Items land one commit at a time; each is marked Landed here with its commit, and any interface difference from
 the proposal is noted. O-10 is part of the GPU stage with Quasar's R-2 and F-47.
+
+**Landed (Renga, 2026-11-12, batch F-58).** All of O-1 to O-9, O-12 and O-13 are on `ce/main`; Renga's notes
+for OBS are in `docs/partners/OBS.md` there. Interface differences from the proposals:
+- O-1: the exclusion parameter is id 4 (look it up by kind `renga:loopback_exclude`); helper
+  `AudioStreamControl::SetLoopbackExclusions()`.
+- O-4: no per-stream parameter; one hidden mixer text parameter `renga:routes` (`<input id> <device>` lines),
+  helper `AudioStreamControl::SetRoute()`.
+- O-2/O-3: route `renga:loopback-only` (`SetLoopbackOnly()`), loopback kind `renga:loopback_team` id 5
+  (`SetLoopbackTeam()`).
+- O-5: hidden read-only `renga:video_modes` text parameter on the camera node; rate through `field_rate`.
+- O-7: `BScreenCapture::RequestPermission(BMessenger, uint32)` answers with `SCREEN_CAPTURE_PERMISSION_ANSWER`.
+- O-8: a semaphore (`SetFrameNotification()`) or `WaitForFrame(timeout)`, not a message.
+- O-9: `NextFrame(..., &flags)` with `SCREEN_CAPTURE_FRAME_*` flags.
+- O-12: `BPrivate::VirtualCameraFeeder` (`headers/private/media/VirtualCamera.h`).
+- O-13: three kernel fixes came with the tests (empty messages, descriptors with empty messages, MSG_CTRUNC).
+OBS adapts to each in the commits that follow; the request text below is kept as the original proposal.
 
 Suggested order: O-1 (the most noticeable everyday problem, a small change in the mixer's loopback), then
 O-7 with O-6 (removes a fragile workaround in OBS and a UI freeze), then O-4, then O-5 and O-12 (the
