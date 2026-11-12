@@ -10,16 +10,29 @@ cd ~/OBS-Studio_HaikuOS
 build-aux/haiku/test.sh            # pull, build, test (the build takes a while)
 build-aux/haiku/test.sh --no-build # test the existing build only
 build-aux/haiku/test.sh --quick    # shorter recordings, skips the forced-GPU run
+build-aux/haiku/test.sh --no-gpu   # never touch the GPU (CPU renderer only)
+build-aux/haiku/test.sh --gpu-only # only the GPU steps
 ```
 
-It pulls (`--ff-only`, skipped if the tree has local changes) and builds, collects system facts (packages,
-accelerants, Vulkan ICDs, environment, syslog), runs `obs-haiku-gl-probe`, then starts OBS three times (default
-renderer, `OBS_HAIKU_GL=osmesa`, and `OBS_HAIKU_GL=egl OBS_HAIKU_GL_WATCHDOG=0` last) and records a known scene
-(Screen Capture, a colour source, text, desktop audio) for 20 s each. OBS windows open and close by themselves.
-Every step has a time limit; hangs are recorded with a thread listing and `listimage`, then killed.
+It first prints a one-line warning that the GPU steps can freeze the machine on an experimental graphics driver
+and waits 5 s, so you can press Ctrl-C and use `--no-gpu` instead (`--yes` skips the wait). Then it pulls
+(`--ff-only`, skipped if the tree has local changes) and builds, collects system facts (packages, accelerants,
+Vulkan ICDs, environment, syslog), and runs the tests from safest to riskiest:
 
-Each OBS run uses a throwaway configuration in a temporary directory (`XDG_CONFIG_HOME`), so your own OBS
-settings, profiles and scenes are not touched. See `build-aux/haiku/test/make-config.sh` for what it contains.
+1. OBS with `OBS_HAIKU_GL=osmesa OBS_HAIKU_GL_PROBE=0` (CPU renderer, the GPU is not used at all);
+2. `obs-haiku-gl-probe` on the GPU, cheapest pattern first (`--frames 16` with every optional feature off:
+   `--no-stream --no-stage --no-second-display --no-handoff`), then one feature at a time, then the full
+   default, with `--verbose` whenever the probe offers the option;
+3. OBS with the default renderer;
+4. OBS with `OBS_HAIKU_GL=egl OBS_HAIKU_GL_WATCHDOG=0` (forced GPU, no hang watchdog) last.
+
+Each OBS run records a known scene (Screen Capture, a colour source, text, desktop audio) for 20 s. OBS windows
+open and close by themselves. Every step has a time limit; hangs are recorded with a thread listing and
+`listimage`, then killed. `--no-gpu` skips the self-test and the forced-EGL run and gives the default run
+`OBS_HAIKU_GL=osmesa`; `--gpu-only` skips the CPU-only run.
+
+Each OBS run uses a throwaway configuration (`XDG_CONFIG_HOME`), so your own OBS settings, profiles and scenes
+are not touched. See `build-aux/haiku/test/make-config.sh` for what it contains.
 
 **Screen recording permission.** The first capture of an application shows the *Screen recording* prompt and waits
 up to 2 minutes for an answer, which would stall an unattended run. On this branch `test.sh` therefore runs the step
@@ -37,6 +50,18 @@ preferences. The step is skipped when the `ScreenRecording` command is missing.
 The last line printed is the archive on the Desktop (`obs-test-<branch>-<commit>-<time>.zip`). Send that file;
 `SUMMARY.txt` inside it has one PASS/FAIL/HANG/SKIPPED line per step. The manual checklist below is still
 needed for things the script cannot judge (preview, dialogs, docks, audio monitoring).
+
+**If the machine freezes.** A graphics driver hang can freeze the whole system, so the run is written to
+`~/obs-test-runs/<time>/` (not `/tmp`; `OBS_TEST_WORK` overrides), with a `sync` after every log line.
+`progress.txt` there gets the step and the exact command line before each launch, so after a hard reset its
+last `LAUNCH` line is what was running (for the probe, also the end of `04-probe/<pattern>.log`). Just run the
+script again after rebooting: it lists the unfinished run and packs it into the new archive under
+`00-previous-incomplete/`, together with `/var/log/syslog*` and the part of it from the previous boot. The
+directory is removed once a run has written its archive (kept with `--keep`).
+
+The syslog may lack the last seconds before a freeze. If your boot loader offers it, turn on *Enable debug
+syslog* in the boot menu's debug options before a risky run: after a warm reset (the reset button, not power
+off), choose *Save syslog from previous session during boot* and `/var/log/previous_syslog` is packed as well.
 
 A step-by-step checklist for the first runs on real hardware. Work through it in order; each step says what
 should happen and what to collect if it doesn't. Tick boxes as you go and note anything odd. Exact error
