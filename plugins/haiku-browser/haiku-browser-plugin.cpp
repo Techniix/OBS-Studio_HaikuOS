@@ -27,6 +27,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 extern void haiku_register_browser_source(void);
 extern void haiku_browser_shutdown(void);
+extern void haiku_browser_audio_shutdown(void);
 
 bool obs_module_load(void)
 {
@@ -34,9 +35,11 @@ bool obs_module_load(void)
 	return true;
 }
 
-/* Sources and docks are gone by now; helpers they told to quit may still be flushing WebKit's storage. Their
- * reaper thread has to finish before this module's code is unloaded. */
+/* Sources and docks are gone by now; helpers they told to quit may still be flushing WebKit's storage, and the
+ * audio threads of rerouted sources may still be releasing their loopbacks. Those threads have to finish
+ * before this module's code is unloaded. */
 void obs_module_unload(void)
 {
+	haiku_browser_audio_shutdown();
 	haiku_browser_shutdown();
 }

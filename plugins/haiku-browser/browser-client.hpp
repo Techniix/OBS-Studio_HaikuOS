@@ -50,6 +50,9 @@ struct HaikuBrowserConfig {
 	int fps = 30;
 	std::string css;
 	bool transparent = true;
+	/* "Control audio via OBS": the helper runs under OBS_BROWSER_HELPER_REROUTED_SIGNATURE (browser-audio.hpp).
+	 * Changing it restarts the helper, as obs-browser recreates its browser. */
+	bool reroute_audio = false;
 };
 
 /* Only valid during the frame callback */
@@ -70,6 +73,8 @@ public:
 		std::function<void(const HaikuBrowserFrame &)> frame;
 		/* the page's title or URL changed (may be empty) */
 		std::function<void(const std::string &title, const std::string &url)> info;
+		/* a helper was started (also each restart); its team id */
+		std::function<void(pid_t team)> started;
 	};
 
 	/* storage_path: WebKit persistent storage (cookies, local storage) for this page; empty = shared default */
@@ -143,6 +148,7 @@ private:
 	bool stopped = false;
 	bool quit = false;
 	bool reset_backoff = false;
+	bool respawn = false;   /* the helper's command line changed (reroute_audio): replace a running one */
 	bool connected = false; /* a helper is running: messages are queued for it */
 	std::deque<std::vector<uint8_t>> queue;
 	size_t queue_bytes = 0;

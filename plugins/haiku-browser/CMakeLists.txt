@@ -33,12 +33,24 @@ if(NOT HaikuWebKit_INCLUDE_DIR OR NOT HaikuWebKit_LIBRARY OR NOT JavaScriptCore_
   )
 endif()
 
+# Renga's private Media Kit headers (haiku_devel): AudioStreamControl.h, header-only on public Media Kit API,
+# for "Control audio via OBS" (browser-audio.cpp: loopback by team and loopback-only routes, Renga F-58)
+find_path(
+  HaikuBrowserMediaPrivate_INCLUDE_DIR
+  NAMES AudioStreamControl.h
+  PATHS /boot/system/develop/headers/private/media
+  NO_DEFAULT_PATH
+  REQUIRED
+)
+
 add_library(obs-browser MODULE)
 add_library(OBS::browser ALIAS obs-browser)
 
 target_sources(
   obs-browser
   PRIVATE
+    browser-audio.cpp
+    browser-audio.hpp
     browser-client.cpp
     browser-client.hpp
     browser-input.hpp
@@ -47,9 +59,12 @@ target_sources(
     haiku-browser-plugin.cpp
 )
 
+target_include_directories(obs-browser SYSTEM PRIVATE "${HaikuBrowserMediaPrivate_INCLUDE_DIR}")
+
 # libbe: BMessage (flattened control messages), BAppFileInfo. libgnu: Renga's epoll, eventfd and memfd sealing
-# (3rdparty/ce/PORTING.md), the helper channel (browser-ipc.hpp).
-target_link_libraries(obs-browser PRIVATE OBS::libobs be gnu)
+# (3rdparty/ce/PORTING.md), the helper channel (browser-ipc.hpp). libmedia: BMediaRoster, BMediaRecorder
+# (browser-audio.cpp).
+target_link_libraries(obs-browser PRIVATE OBS::libobs be gnu media)
 target_compile_features(obs-browser PRIVATE cxx_std_17)
 
 # Browser docks: implement obs-browser's QCef panel interface. The interface header comes from the obs-browser

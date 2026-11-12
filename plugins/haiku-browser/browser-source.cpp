@@ -20,6 +20,7 @@
  * between platforms unchanged, rendered by HaikuWebKit in the obs-haiku-browser helper.
  */
 
+#include "browser-audio.hpp"
 #include "browser-client.hpp"
 #include "browser-input.hpp"
 
@@ -67,7 +68,15 @@ struct BrowserSource {
 	std::atomic_bool restart_when_active{false};
 	std::atomic_bool showing{false};
 
+	/* "Control audio via OBS": present while reroute_audio is on. Created and destroyed in browser_update()
+	 * (UI thread), told the helper's team from the client's I/O thread; neither waits for the media server
+	 * (browser-audio.hpp). */
+	std::mutex audio_mutex;
+	std::unique_ptr<BrowserAudioReroute> audio;
+
 	void OutputFrame(const HaikuBrowserFrame &frame);
+	void HelperStarted(pid_t team);
+	void SetRerouteAudio(bool on);
 };
 
 std::string file_url(const char *path)
@@ -104,6 +113,31 @@ void BrowserSource::OutputFrame(const HaikuBrowserFrame &frame)
 	obs_source_output_video(source, &out);
 }
 
+/* On the client's I/O thread, for every helper started */
+void BrowserSource::HelperStarted(pid_t team)
+{
+	std::lock_guard<std::mutex> lock(audio_mutex);
+	if (audio)
+		audio->SetHelperTeam(team);
+}
+
+void BrowserSource::SetRerouteAudio(bool on)
+{
+	{
+		std::lock_guard<std::mutex> lock(audio_mutex);
+		if (on && !audio) {
+			/* No team yet: a helper that is running has the other signature and is replaced (the
+			 * client restarts it whenever reroute_audio changes, and starts the first one only after
+			 * this); HelperStarted() passes the new one's team. */
+			audio = std::make_unique<BrowserAudioReroute>(source);
+		} else if (!on) {
+			audio.reset(); /* returns at once; its thread releases the loopback */
+		}
+	}
+	/* as obs-browser: the source is listed in the audio mixer only while it has audio */
+	obs_source_set_audio_active(source, on);
+}
+
 const char *browser_get_name(void *)
 {
 	return T_("BrowserSource");
@@ -132,6 +166,9 @@ void browser_update(void *data, obs_data_t *settings)
 	}
 	cfg.css = obs_data_get_string(settings, S_CSS);
 	cfg.transparent = true;
+	cfg.reroute_audio = obs_data_get_bool(settings, S_REROUTE_AUDIO);
+	/* before Configure(): the loopback must exist when the helper that Configure() restarts reports its team */
+	bs->SetRerouteAudio(cfg.reroute_audio);
 
 	const bool was_shutdown = bs->shutdown_when_hidden;
 	bs->shutdown_when_hidden = obs_data_get_bool(settings, S_SHUTDOWN);
@@ -169,6 +206,7 @@ void *browser_create(obs_data_t *settings, obs_source_t *source)
 	obs_source_set_async_unbuffered(source, true);
 	HaikuBrowserClient::Callbacks callbacks;
 	callbacks.frame = [bs](const HaikuBrowserFrame &frame) { bs->OutputFrame(frame); };
+	callbacks.started = [bs](pid_t team) { bs->HelperStarted(team); };
 	bs->client = std::make_unique<HaikuBrowserClient>(obs_source_get_name(source), std::move(callbacks));
 	browser_update(bs, settings);
 	return bs;
@@ -177,7 +215,8 @@ void *browser_create(obs_data_t *settings, obs_source_t *source)
 void browser_destroy(void *data)
 {
 	BrowserSource *bs = static_cast<BrowserSource *>(data);
-	bs->client.reset(); /* joins its I/O thread: no frame callback runs after this */
+	bs->client.reset(); /* joins its I/O thread: no frame or started callback runs after this */
+	bs->audio.reset();  /* no audio is output after this; the loopback is released by its own thread */
 	delete bs;
 }
 
@@ -325,8 +364,7 @@ obs_properties_t *browser_properties(void *data)
 	obs_property_set_long_description(p, T_("WebpageControlLevel.Haiku"));
 
 	p = obs_properties_add_bool(props, S_REROUTE_AUDIO, T_("RerouteAudio"));
-	obs_property_set_enabled(p, false);
-	obs_property_set_long_description(p, T_("RerouteAudio.Haiku"));
+	obs_property_set_long_description(p, T_("RerouteAudio.Description"));
 
 	obs_properties_add_button2(props, "refreshnocache", T_("RefreshNoCache"), refresh_clicked, data);
 	return props;
@@ -353,7 +391,11 @@ void haiku_register_browser_source(void)
 	struct obs_source_info info = {};
 	info.id = "browser_source";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_INTERACTION | OBS_SOURCE_DO_NOT_DUPLICATE;
+	/* OBS_SOURCE_AUDIO always, as obs-browser: a source without the flag at registration can never output
+	 * audio; without "Control audio via OBS" it simply outputs none and is kept out of the audio mixer
+	 * (obs_source_set_audio_active() in SetRerouteAudio()). */
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_INTERACTION |
+			    OBS_SOURCE_DO_NOT_DUPLICATE;
 	info.icon_type = OBS_ICON_TYPE_BROWSER;
 	info.get_name = browser_get_name;
 	info.create = browser_create;

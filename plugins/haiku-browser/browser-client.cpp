@@ -358,6 +358,8 @@ void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
 {
 	{
 		std::lock_guard<std::mutex> lock(mutex);
+		if (have_config && cfg.reroute_audio != config.reroute_audio)
+			respawn = true;
 		config = cfg;
 		config.width = std::clamp(config.width, 1, OBS_BROWSER_MAX_DIMENSION);
 		config.height = std::clamp(config.height, 1, OBS_BROWSER_MAX_DIMENSION);
@@ -524,21 +526,25 @@ void HaikuBrowserClient::Run()
 	os_set_thread_name("haiku-browser-io");
 
 	for (;;) {
-		bool want_helper;
+		bool want_helper, replace_helper = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex);
 			if (quit)
 				break;
 			want_helper = have_config && !stopped;
-			if (reset_backoff) {
+			if (reset_backoff || respawn) {
 				reset_backoff = false;
 				restarts = 0;
 				next_restart = 0;
 			}
+			if (respawn) {
+				respawn = false;
+				replace_helper = true;
+			}
 		}
 
 		bigtime_t now = system_time();
-		if (!want_helper && helper > 0)
+		if ((!want_helper || replace_helper) && helper > 0)
 			CloseHelper();
 		if (want_helper && helper <= 0 && now >= next_restart)
 			Spawn(now);
@@ -602,6 +608,12 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 	}
 	mark_background_app(path);
 
+	bool rerouted;
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		rerouted = config.reroute_audio;
+	}
+
 	/* SOCK_STREAM: see browser-ipc.hpp. Both ends close-on-exec; the helper's is made inheritable only
 	 * while it is started. The helper adds to the eventfd, we read it; O_NONBLOCK belongs to the open file,
 	 * so the helper's copy never blocks either. */
@@ -640,18 +652,16 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 			char ipc_arg[16], wake_arg[16];
 			snprintf(ipc_arg, sizeof(ipc_arg), "%d", pair[1]);
 			snprintf(wake_arg, sizeof(wake_arg), "%d", child_event);
-			char *argv[8] = {const_cast<char *>(path.c_str()),
-					 const_cast<char *>("--ipc"),
-					 ipc_arg,
-					 const_cast<char *>("--wake"),
-					 wake_arg,
-					 nullptr,
-					 nullptr,
-					 nullptr};
+			char *argv[9] = {const_cast<char *>(path.c_str()), const_cast<char *>("--ipc"), ipc_arg,
+					 const_cast<char *>("--wake"), wake_arg};
+			int argc = 5;
 			if (!storage.empty()) {
-				argv[5] = const_cast<char *>("--storage");
-				argv[6] = const_cast<char *>(storage.c_str());
+				argv[argc++] = const_cast<char *>("--storage");
+				argv[argc++] = const_cast<char *>(storage.c_str());
 			}
+			if (rerouted)
+				argv[argc++] = const_cast<char *>("--audio-rerouted");
+			argv[argc] = nullptr;
 			err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
 		}
 		if (child_event >= 0)
@@ -712,7 +722,10 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 		QueueVisibilityLocked("active", active);
 	}
 
-	BLOG(LOG_INFO, "started browser helper (team %d)", (int)pid);
+	BLOG(LOG_INFO, "started browser helper (team %d%s)", (int)pid,
+	     rerouted ? ", page audio controlled by OBS" : "");
+	if (callbacks.started)
+		Deliver([&]() { callbacks.started(pid); });
 	return true;
 }
 
@@ -900,6 +913,13 @@ void HaikuBrowserClient::ReadSocket(bigtime_t now)
 		}
 		if (got == 0) {
 			HelperDied(now);
+			return;
+		}
+
+		/* More descriptors than the control buffer holds: Renga delivers the bytes with MSG_CTRUNC and closes
+		 * the descriptors (unix_process_ancillary_data(), F-58). A correct helper sends one at a time. */
+		if (message.msg_flags & MSG_CTRUNC) {
+			KillHelper(now, "sent unexpected file descriptors");
 			return;
 		}
 

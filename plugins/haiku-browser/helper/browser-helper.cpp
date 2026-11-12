@@ -18,7 +18,12 @@
 /*
  * obs-haiku-browser: renders one web page for an OBS browser source or browser dock with HaikuWebKit.
  *
- *   obs-haiku-browser --ipc <socket fd> --wake <eventfd> [--storage <dir>]
+ *   obs-haiku-browser --ipc <socket fd> --wake <eventfd> [--storage <dir>] [--audio-rerouted]
+ *
+ * --audio-rerouted: the source has "Control audio via OBS"; the helper registers under
+ * OBS_BROWSER_HELPER_REROUTED_SIGNATURE instead of OBS_BROWSER_HELPER_SIGNATURE so that the system mixer can
+ * tell its streams apart (../browser-audio.hpp). BApplication prints that the signature differs from the
+ * executable's; that is expected.
  *
  * One process per browser instance: a page that hangs or crashes WebKit only takes its own helper down, and
  * the OBS side restarts it. See ../browser-ipc.hpp for the protocol; both descriptors are inherited from OBS.
@@ -295,8 +300,8 @@ private:
 class HelperApp : public BApplication {
 public:
 	/* storage: the resolved storage directory (see resolve_storage_dir()); empty if there is none */
-	HelperApp(int wake_fd, const std::string &storage)
-		: BApplication(OBS_BROWSER_HELPER_SIGNATURE),
+	HelperApp(int wake_fd, const std::string &storage, const char *signature)
+		: BApplication(signature),
 		  wake_fd(wake_fd),
 		  storage(storage)
 	{
@@ -1028,6 +1033,7 @@ int main(int argc, char **argv)
 {
 	int ipc_fd = -1, wake_fd = -1;
 	const char *storage = nullptr;
+	bool audio_rerouted = false;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--ipc") && i + 1 < argc)
@@ -1036,11 +1042,14 @@ int main(int argc, char **argv)
 			wake_fd = descriptor_arg(argv[++i]);
 		else if (!strcmp(argv[i], "--storage") && i + 1 < argc)
 			storage = argv[++i];
+		else if (!strcmp(argv[i], "--audio-rerouted"))
+			audio_rerouted = true;
 	}
 
 	struct stat st;
 	if (ipc_fd < 0 || wake_fd < 0 || fstat(ipc_fd, &st) != 0 || !S_ISSOCK(st.st_mode)) {
-		fprintf(stderr, "usage: %s --ipc <fd> --wake <fd> [--storage <dir>]\n", argv[0]);
+		fprintf(stderr, "usage: %s --ipc <fd> --wake <fd> [--storage <dir>] [--audio-rerouted]\n",
+			argv[0]);
 		fprintf(stderr, "This helper is started by OBS Studio's browser source; it is not meant to be run by hand.\n");
 		return 1;
 	}
@@ -1055,7 +1064,11 @@ int main(int argc, char **argv)
 	Channel connection(ipc_fd);
 	channel = &connection;
 
-	HelperApp app(wake_fd, storage_dir);
+	/* BApplication registers with the signature given here (BApplication::_InitData(): AddApplication() with
+	 * the constructor's signature), and the mixer names a stream's application by the registered one
+	 * (AudioMixer::_IdentifyApplication(): be_roster->GetRunningAppInfo() of the producer port's team). */
+	HelperApp app(wake_fd, storage_dir,
+		      audio_rerouted ? OBS_BROWSER_HELPER_REROUTED_SIGNATURE : OBS_BROWSER_HELPER_SIGNATURE);
 	const thread_id reader = spawn_thread(socket_reader, "obs browser ipc", B_NORMAL_PRIORITY, nullptr);
 	resume_thread(reader);
 	app.Run();
