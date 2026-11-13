@@ -22,31 +22,30 @@
  * any camera (CodyCam, the Media preferences, Chromium). It is fed through BPrivate::VirtualCameraFeeder from the
  * header-only private header VirtualCamera.h: Connect(width, height, fieldRate, slotCount) sends a memfd with
  * slotCount B_RGB32 frame slots to the node over the local SOCK_SEQPACKET socket VIRTUAL_CAMERA_SOCKET, and
- * WriteFrame(bits, bytesPerRow, time) copies one frame into the next slot and announces it with a small message.
- * The node scales what it gets to whatever size its consumer connected with.
+ * WriteFrame() copies one frame into the next slot and announces it with a small message. The node scales what
+ * it gets to whatever size its consumer connected with.
  *
  * This module registers the output type "virtualcam_output", the id the frontend looks for (frontend/utility/
  * VCamConfig.hpp, VIRTUAL_CAM_ID), as plugins/linux-v4l2 and plugins/mac-virtualcam do. The frontend chooses what
  * the camera shows (program, preview, a scene or a source: OBSBasicVCamConfig) by giving the output a video_t
  * with obs_output_set_media(); this output just sends whatever video it is given, at that video's size.
  *
- * Threads:
- *  - start()/stop()/destroy() run on the thread that starts or stops the output (the UI thread, or e.g.
- *    obs-websocket's); libobs does not call them concurrently for one output.
- *  - raw_video() runs on libobs' video output thread. It only copies the frame into a buffer it owns and puts it
- *    into a one-slot mailbox, dropping the frame that was there if the writer has not taken it yet.
- *  - The writer thread takes frames from the mailbox and calls WriteFrame(). WriteFrame() ends in a blocking
- *    send() on the socket, which waits whenever the node's socket buffer is full (the node not reading, e.g. a
- *    busy or stuck media_addon_server), so it must not run on the video thread, which renders for every other
- *    output too.
- * VirtualCameraFeeder is "not thread safe: one thread at a time" (VirtualCamera.h). Here it is used by start()
- * before the writer exists, then only by the writer, and by stop()/start()/destroy() again after the writer has
- * been joined; pthread_create() and pthread_join() order the accesses.
+ * Threads: raw_video() runs on libobs' video output thread and calls WriteFrame(..., 0) itself (F-58 batch 2,
+ * OBS request O-20, Renga commit 677afa3d). With a timeout of 0 WriteFrame() never waits: it first polls the
+ * socket, and if the node has not taken the previous frames (media_addon_server busy, stopped or hung) it returns
+ * B_WOULD_BLOCK without copying, and the frame counts as dropped; the feed stays connected. Otherwise it copies
+ * the frame once, row by row (so OBS's line size needs no copy of ours), into the shared memfd and sends a
+ * 16-byte message with MSG_DONTWAIT. The copy is what the previous design (a writer thread fed through a
+ * one-slot mailbox) also did on this thread, into the mailbox: about 8 MB at 1080p, 1-2 ms, which the video
+ * thread can afford; the writer's second copy, its thread and the mailbox are gone. Disconnect() never waits for
+ * the node either (it shuts the socket down first), so stop() cannot hang.
+ * VirtualCameraFeeder is "not thread safe: one thread at a time" (VirtualCamera.h), and libobs' video thread may
+ * still call raw_video() for a moment after stop() (obs_output_end_data_capture() stops the callbacks on a
+ * thread of its own). So every use of the feeder is under `feed_mutex`; nothing under it waits for anything.
  */
 
 #include <obs-module.h>
 #include <media-io/video-io.h>
-#include <util/bmem.h>
 #include <util/dstr.h>
 #include <util/platform.h>
 #include <util/threading.h>
@@ -62,7 +61,6 @@
 #include <string.h>
 
 #include <new>
-#include <utility>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("haiku-virtualcam", "en-US")
@@ -76,35 +74,25 @@ MODULE_EXPORT const char *obs_module_description(void)
 namespace {
 
 /* The feeder's default (VirtualCamera.h): one slot the node may be copying, one with the newest frame, one being
- * written. More only adds memory: frames are dropped in our mailbox, not queued in the slots. */
+ * written. More only adds memory; a frame that finds no room is dropped, not queued. */
 constexpr uint32 kSlotCount = 3;
+
+/* How often a summary of dropped frames is logged while frames are being dropped (os_gettime_ns()) */
+constexpr uint64_t kDropReportInterval = 60000000000ULL;
 
 struct haiku_vcam {
 	obs_output_t *output = nullptr;
+
+	/* Guards `feeder` and the counters (see the top of the file). */
+	pthread_mutex_t feed_mutex;
 	BPrivate::VirtualCameraFeeder feeder;
+	uint64_t sent = 0;
+	uint64_t dropped = 0;
+	uint64_t report_sent = 0; /* the counts at the last summary */
+	uint64_t report_dropped = 0;
+	uint64_t next_report = 0;
 
-	uint32_t width = 0;
-	uint32_t height = 0;
-	size_t buffer_size = 0;
-
-	/* Three frame buffers that change hands, so that nobody copies a frame while holding the mutex:
-	 * `fill` belongs to raw_video(), `ready` is the mailbox (guarded by `mutex`), `write` belongs to the writer.
-	 * raw_video() and the writer swap their buffer with `ready` under the mutex. */
-	uint8_t *fill = nullptr;
-	uint8_t *ready = nullptr;
-	uint8_t *write = nullptr;
-	bigtime_t fill_time = 0;
-	bigtime_t ready_time = 0;
-
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	bool ready_full = false; /* guarded by mutex */
-	bool quit = false;       /* guarded by mutex */
-
-	pthread_t writer;
-	bool writer_running = false; /* touched only by start()/stop()/destroy() */
-
-	/* Set by the writer when the feed broke; raw_video() then stops copying frames nobody will send. */
+	/* Set when the feed broke; raw_video() then does nothing until the next start(). */
 	volatile bool failed = false;
 };
 
@@ -126,88 +114,17 @@ void set_error(haiku_vcam *vcam, const char *text_id, status_t status)
 	dstr_free(&message);
 }
 
-void *writer_thread(void *data)
+/* feed_mutex held. Ends the feed and logs what it sent. */
+void disconnect_locked(haiku_vcam *vcam, bool log_totals)
 {
-	haiku_vcam *vcam = static_cast<haiku_vcam *>(data);
-
-	/* WriteFrame() uses send() without MSG_NOSIGNAL: if media_addon_server goes away, send() fails with EPIPE
-	 * and Haiku's socket layer raises SIGPIPE in the sending thread (src/add-ons/kernel/network/stack/
-	 * net_socket.cpp). The frontend blocks SIGPIPE in main() before any thread is made (obs-main.cpp), and
-	 * threads inherit that mask; blocking it here as well keeps libobs users without that frontend safe. The
-	 * failure is then reported by WriteFrame()'s return value. */
-	sigset_t pipe_set;
-	sigemptyset(&pipe_set);
-	sigaddset(&pipe_set, SIGPIPE);
-	pthread_sigmask(SIG_BLOCK, &pipe_set, nullptr);
-
-	os_set_thread_name("haiku-virtualcam: writer");
-
-	const uint32 bytes_per_row = vcam->width * 4;
-	status_t status = B_OK;
-	bool stopping = false;
-
-	pthread_mutex_lock(&vcam->mutex);
-	for (;;) {
-		while (!vcam->ready_full && !vcam->quit) {
-			pthread_cond_wait(&vcam->cond, &vcam->mutex);
-		}
-		if (vcam->quit) {
-			stopping = true;
-			break;
-		}
-		std::swap(vcam->write, vcam->ready);
-		bigtime_t time = vcam->ready_time;
-		vcam->ready_full = false;
-		pthread_mutex_unlock(&vcam->mutex);
-
-		status = vcam->feeder.WriteFrame(vcam->write, bytes_per_row, time);
-
-		pthread_mutex_lock(&vcam->mutex);
-		if (status != B_OK) {
-			stopping = vcam->quit;
-			break;
-		}
+	vcam->feeder.Disconnect();
+	if (log_totals && (vcam->sent || vcam->dropped)) {
+		blog(LOG_INFO,
+		     "[haiku-virtualcam] %llu frames sent, %llu dropped (the Virtual Camera had not taken the "
+		     "previous frames yet)",
+		     (unsigned long long)vcam->sent, (unsigned long long)vcam->dropped);
 	}
-	pthread_mutex_unlock(&vcam->mutex);
-
-	if (status != B_OK) {
-		/* WriteFrame() has already disconnected the feeder (VirtualCamera.h). When stop() is not under way,
-		 * end the output the way network outputs do on a lost connection: libobs ends the data capture and
-		 * emits "stop" with the code, and the frontend shows the last error. Our stop() is not called then;
-		 * the next start() or destroy() joins this thread. */
-		os_atomic_set_bool(&vcam->failed, true);
-		if (!stopping) {
-			set_error(vcam, "Error.Lost", status);
-			obs_output_signal_stop(vcam->output, OBS_OUTPUT_ERROR);
-		}
-	}
-	return nullptr;
-}
-
-/* Joins the writer, if one runs or ended on its own after a failure. */
-void stop_writer(haiku_vcam *vcam)
-{
-	if (!vcam->writer_running) {
-		return;
-	}
-	pthread_mutex_lock(&vcam->mutex);
-	vcam->quit = true;
-	pthread_cond_signal(&vcam->cond);
-	pthread_mutex_unlock(&vcam->mutex);
-	/* Waits at most for one WriteFrame(): a frame copy and a send() that the node normally takes at once (its
-	 * feed thread only receives these messages). It could wait longer only if media_addon_server stopped
-	 * reading without closing the socket. */
-	pthread_join(vcam->writer, nullptr);
-	vcam->writer_running = false;
-}
-
-void free_buffers(haiku_vcam *vcam)
-{
-	bfree(vcam->fill);
-	bfree(vcam->ready);
-	bfree(vcam->write);
-	vcam->fill = vcam->ready = vcam->write = nullptr;
-	vcam->buffer_size = 0;
+	vcam->sent = vcam->dropped = vcam->report_sent = vcam->report_dropped = 0;
 }
 
 void *vcam_create(obs_data_t *, obs_output_t *output)
@@ -217,8 +134,7 @@ void *vcam_create(obs_data_t *, obs_output_t *output)
 		return nullptr;
 	}
 	vcam->output = output;
-	pthread_mutex_init(&vcam->mutex, nullptr);
-	pthread_cond_init(&vcam->cond, nullptr);
+	pthread_mutex_init(&vcam->feed_mutex, nullptr);
 	return vcam;
 }
 
@@ -227,21 +143,16 @@ void vcam_destroy(void *data)
 	haiku_vcam *vcam = static_cast<haiku_vcam *>(data);
 	/* libobs stops an active output and waits for its data capture to end (obs_output_destroy()) before it
 	 * calls destroy(), so raw_video() no longer runs. */
-	stop_writer(vcam);
-	vcam->feeder.Disconnect();
-	free_buffers(vcam);
-	pthread_cond_destroy(&vcam->cond);
-	pthread_mutex_destroy(&vcam->mutex);
+	pthread_mutex_lock(&vcam->feed_mutex);
+	disconnect_locked(vcam, false);
+	pthread_mutex_unlock(&vcam->feed_mutex);
+	pthread_mutex_destroy(&vcam->feed_mutex);
 	delete vcam;
 }
 
 bool vcam_start(void *data)
 {
 	haiku_vcam *vcam = static_cast<haiku_vcam *>(data);
-
-	/* A writer that ended on its own after a failure (libobs ended the capture without calling stop()). */
-	stop_writer(vcam);
-	vcam->feeder.Disconnect();
 
 	video_t *video = obs_output_video(vcam->output);
 	if (!video) {
@@ -262,9 +173,15 @@ bool vcam_start(void *data)
 	}
 	const float fps = (float)info->fps_num / (float)info->fps_den;
 
-	/* One request and its reply on the local socket; the node's feed thread answers at once (B_OK, or B_BUSY
-	 * from its poll loop while another program feeds the camera). */
-	status_t status = vcam->feeder.Connect(width, height, fps, kSlotCount);
+	/* libobs starts an output only after the previous data capture has fully ended (obs_output_actual_start()
+	 * waits for stopping_event), so raw_video() does not run here. One request and its reply on the local
+	 * socket; the node's feed thread answers at once (B_OK, or B_BUSY from its poll loop while another program
+	 * feeds the camera). A feed left over from a failure is replaced (Connect() disconnects first). */
+	pthread_mutex_lock(&vcam->feed_mutex);
+	disconnect_locked(vcam, false);
+	const status_t status = vcam->feeder.Connect(width, height, fps, kSlotCount);
+	vcam->next_report = os_gettime_ns() + kDropReportInterval;
+	pthread_mutex_unlock(&vcam->feed_mutex);
 	if (status != B_OK) {
 		if (status == B_BUSY) {
 			set_error(vcam, "Error.Busy", B_OK);
@@ -275,19 +192,6 @@ bool vcam_start(void *data)
 		}
 		return false;
 	}
-
-	const size_t size = (size_t)width * 4 * height;
-	if (size != vcam->buffer_size) {
-		free_buffers(vcam);
-		vcam->fill = (uint8_t *)bmalloc(size);
-		vcam->ready = (uint8_t *)bmalloc(size);
-		vcam->write = (uint8_t *)bmalloc(size);
-		vcam->buffer_size = size;
-	}
-	vcam->width = width;
-	vcam->height = height;
-	vcam->ready_full = false;
-	vcam->quit = false;
 	os_atomic_set_bool(&vcam->failed, false);
 
 	/* B_RGB32 is B,G,R,A bytes in memory on little-endian x86 (GraphicsDefs.h), which is VIDEO_FORMAT_BGRA;
@@ -302,16 +206,10 @@ bool vcam_start(void *data)
 	conversion.colorspace = info->colorspace;
 	obs_output_set_video_conversion(vcam->output, &conversion);
 
-	if (pthread_create(&vcam->writer, nullptr, writer_thread, vcam) != 0) {
-		vcam->feeder.Disconnect();
-		set_error(vcam, "Error.ConnectFailed", B_NO_MEMORY);
-		return false;
-	}
-	vcam->writer_running = true;
-
 	if (!obs_output_begin_data_capture(vcam->output, 0)) {
-		stop_writer(vcam);
-		vcam->feeder.Disconnect();
+		pthread_mutex_lock(&vcam->feed_mutex);
+		disconnect_locked(vcam, false);
+		pthread_mutex_unlock(&vcam->feed_mutex);
 		return false;
 	}
 
@@ -324,45 +222,92 @@ void vcam_stop(void *data, uint64_t)
 	haiku_vcam *vcam = static_cast<haiku_vcam *>(data);
 
 	/* Ends the raw video callbacks (on libobs' end-data-capture thread, so raw_video() may run a little longer;
-	 * it only fills the mailbox, and the buffers live until the next start() or destroy()). Called even when
-	 * the writer has just signalled a failure: in that case the capture has already ended and this only emits
-	 * "stop" and the stopping event again, which libobs' obs_output_actual_stop() needs to see after it reset
-	 * the event. */
+	 * it finds the feeder disconnected). Called even when raw_video() has just signalled a failure: in that
+	 * case the capture has already ended and this only emits "stop" and the stopping event again, which
+	 * libobs' obs_output_actual_stop() needs to see after it reset the event. Disconnect() does not wait for
+	 * the node (O-20). */
 	obs_output_end_data_capture(vcam->output);
-	stop_writer(vcam);
-	vcam->feeder.Disconnect();
+	pthread_mutex_lock(&vcam->feed_mutex);
+	disconnect_locked(vcam, true);
+	pthread_mutex_unlock(&vcam->feed_mutex);
 	blog(LOG_INFO, "[haiku-virtualcam] stopped");
+}
+
+/* WriteFrame() uses send() without MSG_NOSIGNAL: if media_addon_server goes away, send() fails with EPIPE and
+ * Haiku's socket layer raises SIGPIPE in the sending thread (src/add-ons/kernel/network/stack/net_socket.cpp).
+ * The frontend blocks SIGPIPE in main() before any thread is made (obs-main.cpp), and libobs' threads inherit
+ * that mask; blocking it in the video thread as well (once) keeps libobs users without that frontend safe. The
+ * failure is then reported by WriteFrame()'s return value. */
+void block_sigpipe_once()
+{
+	static thread_local bool blocked = false;
+	if (blocked) {
+		return;
+	}
+	sigset_t pipe_set;
+	sigemptyset(&pipe_set);
+	sigaddset(&pipe_set, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &pipe_set, nullptr);
+	blocked = true;
 }
 
 void vcam_raw_video(void *data, struct video_data *frame)
 {
 	haiku_vcam *vcam = static_cast<haiku_vcam *>(data);
-	if (os_atomic_load_bool(&vcam->failed) || !vcam->fill) {
+	if (os_atomic_load_bool(&vcam->failed)) {
 		return;
 	}
-
-	const size_t row = (size_t)vcam->width * 4;
-	const uint8_t *source = frame->data[0];
-	if (frame->linesize[0] == row) {
-		memcpy(vcam->fill, source, row * vcam->height);
-	} else {
-		for (uint32_t y = 0; y < vcam->height; y++) {
-			memcpy(vcam->fill + y * row, source + (size_t)y * frame->linesize[0], row);
-		}
-	}
+	block_sigpipe_once();
 
 	/* OBS timestamps come from os_gettime_ns(), which is clock_gettime(CLOCK_MONOTONIC) (libobs/util/
 	 * platform-nix.c), and Renga's libroot implements CLOCK_MONOTONIC as system_time() (src/system/libroot/
 	 * posix/time/clock_support.cpp). So the frame time in system_time() microseconds, which
 	 * virtual_camera_slot::time is, is the timestamp divided by 1000. */
-	vcam->fill_time = (bigtime_t)(frame->timestamp / 1000);
+	const bigtime_t time = (bigtime_t)(frame->timestamp / 1000);
 
-	pthread_mutex_lock(&vcam->mutex);
-	std::swap(vcam->fill, vcam->ready);
-	vcam->ready_time = vcam->fill_time;
-	vcam->ready_full = true; /* replaces a frame the writer has not taken yet */
-	pthread_cond_signal(&vcam->cond);
-	pthread_mutex_unlock(&vcam->mutex);
+	pthread_mutex_lock(&vcam->feed_mutex);
+	if (!vcam->feeder.IsConnected()) {
+		/* stopped: a last callback before libobs removed it */
+		pthread_mutex_unlock(&vcam->feed_mutex);
+		return;
+	}
+	/* The frame is the size given to Connect(): libobs converts to the size set in start() */
+	const status_t status = vcam->feeder.WriteFrame(frame->data[0], frame->linesize[0], time, 0);
+	if (status == B_OK) {
+		vcam->sent++;
+	} else if (status == B_WOULD_BLOCK) {
+		vcam->dropped++;
+	}
+	const uint64_t now = os_gettime_ns();
+	if (status == B_OK || status == B_WOULD_BLOCK) {
+		if (now >= vcam->next_report) {
+			const uint64_t dropped = vcam->dropped - vcam->report_dropped;
+			if (dropped) {
+				blog(LOG_INFO,
+				     "[haiku-virtualcam] %llu of %llu frames dropped in the last minute (the Virtual "
+				     "Camera was not keeping up)",
+				     (unsigned long long)dropped,
+				     (unsigned long long)(dropped + vcam->sent - vcam->report_sent));
+			}
+			vcam->report_sent = vcam->sent;
+			vcam->report_dropped = vcam->dropped;
+			vcam->next_report = now + kDropReportInterval;
+		}
+		pthread_mutex_unlock(&vcam->feed_mutex);
+		return;
+	}
+	/* Any other error: WriteFrame() has already disconnected the feeder (VirtualCamera.h); this logs the
+	 * totals. */
+	disconnect_locked(vcam, true);
+	pthread_mutex_unlock(&vcam->feed_mutex);
+
+	/* End the output the way network outputs do on a lost connection: libobs ends the data capture on a thread
+	 * of its own (obs_output_end_data_capture_internal()), so this does not wait here, and emits "stop" with
+	 * the code; the frontend shows the last error. Our stop() is not called then; the next start() or
+	 * destroy() cleans up. */
+	os_atomic_set_bool(&vcam->failed, true);
+	set_error(vcam, "Error.Lost", status);
+	obs_output_signal_stop(vcam->output, OBS_OUTPUT_ERROR);
 }
 
 /* Whether this Renga has the virtual camera add-on (Renga d6f1bc7b and later): it is installed as
