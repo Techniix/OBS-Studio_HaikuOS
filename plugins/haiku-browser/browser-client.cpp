@@ -60,6 +60,12 @@ extern char **environ;
  * helper that replaces it gets the configuration anew) */
 #define QUEUE_LIMIT (2 * (size_t)OBS_BROWSER_MAX_MESSAGE)
 
+/* "Control audio via OBS": how long a new helper's messages (the page's URL among them) are held back at most
+ * while the source puts its team on the mixer's loopback-only list (AudioReady()). That takes one read of the
+ * mixer's parameter web and one write; a media server that does not answer in this time must not keep the page
+ * blank. */
+#define AUDIO_HOLD_TIMEOUT 3000000LL
+
 /* A helper told to go (its socket was closed) gets this long before it is killed. The helper gives itself
  * two seconds (browser-helper.cpp, SocketReader). */
 #define REAP_GRACE 3000000LL
@@ -358,14 +364,26 @@ void HaikuBrowserClient::Configure(const HaikuBrowserConfig &cfg)
 {
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		if (have_config && cfg.reroute_audio != config.reroute_audio)
-			respawn = true;
 		config = cfg;
+		/* turned off while a new helper waits for its audio: nothing to wait for any more */
+		if (!config.reroute_audio)
+			audio_hold = -1;
 		config.width = std::clamp(config.width, 1, OBS_BROWSER_MAX_DIMENSION);
 		config.height = std::clamp(config.height, 1, OBS_BROWSER_MAX_DIMENSION);
 		config.fps = std::clamp(config.fps, 1, 120);
 		have_config = true;
 		QueueConfigLocked(); /* no-op without a helper: one started later is sent `config` first thing */
+	}
+	Wake();
+}
+
+void HaikuBrowserClient::AudioReady(pid_t team)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (audio_hold != team)
+			return; /* a helper that is gone, or one that was never held */
+		audio_hold = -1;
 	}
 	Wake();
 }
@@ -526,25 +544,21 @@ void HaikuBrowserClient::Run()
 	os_set_thread_name("haiku-browser-io");
 
 	for (;;) {
-		bool want_helper, replace_helper = false;
+		bool want_helper;
 		{
 			std::lock_guard<std::mutex> lock(mutex);
 			if (quit)
 				break;
 			want_helper = have_config && !stopped;
-			if (reset_backoff || respawn) {
+			if (reset_backoff) {
 				reset_backoff = false;
 				restarts = 0;
 				next_restart = 0;
 			}
-			if (respawn) {
-				respawn = false;
-				replace_helper = true;
-			}
 		}
 
 		bigtime_t now = system_time();
-		if ((!want_helper || replace_helper) && helper > 0)
+		if (!want_helper && helper > 0)
 			CloseHelper();
 		if (want_helper && helper <= 0 && now >= next_restart)
 			Spawn(now);
@@ -556,9 +570,15 @@ void HaikuBrowserClient::Run()
 		/* Nothing to do until a descriptor says so, except the slow ping while a helper runs and the
 		 * restart backoff while none does. */
 		int timeout = -1;
-		if (helper > 0)
+		if (helper > 0) {
 			timeout = (int)(PING_INTERVAL / 2000);
-		else if (want_helper)
+			std::lock_guard<std::mutex> lock(mutex);
+			if (audio_hold == helper) {
+				/* wake up for the end of the audio hold (Housekeeping()) */
+				const bigtime_t left = helper_started + AUDIO_HOLD_TIMEOUT - system_time();
+				timeout = std::min(timeout, (int)std::max<bigtime_t>(left / 1000 + 1, 1));
+			}
+		} else if (want_helper)
 			timeout = (int)std::max<bigtime_t>((next_restart - system_time()) / 1000 + 1, 1);
 
 		struct epoll_event events[4];
@@ -608,12 +628,6 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 	}
 	mark_background_app(path);
 
-	bool rerouted;
-	{
-		std::lock_guard<std::mutex> lock(mutex);
-		rerouted = config.reroute_audio;
-	}
-
 	/* SOCK_STREAM: see browser-ipc.hpp. Both ends close-on-exec; the helper's is made inheritable only
 	 * while it is started. The helper adds to the eventfd, we read it; O_NONBLOCK belongs to the open file,
 	 * so the helper's copy never blocks either. */
@@ -652,15 +666,13 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 			char ipc_arg[16], wake_arg[16];
 			snprintf(ipc_arg, sizeof(ipc_arg), "%d", pair[1]);
 			snprintf(wake_arg, sizeof(wake_arg), "%d", child_event);
-			char *argv[9] = {const_cast<char *>(path.c_str()), const_cast<char *>("--ipc"), ipc_arg,
+			char *argv[8] = {const_cast<char *>(path.c_str()), const_cast<char *>("--ipc"), ipc_arg,
 					 const_cast<char *>("--wake"), wake_arg};
 			int argc = 5;
 			if (!storage.empty()) {
 				argv[argc++] = const_cast<char *>("--storage");
 				argv[argc++] = const_cast<char *>(storage.c_str());
 			}
-			if (rerouted)
-				argv[argc++] = const_cast<char *>("--audio-rerouted");
 			argv[argc] = nullptr;
 			err = posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv, environ);
 		}
@@ -702,9 +714,15 @@ bool HaikuBrowserClient::Spawn(bigtime_t now)
 	ping_outstanding = false;
 	hello = false;
 
+	bool rerouted;
 	{
 		/* The helper reads these once its application runs; until then they wait in the socket. */
 		std::lock_guard<std::mutex> lock(mutex);
+		/* "Control audio via OBS": nothing goes to the helper, so no page is loaded, until the source has
+		 * put the team on the mixer's loopback-only list (AudioReady(); browser-audio.hpp). The helper only
+		 * creates its window before the first message, and plays nothing. */
+		rerouted = config.reroute_audio;
+		audio_hold = rerouted ? pid : -1;
 		queue.clear();
 		queue_bytes = 0;
 		queue_tail_is_move = false;
@@ -743,6 +761,7 @@ void HaikuBrowserClient::CloseHelper()
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		connected = false;
+		audio_hold = -1;
 		queue.clear();
 		queue_bytes = 0;
 		queue_tail_is_move = false;
@@ -839,6 +858,21 @@ void HaikuBrowserClient::Housekeeping(bigtime_t now)
 {
 	if (hello && restarts > 0 && now - helper_started > 30000000LL)
 		restarts = 0;
+
+	if (now - helper_started >= AUDIO_HOLD_TIMEOUT) {
+		bool timed_out = false;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (audio_hold == helper) {
+				audio_hold = -1;
+				timed_out = true;
+			}
+		}
+		if (timed_out)
+			BLOG(LOG_WARNING,
+			     "the page's audio could not be made loopback-only in time (media server busy?); "
+			     "loading the page anyway");
+	}
 
 	if (!ping_outstanding) {
 		if (now - last_ping >= PING_INTERVAL) {
@@ -1130,6 +1164,14 @@ void HaikuBrowserClient::WatchSocket(bool writable)
  * when there is room again. A stream socket may take part of a message: the rest stays in `sending`. */
 void HaikuBrowserClient::Flush(bigtime_t now)
 {
+	{
+		/* held back for "Control audio via OBS" (Spawn()); AudioReady() or Housekeeping() wakes us */
+		std::lock_guard<std::mutex> lock(mutex);
+		if (audio_hold == helper) {
+			WatchSocket(false);
+			return;
+		}
+	}
 	for (;;) {
 		if (sending_offset == sending.size()) {
 			std::lock_guard<std::mutex> lock(mutex);

@@ -28,14 +28,16 @@
  *   payload. Everything is ordered on this one channel, in both directions; data written before the helper's
  *   BApplication exists simply waits in the socket.
  *   Why not SOCK_SEQPACKET, which Renga has with SCM_RIGHTS (F-58, O-13; tests/posix_compat/seqpacket_test.cpp)
- *   and which would keep message boundaries: a message has to fit in the peer's receive FIFO, 64 KiB by default
- *   (net_socket.cpp: receive.buffer_size = 65535, taken by UnixStreamEndpoint::Connect() when the pair is made)
- *   and 128 KiB at most with SO_RCVBUF (UnixFifo.h: UNIX_FIFO_MAXIMAL_CAPACITY). A bigger one is not refused
- *   with EMSGSIZE (the unix protocol module does not declare NET_PROTOCOL_ATOMIC_MESSAGES, unix.cpp), it
- *   waits for room that never comes (UnixFifo::_Write(), _MinimumWritableSize()): with a non-blocking socket,
- *   EWOULDBLOCK forever. OBS -> helper messages carry custom CSS and scripts (OBS_BROWSER_MAX_MESSAGE), and CSS
- *   with embedded data: fonts or images is easily bigger than that; splitting them would bring the framing
- *   back. So the stream stays, with its few lines of framing.
+ *   and which would keep message boundaries: a message has to fit whole in the receiver's buffer, 64 KiB by
+ *   default and 128 KiB at most with SO_RCVBUF (UnixFifo.h: UNIX_FIFO_MAXIMAL_CAPACITY). Since F-58 batch 2
+ *   (O-19) a bigger one fails at once with EMSGSIZE (UnixFifo::_MessageTooLarge()) instead of waiting forever,
+ *   but it still cannot be sent. OBS -> helper messages carry custom CSS and scripts (OBS_BROWSER_MAX_MESSAGE),
+ *   and CSS with embedded data: fonts or images is easily bigger than 128 KiB. They would need a second path
+ *   (a sealed memfd per large message, sent with SCM_RIGHTS, or splitting and reassembly), which is more code
+ *   and more states than the uint32 length prefix it would remove. So the stream stays; on it EMSGSIZE does not
+ *   occur (streams are written in parts), and every send error other than EINTR/EAGAIN means the peer is gone:
+ *   OBS treats it as the helper's death (HaikuBrowserClient::Flush()), the helper as OBS's (Channel::Send(),
+ *   the reader then sees end-of-file).
  *   OBS -> helper payloads are flattened BMessages (the helper trusts OBS, and its handlers are BMessage
  *   handlers anyway). Helper -> OBS payloads are a fixed binary record, obs_browser_event: a renderer can be
  *   taken over by the page it shows, and unflattening a BMessage from it would let it hand OBS arbitrary field
@@ -69,15 +71,10 @@
 
 #define OBS_BROWSER_HELPER_NAME "obs-haiku-browser"
 #define OBS_BROWSER_HELPER_SIGNATURE "application/x-vnd.obs-studio-browser-helper"
-/* The signature of a helper started with "--audio-rerouted", for a browser source with "Control audio via
- * OBS": the system mixer knows a stream's application by signature and remembers its route per signature, so
- * a separate one lets those helpers' streams be routed "loopback only" without touching the route of any other
- * helper (browser-audio.hpp). */
-#define OBS_BROWSER_HELPER_REROUTED_SIGNATURE "application/x-vnd.obs-studio-browser-helper-rerouted"
 
 /* Sent in OBS_BROWSER_MSG_HELLO; the helper is installed next to obs, but an older copy can be left over in
- * non-packaged. */
-#define OBS_BROWSER_PROTOCOL 3 /* 3: --audio-rerouted */
+ * non-packaged. Still 3: dropping the "--audio-rerouted" argument that came with 3 changed no message. */
+#define OBS_BROWSER_PROTOCOL 3
 
 /* Upper bound of one OBS -> helper message (scripts travel in them) */
 #define OBS_BROWSER_MAX_MESSAGE (16u << 20)

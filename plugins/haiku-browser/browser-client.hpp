@@ -50,8 +50,9 @@ struct HaikuBrowserConfig {
 	int fps = 30;
 	std::string css;
 	bool transparent = true;
-	/* "Control audio via OBS": the helper runs under OBS_BROWSER_HELPER_REROUTED_SIGNATURE (browser-audio.hpp).
-	 * Changing it restarts the helper, as obs-browser recreates its browser. */
+	/* "Control audio via OBS": a new helper gets no message, so loads no page, until AudioReady() was called
+	 * with its team (browser-audio.hpp). Changing it does not restart the helper: the mixer switches the
+	 * team's streams that already play at once (Renga F-58, O-18). */
 	bool reroute_audio = false;
 };
 
@@ -87,6 +88,10 @@ public:
 	/* Applies a configuration and remembers it for helpers started later. The first call starts the helper
 	 * (unless the client is stopped). */
 	void Configure(const HaikuBrowserConfig &config);
+
+	/* Any thread: the helper `team` (from the started callback) may load its page; see reroute_audio. Ignored
+	 * for a helper that is no longer the current one. */
+	void AudioReady(pid_t team);
 
 	/* Stop() ends the helper (e.g. "shutdown when not visible") and keeps it down; when it returns no
 	 * callback is running and none follows. Start() brings the helper back with the last configuration. */
@@ -148,7 +153,7 @@ private:
 	bool stopped = false;
 	bool quit = false;
 	bool reset_backoff = false;
-	bool respawn = false;   /* the helper's command line changed (reroute_audio): replace a running one */
+	pid_t audio_hold = -1;  /* the helper whose messages are held back for reroute_audio, -1: none */
 	bool connected = false; /* a helper is running: messages are queued for it */
 	std::deque<std::vector<uint8_t>> queue;
 	size_t queue_bytes = 0;

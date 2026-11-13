@@ -70,9 +70,10 @@ struct BrowserSource {
 
 	/* "Control audio via OBS": present while reroute_audio is on. Created and destroyed in browser_update()
 	 * (UI thread), told the helper's team from the client's I/O thread; neither waits for the media server
-	 * (browser-audio.hpp). */
+	 * (browser-audio.hpp). Destroyed before `client`: its ready callback calls the client. */
 	std::mutex audio_mutex;
 	std::unique_ptr<BrowserAudioReroute> audio;
+	pid_t helper_team = -1; /* the last helper started, under audio_mutex: for turning the option on */
 
 	void OutputFrame(const HaikuBrowserFrame &frame);
 	void HelperStarted(pid_t team);
@@ -117,6 +118,7 @@ void BrowserSource::OutputFrame(const HaikuBrowserFrame &frame)
 void BrowserSource::HelperStarted(pid_t team)
 {
 	std::lock_guard<std::mutex> lock(audio_mutex);
+	helper_team = team;
 	if (audio)
 		audio->SetHelperTeam(team);
 }
@@ -126,12 +128,19 @@ void BrowserSource::SetRerouteAudio(bool on)
 	{
 		std::lock_guard<std::mutex> lock(audio_mutex);
 		if (on && !audio) {
-			/* No team yet: a helper that is running has the other signature and is replaced (the
-			 * client restarts it whenever reroute_audio changes, and starts the first one only after
-			 * this); HelperStarted() passes the new one's team. */
-			audio = std::make_unique<BrowserAudioReroute>(source);
+			/* A new helper (Configure() starts the first one only after this) is held back by the client
+			 * until the team is loopback-only; `ready` releases it. A helper that already runs is switched
+			 * at once, streams included, without a reload (O-18). The client outlives this object
+			 * (browser_destroy()). */
+			HaikuBrowserClient *const c = client.get();
+			audio = std::make_unique<BrowserAudioReroute>(source,
+								      [c](team_id team) { c->AudioReady(team); });
+			if (helper_team > 0)
+				audio->SetHelperTeam(helper_team);
 		} else if (!on) {
-			audio.reset(); /* returns at once; its thread releases the loopback */
+			/* returns at once; its thread takes the team off the loopback-only list and releases the
+			 * loopback */
+			audio.reset();
 		}
 	}
 	/* as obs-browser: the source is listed in the audio mixer only while it has audio */
@@ -167,7 +176,7 @@ void browser_update(void *data, obs_data_t *settings)
 	cfg.css = obs_data_get_string(settings, S_CSS);
 	cfg.transparent = true;
 	cfg.reroute_audio = obs_data_get_bool(settings, S_REROUTE_AUDIO);
-	/* before Configure(): the loopback must exist when the helper that Configure() restarts reports its team */
+	/* before Configure(): the instance must exist when the helper that Configure() may start reports its team */
 	bs->SetRerouteAudio(cfg.reroute_audio);
 
 	const bool was_shutdown = bs->shutdown_when_hidden;
@@ -215,8 +224,17 @@ void *browser_create(obs_data_t *settings, obs_source_t *source)
 void browser_destroy(void *data)
 {
 	BrowserSource *bs = static_cast<BrowserSource *>(data);
+	{
+		/* First, so that its ready callback (which calls the client) has ended. The helper goes with the
+		 * client below: its team stays loopback-only until it has quit. No audio is output after this; the
+		 * loopback is released by the instance's own thread. A started callback until then finds no
+		 * instance. */
+		std::lock_guard<std::mutex> lock(bs->audio_mutex);
+		if (bs->audio)
+			bs->audio->HelperClosing();
+		bs->audio.reset();
+	}
 	bs->client.reset(); /* joins its I/O thread: no frame or started callback runs after this */
-	bs->audio.reset();  /* no audio is output after this; the loopback is released by its own thread */
 	delete bs;
 }
 

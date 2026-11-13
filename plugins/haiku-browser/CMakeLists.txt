@@ -34,7 +34,7 @@ if(NOT HaikuWebKit_INCLUDE_DIR OR NOT HaikuWebKit_LIBRARY OR NOT JavaScriptCore_
 endif()
 
 # Renga's private Media Kit headers (haiku_devel): AudioStreamControl.h, header-only on public Media Kit API,
-# for "Control audio via OBS" (browser-audio.cpp: loopback by team and loopback-only routes, Renga F-58)
+# for "Control audio via OBS" (browser-audio.cpp: loopback by team and loopback-only teams, Renga F-58 O-3/O-18)
 find_path(
   HaikuBrowserMediaPrivate_INCLUDE_DIR
   NAMES AudioStreamControl.h

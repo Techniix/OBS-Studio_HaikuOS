@@ -18,7 +18,6 @@
 /* See browser-audio.hpp for what this does and why. */
 
 #include "browser-audio.hpp"
-#include "browser-ipc.hpp"
 
 #include <util/platform.h>
 #include <util/threading.h>
@@ -28,16 +27,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <list>
 #include <mutex>
-#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <vector>
 
 #include <string.h>
-#include <strings.h>
 
 #include <MediaAddOn.h>
 #include <MediaRecorder.h>
@@ -49,15 +46,12 @@
 
 #define ALOG(level, fmt, ...) blog(level, "[haiku-browser] %s: " fmt, state->name.c_str(), ##__VA_ARGS__)
 
-/* How often the worker looks at the mixer's inputs (one round trip: GetConnectedInputsFor()). The whole
- * parameter web is read (AudioStreamControl::Update(), a round trip per parameter) only when the inputs
- * changed, and every FULL_SCAN_INTERVAL in case a route was changed by hand in the Audio preferences. */
-#define POLL_INTERVAL_MS 1000
-#define FULL_SCAN_INTERVAL_US 10000000LL
-/* how long to wait before trying again to set up a loopback that could not be set up */
+/* How often an idle worker checks that its loopback still exists (get_port_info(), no round trip to the media
+ * server): the media services may have been restarted, and the new mixer knows neither the loopback nor the
+ * loopback-only team. */
+#define CHECK_INTERVAL_MS 2000
+/* how long to wait before trying again what could not be set up (loopback, loopback-only team) */
 #define RETRY_INTERVAL_US 2000000LL
-/* mixer inputs compared per poll; a mixer with more streams is just rescanned more often */
-#define MAX_INPUTS 64
 
 /* a converted time further than this from now is not believed (libobs gives up at 2 s, MAX_TS_VAR) */
 #define MAX_CLOCK_OFFSET_US 1000000
@@ -77,9 +71,14 @@ struct BrowserAudioReroute::State {
 	/* set by the worker as its last action; the registry joins finished workers */
 	std::atomic_bool done{false};
 
-	/* --- audio output, under `output_mutex` --- */
+	/* the destructor ran without HelperClosing(): take the team off the loopback-only list on the way out */
+	bool restore = true;
+
+	/* --- what the worker hands out, under `output_mutex` --- */
 	std::mutex output_mutex;
-	obs_source_t *source = nullptr; /* null once the source let go: nothing is output after that */
+	/* both cleared once the instance let go: nothing is output and nobody is called after that */
+	obs_source_t *source = nullptr;
+	std::function<void(team_id)> ready;
 };
 
 namespace {
@@ -414,77 +413,95 @@ void Loopback::Close()
 }
 
 /*
- * Routes every stream of a rerouted helper to "None (loopback only)". Cheap while nothing changes: one
- * round trip for the list of mixer inputs; the parameter web is read only when that list changed (a stream
- * came or went) or every FULL_SCAN_INTERVAL_US.
+ * The helper's team on the mixer's loopback-only list (O-18, AudioStreamControl::SetTeamLoopbackOnly()). It is
+ * set for the current team only; a previous helper's team stays listed while that helper shuts down and is
+ * forgotten by the mixer when it has quit. Worker thread only.
  */
-class StreamRouter {
+class TeamRoute {
 public:
-	explicit StreamRouter(State *state_) : state(state_) {}
+	explicit TeamRoute(State *state_) : state(state_) {}
 
-	void Poll(BMediaRoster *roster, bigtime_t now)
+	/* The mixer lost its list (the media services were restarted): set it again. */
+	void Forget()
 	{
-		media_node mixer;
-		if (roster->GetAudioMixer(&mixer) != B_OK)
-			return;
-		media_input inputs[MAX_INPUTS];
-		int32 count = 0;
-		const status_t err = roster->GetConnectedInputsFor(mixer, inputs, MAX_INPUTS, &count);
-		roster->ReleaseNode(mixer);
-		if (err != B_OK)
-			return;
+		applied = -1;
+		given_up = -1;
+		next_try = 0;
+	}
 
-		std::vector<int32> ids;
-		for (int32 i = 0; i < count; i++)
-			ids.push_back(inputs[i].destination.id);
-		std::sort(ids.begin(), ids.end());
-		if (ids == last_inputs && now - last_scan < FULL_SCAN_INTERVAL_US)
-			return;
-		last_inputs = std::move(ids);
-		last_scan = now;
-
-		if (streams.Update() != B_OK)
-			return;
-		std::set<int32> seen;
-		for (int32 i = 0; i < streams.CountStreams(); i++) {
-			const BPrivate::AudioStream *stream = streams.StreamAt(i);
-			/* MIME types compare without case */
-			if (strcasecmp(stream->signature.String(), OBS_BROWSER_HELPER_REROUTED_SIGNATURE) != 0)
-				continue;
-			seen.insert(stream->id);
-			if (!stream->hasRoute) {
-				if (!warned_no_route)
-					ALOG(LOG_WARNING,
-					     "the system mixer has no routes by name (renga:routes, Renga F-58): "
-					     "the page's audio is also played on the speakers");
-				warned_no_route = true;
-				continue;
-			}
-			if (stream->loopbackOnly)
-				continue;
-			/* Remembered by the mixer for the rerouted helpers' signature: the next helper's streams start
-			 * out loopback-only, and this is only a safety net (first use, or changed by hand). */
-			const status_t set = streams.SetLoopbackOnly(stream->id, true);
-			if (set == B_OK)
-				ALOG(LOG_INFO, "page audio stream %d is now loopback-only", (int)stream->id);
-			else if (!failed.count(stream->id))
-				ALOG(LOG_WARNING, "cannot route page audio stream %d loopback-only: %s",
-				     (int)stream->id, strerror(set));
-			if (set != B_OK)
-				failed.insert(stream->id);
+	/* Puts `team` on the list unless it is there; then calls `ready` once per team, whether that worked or
+	 * not (the page must not stay blank because of a missing mixer). */
+	void Apply(team_id team, bigtime_t now)
+	{
+		if (team != wanted) {
+			wanted = team;
+			next_try = 0;
+			notified = false;
 		}
-		/* forget streams that are gone, so the set does not grow */
-		for (auto it = failed.begin(); it != failed.end();)
-			it = seen.count(*it) ? std::next(it) : failed.erase(it);
+		if (applied != team && given_up != team && now >= next_try) {
+			/* Update() reads the mixer's parameter web, which SetTeamLoopbackOnly() needs (_FindKind()) */
+			status_t status = control.Update();
+			if (status == B_OK)
+				status = control.SetTeamLoopbackOnly(team, true);
+			if (status == B_OK) {
+				applied = team;
+				ALOG(LOG_INFO,
+				     "browser helper team %d plays loopback-only (not on the speakers, not in "
+				     "Desktop Audio)",
+				     (int)team);
+			} else if (status == B_BAD_VALUE) {
+				/* the team no longer runs (stopped while hidden, or crashed): its successor is reported
+				 * with the started callback */
+				given_up = team;
+				ALOG(LOG_INFO, "browser helper team %d no longer runs", (int)team);
+			} else if (status == B_ENTRY_NOT_FOUND) {
+				/* the mixer has no "renga:loopback_only_teams" (older than F-58 batch 2) */
+				given_up = team;
+				ALOG(LOG_WARNING,
+				     "cannot make browser helper team %d loopback-only (the system mixer does not support "
+				     "it): the page's audio may also play on the speakers and in Desktop Audio",
+				     (int)team);
+			} else {
+				/* the mixer is not there (yet), or the media server did not answer: again later */
+				next_try = now + RETRY_INTERVAL_US;
+				if (!notified)
+					ALOG(LOG_WARNING,
+					     "cannot make browser helper team %d loopback-only yet (%s); retrying",
+					     (int)team, strerror(status));
+			}
+		}
+		if (!notified) {
+			notified = true;
+			std::lock_guard<std::mutex> lock(state->output_mutex);
+			if (state->ready)
+				state->ready(team);
+		}
+	}
+
+	/* The option was turned off: the page plays as its own settings say again. */
+	void Restore()
+	{
+		if (applied <= 0)
+			return;
+		status_t status = control.Update();
+		if (status == B_OK)
+			status = control.SetTeamLoopbackOnly(applied, false);
+		if (status == B_OK)
+			ALOG(LOG_INFO, "browser helper team %d plays on the speakers again", (int)applied);
+		else
+			ALOG(LOG_WARNING, "cannot take browser helper team %d off the loopback-only list: %s",
+			     (int)applied, strerror(status));
+		applied = -1;
 	}
 
 private:
 	State *const state;
-	BPrivate::AudioStreamControl streams; /* not thread safe: this worker's own */
-	std::vector<int32> last_inputs;
-	bigtime_t last_scan = 0;
-	bool warned_no_route = false;
-	std::set<int32> failed;
+	BPrivate::AudioStreamControl control; /* not thread safe: this worker's own */
+	team_id wanted = -1;
+	team_id applied = -1;
+	team_id given_up = -1;
+	bigtime_t next_try = 0;
+	bool notified = false;
 };
 
 void run_worker(std::shared_ptr<State> state)
@@ -492,18 +509,23 @@ void run_worker(std::shared_ptr<State> state)
 	os_set_thread_name("haiku-browser-audio");
 	{
 		Loopback loopback(state.get());
-		StreamRouter router(state.get());
+		TeamRoute route(state.get());
 		bigtime_t next_open = 0;
 		const char *last_reason = nullptr;
+		bool restore;
 
 		for (;;) {
 			team_id team;
 			{
+				/* Only a retry or the loopback check needs a timeout; otherwise this waits for a new team
+				 * or the end. */
 				std::unique_lock<std::mutex> lock(state->mutex);
-				state->cond.wait_for(lock, std::chrono::milliseconds(POLL_INTERVAL_MS),
+				state->cond.wait_for(lock, std::chrono::milliseconds(CHECK_INTERVAL_MS),
 						     [&]() { return state->quit || state->wake; });
-				if (state->quit)
+				if (state->quit) {
+					restore = state->restore;
 					break;
+				}
 				state->wake = false;
 				team = state->team;
 			}
@@ -511,36 +533,44 @@ void run_worker(std::shared_ptr<State> state)
 			BMediaRoster *roster = BMediaRoster::Roster();
 			if (!roster)
 				continue;
-			const bigtime_t now = system_time();
+			bigtime_t now = system_time();
 
-			/* the media services were restarted: the instance went with the media add-on server */
+			/* the media services were restarted: the instance went with the media add-on server, and the
+			 * new mixer has an empty loopback-only list */
 			if (loopback.IsOpen() && !loopback.NodeAlive()) {
 				ALOG(LOG_WARNING, "the page audio loopback went away (media services restarted?); "
 						  "setting it up again");
 				loopback.Close();
+				route.Forget();
 				next_open = 0;
 			}
 
-			if (team > 0) {
-				if (!loopback.IsOpen()) {
-					const char *reason = nullptr;
-					if (now >= next_open && !loopback.Open(roster, team, &reason)) {
-						if (reason != last_reason)
-							ALOG(LOG_WARNING,
-							     "cannot record the page's audio: %s; retrying", reason);
-						last_reason = reason;
-						next_open = now + RETRY_INTERVAL_US;
-					} else if (loopback.IsOpen()) {
-						last_reason = nullptr;
-					}
-				} else if (loopback.Team() != team && !loopback.SetTeam(team)) {
-					/* set it up anew with the new team at the next turn */
-					loopback.Close();
-				}
-			}
+			if (team <= 0)
+				continue;
 
-			router.Poll(roster, now);
+			/* first: the page is held back until this is done */
+			route.Apply(team, now);
+			now = system_time();
+
+			if (!loopback.IsOpen()) {
+				const char *reason = nullptr;
+				if (now >= next_open && !loopback.Open(roster, team, &reason)) {
+					if (reason != last_reason)
+						ALOG(LOG_WARNING, "cannot record the page's audio: %s; retrying",
+						     reason);
+					last_reason = reason;
+					next_open = now + RETRY_INTERVAL_US;
+				} else if (loopback.IsOpen()) {
+					last_reason = nullptr;
+				}
+			} else if (loopback.Team() != team && !loopback.SetTeam(team)) {
+				/* set it up anew with the new team at the next turn */
+				loopback.Close();
+			}
 		}
+
+		if (restore)
+			route.Restore();
 		/* ~Loopback() disconnects and releases the loopback here, on this thread */
 	}
 	state->done = true;
@@ -587,8 +617,11 @@ public:
 		}
 		for (Entry &entry : remaining) {
 			{
+				/* OBS is quitting and the helpers go with it: leave their teams loopback-only, as
+				 * HelperClosing() does, so that no page is heard while it closes */
 				std::lock_guard<std::mutex> lock(entry.state->mutex);
 				entry.state->quit = true;
+				entry.state->restore = false;
 			}
 			entry.state->cond.notify_one();
 			entry.thread.join();
@@ -614,21 +647,24 @@ Workers &workers()
 
 } // namespace
 
-BrowserAudioReroute::BrowserAudioReroute(obs_source_t *source) : state(std::make_shared<State>())
+BrowserAudioReroute::BrowserAudioReroute(obs_source_t *source, std::function<void(team_id)> ready)
+	: state(std::make_shared<State>())
 {
 	const char *name = obs_source_get_name(source);
 	state->name = name ? name : "browser";
 	state->source = source;
+	state->ready = std::move(ready);
 
 	workers().Start(state);
 }
 
 BrowserAudioReroute::~BrowserAudioReroute()
 {
-	/* After this no audio reaches the source; an output already in progress finishes first. */
+	/* After this no audio reaches the source and `ready` is not called; a call in progress finishes first. */
 	{
 		std::lock_guard<std::mutex> lock(state->output_mutex);
 		state->source = nullptr;
+		state->ready = nullptr;
 	}
 	{
 		std::lock_guard<std::mutex> lock(state->mutex);
@@ -647,6 +683,12 @@ void BrowserAudioReroute::SetHelperTeam(team_id team)
 		state->wake = true;
 	}
 	state->cond.notify_one();
+}
+
+void BrowserAudioReroute::HelperClosing()
+{
+	std::lock_guard<std::mutex> lock(state->mutex);
+	state->restore = false;
 }
 
 void haiku_browser_audio_shutdown(void)
