@@ -34,11 +34,11 @@ that file are kept consistent.
 | O-13 | SOCK_SEQPACKET coverage with SCM_RIGHTS in the socket tests | Platform | 3 | Landed (`fcac2cd7`) | F-15 |
 | O-14 | `VideoAccelEncoder` details: bitstream formats, dts/B-frames, rate control, colour, surface release, roster locking | Encoding | 2 | Proposed | F-31 phase 5 |
 | O-15 | H.264 (and HEVC/AV1) in the software reference back end | Encoding | 3 | Proposed | F-31 phase 5 |
-| O-16 | A leftover permission request must not answer the next request | Capture | 3 | Proposed | F-58 follow-up |
-| O-17 | Team of each mixer stream | Audio, browser source | 2 | Proposed | F-58 follow-up |
-| O-18 | Loopback-only routing by team, not remembered | Browser source | 2 | Proposed | F-58 follow-up |
-| O-19 | Refuse oversize UNIX datagram/seqpacket messages with EMSGSIZE | Platform | 3 | Proposed | F-58 follow-up |
-| O-20 | A timeout for VirtualCameraFeeder::WriteFrame() | Virtual camera | 3 | Proposed | F-58 follow-up |
+| O-16 | A leftover permission request must not answer the next request | Capture | 3 | Landed (`a1378d54`) | F-58 follow-up |
+| O-17 | Team of each mixer stream | Audio, browser source | 2 | Landed (`cbd2a2c8`) | F-58 follow-up |
+| O-18 | Loopback-only routing by team, not remembered | Browser source | 2 | Landed (`cbd2a2c8`) | F-58 follow-up |
+| O-19 | Refuse oversize UNIX datagram/seqpacket messages with EMSGSIZE | Platform | 3 | Landed (`a220f582`) | F-58 follow-up |
+| O-20 | A timeout for VirtualCameraFeeder::WriteFrame() | Virtual camera | 3 | Landed (`677afa3d`) | F-58 follow-up |
 
 **Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
 Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
@@ -62,6 +62,14 @@ for OBS are in `docs/partners/OBS.md` there. Interface differences from the prop
 - O-13: three kernel fixes came with the tests (empty messages, descriptors with empty messages, MSG_CTRUNC).
 OBS has adapted to each (OBS commits ab7b54e capture, 13ad317 audio and webcam, 73d1ed8 browser audio, 1237ec5
 virtual camera); the request text below is kept as the original proposal. O-16 to O-20 came up while adapting.
+
+**Landed (Renga, 2026-11-13, F-58 batch 2).** O-16 `a1378d54` (an answer belongs only to its own request;
+"Try again" calls `RequestPermission()` once), O-17 and O-18 `cbd2a2c8` (`AudioStream::team`,
+`FindStream(team_id)`, `SetTeamLoopbackOnly(team, on)`, set before the helper's stream starts, nothing
+remembered), O-19 `a220f582` (`EMSGSIZE` for UNIX datagram/seqpacket messages larger than the receiver's buffer),
+O-20 `677afa3d` (`WriteFrame(..., timeout)`; 0 returns `B_WOULD_BLOCK` instead of waiting; `Disconnect()` never
+waits). Also from Renga (F-59, `a22d9aba`): screen capture reads app_server's back buffer in main memory, so the
+pointer no longer stutters during capture; no change needed in OBS.
 
 Suggested order: O-1 (the most noticeable everyday problem, a small change in the mixer's loopback), then
 O-7 with O-6 (removes a fragile workaround in OBS and a UI freeze), then O-4, then O-5 and O-12 (the
