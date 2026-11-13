@@ -223,6 +223,8 @@ Add each with the **+** button under *Sources*.
   - [ ] While capturing, the Screen recording indicator is shown. *Stop* from the indicator ends the capture; the
         properties show the "stopped" message with *Start capture*, and it does not restart by itself. *Start capture*
         resumes.
+  - [ ] While OBS records (and a capture source is capturing), the recording indicator shows OBS's recording size,
+        growing about once a second, and counted once with two capture sources; it shows no size after recording stops.
   - [ ] With two or more capture sources (Screen and Window Capture) running, *Stop* from the indicator stops all of
         them. *Start capture* in the properties of any one of them restarts all of them.
   - [ ] *Capture* = *Region*: set Left/Top/Width/Height; the source shows exactly that part of the screen and

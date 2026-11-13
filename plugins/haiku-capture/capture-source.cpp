@@ -15,6 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
+#include <atomic>
 #include "capture-source.hpp"
 
 #include <util/threading.h>
@@ -488,6 +489,47 @@ bool CaptureSource::SetState(State new_state)
 	return true;
 }
 
+/*
+ * Recording size for Renga's recording indicator (BScreenCapture::SetOutputSize(), Renga F-59; since O-21,
+ * b734d8f4, app_server keeps one size per team, so every capture source of OBS may report it and the indicator
+ * still counts OBS once). The size is what OBS's own recording outputs have written: the frontend names them
+ * simple_file_output / adv_file_output (ffmpeg_muxer, mp4_output or mov_output) and simple_ffmpeg_output /
+ * adv_ffmpeg_output (custom FFmpeg output); see frontend/utility/SimpleOutput.cpp and AdvancedOutput.cpp. The
+ * replay buffer and the multitrack stream output are not recordings the user sees growing, so they are left out.
+ * libobs' output list is used rather than the frontend API, which is meant for the UI thread.
+ */
+static bool add_recording_bytes(void *param, obs_output_t *output)
+{
+	static const char *const names[] = {"simple_file_output", "adv_file_output", "simple_ffmpeg_output",
+					    "adv_ffmpeg_output"};
+	const char *name = obs_output_get_name(output);
+	if (!name || !obs_output_active(output))
+		return true;
+	for (const char *n : names) {
+		if (strcmp(name, n) == 0) {
+			*(uint64_t *)param += obs_output_get_total_bytes(output);
+			break;
+		}
+	}
+	return true;
+}
+
+static void report_recording_size(uint64_t now)
+{
+	/* At most once a second for the whole module; the indicator shows a coarse size. */
+	static std::atomic<uint64_t> next_report{0};
+	static std::atomic<int64_t> last_bytes{-1};
+	uint64_t due = next_report.load(std::memory_order_relaxed);
+	if (now < due || !next_report.compare_exchange_strong(due, now + 1000000000ULL))
+		return;
+
+	uint64_t bytes = 0;
+	obs_enum_outputs(add_recording_bytes, &bytes);
+	/* 0 when nothing records: the indicator then shows no size rather than the last recording's. */
+	if ((int64_t)bytes != last_bytes.exchange((int64_t)bytes))
+		BScreenCapture::SetOutputSize((int64)bytes);
+}
+
 void CaptureSource::Run()
 {
 	os_set_thread_name("haiku-capture");
@@ -627,6 +669,9 @@ void CaptureSource::Run()
 			stats = Stats();
 			stats.since = os_gettime_ns();
 		}
+
+		if (state.load() == State::Capturing)
+			report_recording_size(os_gettime_ns());
 
 		if (!take_frame) {
 			/* Sleep until the source changes (or Stop(), a restart, a button) */

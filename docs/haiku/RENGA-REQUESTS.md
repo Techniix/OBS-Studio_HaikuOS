@@ -39,7 +39,7 @@ that file are kept consistent.
 | O-18 | Loopback-only routing by team, not remembered | Browser source | 2 | Landed (`cbd2a2c8`) | F-58 follow-up |
 | O-19 | Refuse oversize UNIX datagram/seqpacket messages with EMSGSIZE | Platform | 3 | Landed (`a220f582`) | F-58 follow-up |
 | O-20 | A timeout for VirtualCameraFeeder::WriteFrame() | Virtual camera | 3 | Landed (`677afa3d`) | F-58 follow-up |
-| O-21 | Recording size once per team for the recording indicator | Capture | 3 | Accepted (after F-61/F-67) | F-59 follow-up |
+| O-21 | Recording size once per team for the recording indicator | Capture | 3 | Landed (`b734d8f4`) | F-59 follow-up |
 
 **Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
 Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
@@ -255,9 +255,9 @@ if practical, would let OBS's main codecs be tested end to end. OBS tests with V
   recording indicator, but it sets the value on every session of the team and the indicator adds the sessions
   up (`ScreenRecording.cpp`), so OBS with two capture sources would show the size doubled.
 - **Proposed interface.** Store the output size once per team and have the indicator count each team once.
-- **State (2026-11-13).** Accepted as a small F-58 item after Renga's current batch; `SetOutputSize()` keeps its
-  signature. OBS does not call it yet and will start doing so (from the recording output's byte count) once
-  this lands, so the indicator shows the right size with any number of capture sources.
+- **Landed (2026-11-13, `b734d8f4`).** app_server keeps one output size per team; `GetSessions()` adds
+  `total_team`/`total_bytes`. OBS reports the bytes written by its recording outputs once a second while a
+  capture source is capturing (`plugins/haiku-capture/capture-source.cpp`, `report_recording_size()`).
 
 ### Planned Renga work OBS will use as it lands
 
