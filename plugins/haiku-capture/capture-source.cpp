@@ -69,9 +69,6 @@ struct PermissionGate {
 	/* Created on first need; quit (which deletes it) in capture_permission_shutdown() */
 	PermissionLooper *looper = nullptr;
 	bool shut_down = false;
-	/* See permission_answer() */
-	bool ask_twice = false;
-	int32 last_request = -1;
 	bool unavailable_logged = false;
 	/* After a failed request, no new one before this (os_gettime_ns()): the sources ask again once a second */
 	uint64_t not_before = 0;
@@ -95,7 +92,7 @@ void wake_all_locked(PermissionGate &gate)
 	}
 }
 
-void permission_answer(status_t status, int32 request);
+void permission_answer(status_t status);
 
 /* Receives the app_server's SCREEN_CAPTURE_PERMISSION_ANSWER ('ScPa': "status", "request", "sources";
  * headers/private/app/ScreenCaptureDefs.h) for BScreenCapture::RequestPermission(). */
@@ -109,7 +106,7 @@ public:
 			BLooper::MessageReceived(message);
 			return;
 		}
-		permission_answer((status_t)message->GetInt32("status", B_ERROR), message->GetInt32("request", -1));
+		permission_answer((status_t)message->GetInt32("status", B_ERROR));
 	}
 };
 
@@ -123,17 +120,12 @@ status_t send_request(PermissionGate &gate)
 /*
  * On the looper's thread.
  *
- * Why `ask_twice`: an answer that came from the prompt stays with the app_server's request "for the
- * application's next Start...()" (ScreenCaptureManager::_AnswerRequest()), and the next request uses it up
- * (_Decide()): after "Don't allow" without "Remember my decision" the next RequestPermission() is answered
- * B_NOT_ALLOWED at once, without a prompt, and the one after that asks. A prompt closed unanswered (B_CANCELED)
- * leaves its request too, and _Decide() takes that as a no for the next request as well. So when the user
- * presses "Try again" after either, the first, immediate no (request -1: no prompt was shown) only uses up
- * that leftover, and the question is sent once more. A remembered "Don't allow" is answered no again by the
- * second request, and stays denied. (Recorded as a Renga request: such leftovers should not answer a later
- * RequestPermission().)
+ * Every answer belongs to the request it was given for (F-58 batch 2, O-16; ScreenCaptureManager::
+ * _DropSettledNo() and _AnswerRequest()): after a "Don't allow" that was not remembered, or a prompt closed
+ * without an answer, the next RequestPermission() shows the prompt again. So "Try again" is one request; a
+ * remembered "Don't allow" is answered no at once (request -1) and stays denied.
  */
-void permission_answer(status_t status, int32 request)
+void permission_answer(status_t status)
 {
 	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
@@ -141,16 +133,6 @@ void permission_answer(status_t status, int32 request)
 		/* Unloading, or an answer nobody waits for (only one request is ever out) */
 		return;
 	}
-
-	if (status == B_NOT_ALLOWED && request < 0 && gate.ask_twice) {
-		gate.ask_twice = false;
-		if (send_request(gate) == B_OK) {
-			return; /* still asking */
-		}
-		status = B_ERROR;
-	}
-	gate.ask_twice = false;
-	gate.last_request = request;
 
 	const std::string signature = application_signature();
 	switch (status) {
@@ -264,7 +246,6 @@ void capture_permission_invalidate()
 	std::lock_guard<std::mutex> lock(gate.mutex);
 	if (gate.state == CapturePermission::Granted) {
 		gate.state = CapturePermission::Unknown;
-		gate.ask_twice = false;
 	}
 }
 
@@ -273,8 +254,7 @@ void capture_permission_retry()
 	PermissionGate &gate = permission_gate();
 	std::lock_guard<std::mutex> lock(gate.mutex);
 	if (gate.state == CapturePermission::Denied || gate.state == CapturePermission::NotAnswered) {
-		/* Leftovers on the app_server's side: see permission_answer() */
-		gate.ask_twice = gate.state == CapturePermission::NotAnswered || gate.last_request >= 0;
+		/* The next capture_permission_poll() sends one new request, which prompts again (O-16) */
 		gate.state = CapturePermission::Unknown;
 	}
 }
