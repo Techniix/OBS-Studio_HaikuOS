@@ -39,6 +39,7 @@ that file are kept consistent.
 | O-18 | Loopback-only routing by team, not remembered | Browser source | 2 | Landed (`cbd2a2c8`) | F-58 follow-up |
 | O-19 | Refuse oversize UNIX datagram/seqpacket messages with EMSGSIZE | Platform | 3 | Landed (`a220f582`) | F-58 follow-up |
 | O-20 | A timeout for VirtualCameraFeeder::WriteFrame() | Virtual camera | 3 | Landed (`677afa3d`) | F-58 follow-up |
+| O-21 | Recording size once per team for the recording indicator | Capture | 3 | Proposed | F-59 follow-up |
 
 **Schedule (Renga, 2026-11-11).** O-1 to O-9, O-12 and O-13 are accepted as roadmap batch F-58, after the
 Media Kit is finished, in this order: O-1; O-7 with O-6 (including an asynchronous
@@ -247,6 +248,13 @@ if practical, would let OBS's main codecs be tested end to end. OBS tests with V
   reading without closing the socket, OBS's writer thread blocks, and stopping the virtual camera hangs.
 - **Proposed interface.** A timeout argument (or `SetTimeout()`), or `MSG_NOSIGNAL` with a non-blocking mode
   returning `B_WOULD_BLOCK`.
+
+### O-21 Recording size per team
+
+- **Need.** `BScreenCapture::SetOutputSize()` (`00fae122`) would let OBS show its recording's size in the
+  recording indicator, but it sets the value on every session of the team and the indicator adds the sessions
+  up (`ScreenRecording.cpp`), so OBS with two capture sources would show the size doubled.
+- **Proposed interface.** Store the output size once per team and have the indicator count each team once.
 
 ### Planned Renga work OBS will use as it lands
 

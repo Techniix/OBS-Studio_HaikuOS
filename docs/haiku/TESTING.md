@@ -210,8 +210,9 @@ Add each with the **+** button under *Sources*.
   - [ ] Adding the source shows the *Screen recording* prompt and the properties say it is waiting; OBS's UI
         (preview, menus, other dialogs) stays fully responsive meanwhile. *Allow* starts the capture at once and the
         desktop shows in the preview.
-  - [ ] *Deny*: the properties say OBS isn't allowed and show *Try again*; pressing it shows the prompt again
-        (exactly once). *Deny* with "Remember my decision": *Try again* shows no prompt and the properties stay
+  - [ ] *Deny*: the properties say OBS isn't allowed and show *Try again*; one press shows the prompt again
+        (exactly once; the log has one request per press, O-16). Deny and press *Try again* three times in a row:
+        the prompt comes back each time. *Deny* with "Remember my decision": *Try again* shows no prompt and the properties stay
         "not allowed" until the ScreenRecording preferences allow OBS.
   - [ ] Close the prompt without answering: the properties say the prompt was closed without an answer (not "not
         allowed") and show *Try again*, which shows the prompt again.
@@ -377,19 +378,27 @@ chosen device by name (the mixer's `renga:routes`).
       stale size.
 - [ ] **Control audio via OBS**: open a page that plays sound (a YouTube video, or a local file with an
       `<audio autoplay loop>` element). Without the option, the sound is heard and Desktop Audio's meter moves; the
-      source is not in the audio mixer. Turn the option on: the page reloads, the source appears in the audio mixer
-      and its meter moves, the speakers stay silent (after at most a second the first time) and Desktop Audio's
-      meter does not move. The log shows `started browser helper (team N, page audio controlled by OBS)`,
-      `recording the page's audio ... (team N, ... Hz)` and, the first time, `page audio stream ... is now
-      loopback-only`. Audio preferences show the stream with Output "None (loopback only)". Record a few seconds:
-      the page's sound is in the recording once, in sync with the picture.
-- [ ] With the option on, kill the helper in ProcessController: after it restarts, the log shows `page audio now
-      follows browser helper team M` and the sound comes back in the source only. Two rerouted sources with
-      different pages: each source's meter shows only its own page.
-- [ ] Turn the option off again: the page reloads, its sound is heard and recorded by Desktop Audio, and the source
-      leaves the audio mixer. A browser dock playing sound is heard and recorded by Desktop Audio at all times.
+      source is not in the audio mixer. Turn the option on: the page does **not** reload; at once the source
+      appears in the audio mixer and its meter moves, the speakers go silent and Desktop Audio's meter stops. The
+      log shows `browser helper team N plays loopback-only` and `recording the page's audio ... (team N, ...
+      Hz)`. Audio preferences show the stream with Output "None (loopback only)". Record a few seconds: the
+      page's sound is in the recording once, in sync with the picture.
+- [ ] With the option on, remove the source and add it again (or restart OBS) with the autoplay page: not even
+      the first sound is heard on the speakers. The log shows `started browser helper (team N, page audio
+      controlled by OBS)`, then `browser helper team N plays loopback-only`, and no `could not be made
+      loopback-only in time`. Try it also on a busy system (a build running).
+- [ ] With the option on, kill the helper in ProcessController: after it restarts, the log shows `browser helper
+      team M plays loopback-only` and `page audio now follows browser helper team M`, and the sound comes back in
+      the source only, without a blip on the speakers. Two rerouted sources with different pages: each source's
+      meter shows only its own page.
+- [ ] Turn the option off again: the page keeps playing without a reload, its sound is heard and recorded by
+      Desktop Audio (log: `browser helper team N plays on the speakers again`), and the source leaves the audio
+      mixer. A browser dock playing sound is heard and recorded by Desktop Audio at all times. Quit OBS with a
+      rerouted source playing: no sound reaches the speakers while it closes. A new OBS run's helpers play as
+      usual (nothing is remembered).
 - [ ] Restart the media services (Media preferences) with a rerouted source playing: the log shows `the page audio
-      loopback went away` and the sound returns in the source within a few seconds.
+      loopback went away`, then `plays loopback-only` again, and the sound returns in the source within a few
+      seconds.
 - [ ] Twitch/StreamElements-style alert page or a chat overlay URL you normally use: note whether it renders and
       animates (HaikuWebKit has no WebGL, so WebGL-based overlays won't).
 - [ ] **Custom browser docks**: *Docks → Custom Browser Docks...*, add one with `https://obsproject.com`. The dock
@@ -476,8 +485,14 @@ Needs a Renga image with the virtual camera add-on (`d6f1bc7b` or later). CodyCa
 - [ ] Gear button: Output Type "Preview", "Scene" and "Source" each show the chosen picture in
       CodyCam (the camera restarts when the type is changed while running).
 - [ ] *Stop Virtual Camera*: CodyCam shows the dark grey "no signal" frame within about a second; the log has
-      `[haiku-virtualcam] stopped` and `==== Virtual Camera Stop`. Start and stop five times in a row: no hang,
-      no crash, and the camera works each time.
+      `[haiku-virtualcam] N frames sent, M dropped`, `[haiku-virtualcam] stopped` and `==== Virtual Camera Stop`;
+      M is 0 or small on an idle system. Start and stop five times in a row: no hang, no crash, and the camera
+      works each time.
+- [ ] **Busy system**: with CodyCam showing the camera, load the machine (a build with all cores, or
+      `kill -STOP` the `media_addon_server` for 10 s, then `kill -CONT`). OBS's preview, other outputs and
+      recording keep running without stutter (the video thread never waits for the camera); the log shows
+      `frames dropped in the last minute` lines while the camera lags, and the camera picks up again afterwards.
+      With `media_addon_server` stopped, *Stop Virtual Camera* returns at once.
 - [ ] Change *Settings → Video → Output (Scaled) Resolution* (e.g. 1920x1080 to 1280x720) while stopped, then start
       again: the log names the new size and CodyCam still shows a full, undistorted picture.
 - [ ] **Busy**: while OBS feeds the camera, run the Renga test `media_vcam_test` (or a second OBS instance with

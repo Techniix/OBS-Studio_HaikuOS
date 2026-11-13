@@ -405,7 +405,9 @@ application:
 - The selection is written to the loopback's `renga:loopback_signature` parameter. The mixer compares
   signatures every cycle, so the capture follows the application across restarts.
 - The recorded sound is taken before the master volume, so it does not change with the speaker volume.
-- Per-source audio of a browser source ("Control audio via OBS") uses its own loopback of the helper's team (section 10); its helper runs under a second signature until Renga reports stream teams (O-17, O-18).
+- Per-source audio of a browser source ("Control audio via OBS") uses its own loopback of the helper's team and
+  puts that team on the mixer's loopback-only list (O-3, O-18; section 10). Desktop Audio needs nothing for it:
+  loopback-only streams are left out of all-streams loopbacks.
 
 ## 9. haiku-capture: screen and window capture
 
@@ -443,9 +445,9 @@ are not held up while it is open (O-6).
 - `B_NOT_ALLOWED` (a "no", now or remembered) shows *Not allowed* with *Try again*; `B_CANCELED` (the prompt was
   closed without an answer) shows its own text with *Try again*. A session start that returns `B_TIMED_OUT` (the
   permission was set back to "ask" since) asks again and shows *Waiting for your permission*, not a denial.
-- After a "no" that was not remembered, or a prompt closed unanswered, the app_server keeps the answered (or
-  orphaned) request and answers the next request from it, without a prompt. *Try again* therefore asks twice when
-  the first answer is an immediate no (`capture-source.cpp`, `permission_answer()`; a Renga request).
+- *Try again* sends one `RequestPermission()`. Since F-58 batch 2 (O-16) an answer belongs only to the request it
+  was given for, so after a "no" that was not remembered, or a prompt closed unanswered, the next request shows the
+  prompt again; a remembered "no" is answered at once and stays denied.
 - A stop from the recording indicator (`B_CANCELED` from `NextFrame()`) shows *Start capture*. A user stop is not
   undone automatically.
 - Permission can be set outside OBS with the `ScreenRecording` preferences or
@@ -501,10 +503,14 @@ OBS process                                                obs-haiku-browser (on
   `HaikuBrowserClient` restarts it with backoff.
 - **IPC** (`browser-ipc.hpp`), built on the Linux primitives Renga provides (`memfd_create` with sealing,
   `eventfd`, `epoll`, `SCM_RIGHTS` over `AF_UNIX`):
-  - *Channel.* One `AF_UNIX` `SOCK_STREAM` socketpair per helper, length-framed. Renga's `SOCK_SEQPACKET` (with
-    `SCM_RIGHTS` since F-58, O-13) would keep message boundaries, but a message must fit in the receiver's socket
-    buffer (64 KiB by default, 128 KiB at most), and a bigger one is not refused with `EMSGSIZE`: the send waits
-    for room forever. OBS-to-helper messages carry custom CSS and scripts (up to 16 MiB), so the stream stays.
+  - *Channel.* One `AF_UNIX` `SOCK_STREAM` socketpair per helper, length-framed. Decision (reviewed after F-58
+    batch 2): Renga's `SOCK_SEQPACKET` (with `SCM_RIGHTS` since O-13) would keep message boundaries, and since
+    O-19 a message larger than the receiver's buffer fails at once with `EMSGSIZE` instead of hanging. But that
+    buffer is 64 KiB by default and 128 KiB at most, and OBS-to-helper messages carry custom CSS and scripts (up
+    to 16 MiB). Switching would trade the 4-byte length prefix for a second path for large messages (a sealed
+    memfd per message over `SCM_RIGHTS`, or splitting and reassembly), which is more code, not less. So the
+    stream stays. `EMSGSIZE` does not occur on it; any other send error than `EINTR`/`EAGAIN` means the peer has
+    gone and is handled as its death on both sides.
     OBS to helper: flattened `BMessage`s handled by the existing handlers; messages sent before the helper's looper
     runs wait in the socket. Helper to OBS: a fixed binary event record, so OBS never unflattens data a page could
     shape. A control message with more descriptors than expected (`MSG_CTRUNC`) ends the helper.
@@ -553,17 +559,21 @@ OBS process                                                obs-haiku-browser (on
     `renga:loopback_team` to the helper's team (`AudioStreamControl::SetLoopbackTeam()`) before connecting a
     `BMediaRecorder` (float stereo at the mixer's rate). Time stamps are converted from the mixer's time source as
     in Desktop Audio. When the helper is restarted, the loopback is pointed at the new team.
-  - *Off the speakers and out of Desktop Audio (O-2).* The helper's streams are routed "None (loopback only)"
-    (`SetLoopbackOnly()`). The mixer's parameter web names a stream's application by signature only and remembers
-    routes per signature, so a rerouted source's helper registers as
-    `application/x-vnd.obs-studio-browser-helper-rerouted` (`--audio-rerouted`); other helpers and docks keep the
-    ordinary signature and their routes are never touched. Because the mixer remembers the route, a restarted
-    helper's streams start loopback-only. A worker thread looks at the mixer's inputs once a second and reads the
-    parameter web when they change (or every 10 s), as a safety net for the first use and for routes changed by
-    hand. No Media Kit call is made on the UI or graphics thread, and destroying the source does not wait for the
-    media server.
-  - Changing the option restarts the helper (obs-browser recreates its browser too). Docks have no audio
-    handling.
+  - *Off the speakers and out of Desktop Audio (O-18).* The source puts the helper's team on the mixer's
+    loopback-only list (`AudioStreamControl::SetTeamLoopbackOnly(team, true)`). The mixer applies it to a stream
+    of that team while the stream connects, before its first buffer, and to streams already playing at once; such
+    streams are on no output and left out of every all-streams loopback, Desktop Audio's included. Nothing is
+    remembered, and other helpers and docks are never touched. The mixer accepts any running team, also one
+    without streams, so this is done right after the helper is spawned. To make sure the page cannot play first,
+    the client sends a new helper of a rerouted source nothing, its URL included, until the source reports the
+    team done (`HaikuBrowserClient::AudioReady()`); if the mixer lacks the feature or does not answer within 3 s
+    the page is loaded anyway and a warning is logged. Turning the option off takes the team off the list;
+    destroying the source leaves it there, so the closing helper's last sound stays off the speakers, and the
+    mixer forgets the team when the helper quits. A worker thread per source does every Media Kit call, so none
+    is made on the UI, graphics or I/O thread, and destroying the source does not wait for the media server.
+    Idle, the worker only checks every 2 s that its loopback still exists (media services restarted).
+  - Changing the option does not reload the page: the mixer switches a running helper's streams at once.
+    Docks have no audio handling.
 - **Docks** (`browser-panel.cpp`) implement `QCef`/`QCefWidget` from obs-browser's `panel/browser-panel.hpp` (the
   only file used from that submodule). The widget paints the latest frame and forwards Qt input; title and URL
   changes come back as helper events and are emitted as `titleChanged`/`urlChanged`. Cookie managers map to a
@@ -601,11 +611,7 @@ snippet changed, so updating a submodule can't silently drop a fix.
 
 - **Window capture isolation**: windows in front of the captured one are captured too until Renga has a compositor
   (F-33); the source can pause while the window is covered instead.
-- **Capture permission**: *Try again* after a "no" that was not remembered, or after the prompt was closed
-  unanswered, sends two requests, because the app_server answers the first from the leftover request.
-- **Browser**: no WebGL (HaikuWebKit is built without it). With "Control audio via OBS", the very first sound of a
-  rerouted helper can reach the speakers for up to a second before its stream is routed loopback-only (later
-  helpers start loopback-only because the mixer remembers the route). JavaScript calls that need the frontend (`obsstudio.getCurrentScene`, `setCurrentScene`, …) are not
+- **Browser**: no WebGL (HaikuWebKit is built without it). JavaScript calls that need the frontend (`obsstudio.getCurrentScene`, `setCurrentScene`, …) are not
   implemented yet; `pluginVersion`, `getStatus`, `getControlLevel` and the visibility/activity events are.
 - **Webcam modes**: the UVC side of `renga:video_modes` and of the rate choice is untested on a real camera
   (Renga tested it with synthetic descriptors and the demo producer). A camera's list is known only after the
@@ -614,8 +620,8 @@ snippet changed, so updating a submodule can't silently drop a fix.
   could be made asynchronous with a PBO ring.
 - **Hardware encoding**: none today (x264/FFmpeg software encoders only); needs the Media Kit hardware video API
   (O-11) and Quasar's back end (Q-3).
-- **Virtual camera**: B_RGB32 only, so frames are converted to BGRA on the CPU and copied twice; one feeder at a
-  time system-wide (section 16).
+- **Virtual camera**: B_RGB32 only, so frames are converted to BGRA on the CPU and copied once into the shared
+  memory; one feeder at a time system-wide (section 16).
 - **Zero-copy preview and capture**: needs GPU buffers from capture and shared GPU textures (O-10, Q-2, F-47).
 
 ## 14. Design decisions
@@ -708,10 +714,13 @@ between encoders except the read-only type data.
 with a header and `slotCount` frame slots, connects to the local `SOCK_SEQPACKET` socket
 `/boot/system/var/run/media/virtual_camera`, sends the memfd (`SCM_RIGHTS`) with the configuration and waits for
 the node's reply: `B_OK`, `B_BUSY` when another program feeds the camera, `B_NO_INIT` when the socket does not
-exist (no node: media services not running). `WriteFrame(bits, bytesPerRow, time)` copies a frame into the next
-slot (a per-slot sequence number is odd while it is written; the node retries a copy that raced) and announces it
-with a small message; on a send error it disconnects and returns the error. `Disconnect()` closes everything; the
-node then goes back to "no signal". The feeder is not thread safe.
+exist (no node: media services not running). `WriteFrame(bits, bytesPerRow, time, timeout)` (the timeout since
+F-58 batch 2, O-20, Renga `677afa3d`) first waits at most `timeout` for room on the socket; with 0 it does not wait
+and returns `B_WOULD_BLOCK` without copying if the node has not taken the previous frames, and the feed stays
+connected. Otherwise it copies the frame into the next slot (a per-slot sequence number is odd while it is
+written; the node retries a copy that raced) and announces it with a small `MSG_DONTWAIT` message; on any other
+error it disconnects and returns the error. `Disconnect()` shuts the socket down and closes everything without
+waiting for the node; the node then goes back to "no signal". The feeder is not thread safe.
 
 **Registration.** At module load the output is registered only if `virtual_camera.media_addon` exists in a media
 add-ons directory (`find_paths_etc(B_FIND_PATH_MEDIA_NODES_DIRECTORY, ...)`). The frontend shows *Start Virtual
@@ -728,25 +737,26 @@ BGRA rather than BGRX so the alpha byte is 255, as in the node's own frames. Err
 `obs_output_set_last_error()`, which the frontend shows in its "Failed to start virtual camera" box.
 
 **Frames and threads.** `raw_video()` runs on libobs' video output thread, which renders for every output, and
-must not wait. `WriteFrame()` can: its `send()` blocks while the node's socket buffer is full. So `raw_video()`
-copies the frame into a buffer it owns and swaps it into a one-slot mailbox (an unsent frame there is
-replaced), and a writer thread swaps the mailbox out and calls `WriteFrame()`. Three buffers change hands under a
-mutex; no copy happens with the mutex held. The feeder is used by `start()` before the writer exists, then only
-by the writer, then again after the writer is joined. OBS timestamps are `os_gettime_ns()`, which is
-`CLOCK_MONOTONIC`, which Renga's libroot implements as `system_time()`; the slot time is the timestamp / 1000.
+must not wait. It calls `WriteFrame(frame, linesize, time, 0)` itself: that never waits, and a `B_WOULD_BLOCK`
+counts as a dropped frame. The one copy it makes (row by row, so OBS's line size needs no copy of ours) is about
+8 MB at 1080p, 1-2 ms, the same copy the earlier design made on this thread into a mailbox for a writer thread;
+that thread, the mailbox and its second copy are gone. Frames sent and dropped are logged at stop, and once a
+minute while frames are being dropped. libobs may call `raw_video()` once more after `stop()` (it removes the
+callback on its own thread), so every use of the feeder is under one mutex, under which nothing waits. OBS
+timestamps are `os_gettime_ns()`, which is `CLOCK_MONOTONIC`, which Renga's libroot implements as
+`system_time()`; the slot time is the timestamp / 1000.
 
-**Failure and stop.** If `WriteFrame()` fails mid-stream (media services restarted or crashed), the writer sets
-the last error and calls `obs_output_signal_stop(OBS_OUTPUT_ERROR)`. libobs then ends the data capture without
-calling the output's `stop()`, so the writer is joined by the next `start()` or by `destroy()`. The frontend's
+**Failure and stop.** If `WriteFrame()` fails mid-stream (media services restarted or crashed), `raw_video()` sets
+the last error and calls `obs_output_signal_stop(OBS_OUTPUT_ERROR)`, which ends the data capture on a libobs thread
+of its own and so does not wait on the video thread. libobs does not call the output's `stop()` then; the next
+`start()` or `destroy()` cleans up. The frontend's
 `OBSBasic::OnVirtualCamStop()` (in a `__HAIKU__` block, though nothing in it is Haiku specific) shows the last
 error when the stop code is not `OBS_OUTPUT_SUCCESS`; upstream shows nothing because its outputs never stop
 themselves. `send()` is called without `MSG_NOSIGNAL`, so a broken socket raises SIGPIPE in the sending thread:
-the frontend blocks SIGPIPE for all threads in `main()`, and the writer blocks it again for itself. `stop()` ends
-the data capture, joins the writer (at most one `WriteFrame()` away) and disconnects. The frame buffers live until
-the next `start()` or `destroy()`, because libobs ends the raw video callbacks on another thread after `stop()`
-returns.
+the frontend blocks SIGPIPE for all threads in `main()`, and `raw_video()` blocks it once more for the video thread.
+`stop()` ends the data capture and disconnects; neither waits for the node (O-20).
 
-**Limits.** One CPU colour conversion (when OBS's output format is not BGRA) and two frame copies per frame
-(into the mailbox, into the shared memory), plus the node's copy or scale per consumer. No audio: the camera is a
+**Limits.** One CPU colour conversion (when OBS's output format is not BGRA) and one frame copy per frame
+(into the shared memory), plus the node's copy or scale per consumer. No audio: the camera is a
 video source. HDR output is converted without tone mapping. One feeder system-wide. The Virtual Camera is also
 listed by OBS's own *Video Capture Device* source; capturing it in the OBS that feeds it makes a feedback loop.
