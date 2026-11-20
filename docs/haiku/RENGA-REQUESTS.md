@@ -259,6 +259,20 @@ if practical, would let OBS's main codecs be tested end to end. OBS tests with V
   `total_team`/`total_bytes`. OBS reports the bytes written by its recording outputs once a second while a
   capture source is capturing (`plugins/haiku-capture/capture-source.cpp`, `report_recording_size()`).
 
+### Renga batch 5 (2026-11-20, `49102adf`): hide from capture, streamer mode, crash-safe recordings
+
+Not OBS requests; Renga's notes for recorders. How OBS uses them:
+
+- **Hide from capture.** OBS's existing "Hide OBS windows from screen capture" setting (Settings > General, off by
+  default) calls `BScreenCapture::SetWindowHidden()` for its non-projector windows
+  (`frontend/utility/platform-haiku.cpp`). OBS never writes `~/config/settings/Renga/capture_privacy`; windows
+  the user marks there are greyed by app_server for OBS's captures like for every recorder.
+- **Streamer mode.** Not read yet and never turned on by OBS. A later change may follow it to hide the browser
+  docks' contents while it is on.
+- **Crash-safe recordings.** OBS's default format is already Hybrid MP4, which is written fragmented while
+  recording and finalised as a normal MP4 at the end (`plugins/obs-outputs/mp4-mux.c`), so an interrupted
+  recording stays playable without a remux. MKV with "Automatically remux to MP4" stays available.
+
 ### Planned Renga work OBS will use as it lands
 
 No request needed; OBS adapts when these arrive:

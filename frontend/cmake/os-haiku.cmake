@@ -14,6 +14,29 @@ target_compile_definitions(
 # libbe: BMessage/BString and BLocaleRoster (the locale kit is part of libbe), libnetwork: sockets
 target_link_libraries(obs-studio PRIVATE be network)
 
+# Renga: "Hide OBS windows from screen capture" uses BPrivate::BScreenCapture::SetWindowHidden() (private API of
+# libbe: ScreenCapture.h in private/interface, which includes ScreenCaptureDefs.h from private/app); see
+# utility/platform-haiku.cpp. cmake/haiku/defaults.cmake has already checked that Renga's headers are installed.
+find_path(
+  RengaFrontendInterfacePrivate_INCLUDE_DIR
+  NAMES ScreenCapture.h
+  PATHS /boot/system/develop/headers/private/interface
+  NO_DEFAULT_PATH
+)
+find_path(
+  RengaFrontendAppPrivate_INCLUDE_DIR
+  NAMES ScreenCaptureDefs.h
+  PATHS /boot/system/develop/headers/private/app
+  NO_DEFAULT_PATH
+)
+if(NOT RengaFrontendInterfacePrivate_INCLUDE_DIR OR NOT RengaFrontendAppPrivate_INCLUDE_DIR)
+  message(FATAL_ERROR "Renga's private interface headers (ScreenCapture.h, ScreenCaptureDefs.h) were not found.")
+endif()
+set_source_files_properties(
+  utility/platform-haiku.cpp
+  PROPERTIES INCLUDE_DIRECTORIES "${RengaFrontendInterfacePrivate_INCLUDE_DIR};${RengaFrontendAppPrivate_INCLUDE_DIR}"
+)
+
 if(TARGET OBS::python)
   find_package(Python REQUIRED COMPONENTS Interpreter Development)
   target_link_libraries(obs-studio PRIVATE Python::Python)

@@ -1336,7 +1336,7 @@ bool OBSApp::OBSInit()
 
 	blog(LOG_INFO, "Browser Hardware Acceleration: %s", browserHWAccel ? "true" : "false");
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__HAIKU__)
 	bool hideFromCapture = config_get_bool(userConfig, "BasicWindow", "HideOBSWindowsFromCapture");
 	blog(LOG_INFO, "Hide OBS windows from screen capture: %s", hideFromCapture ? "true" : "false");
 #endif

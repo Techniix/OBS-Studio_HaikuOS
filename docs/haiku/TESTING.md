@@ -424,6 +424,9 @@ Video (.mkv)" or "MPEG-4 (.mp4)", Video Encoder "Software (x264)", Audio Encoder
 - [ ] The *Stats* dock (*Docks → Stats*) shows no dropped/lagged frames at the default canvas size.
       Note the CPU usage and render time if frames are dropped.
 - [ ] Try "Advanced" output mode with "Hybrid MP4" as well.
+- [ ] Crash-safe default: on a fresh profile the Recording Format is "Hybrid MP4". Start a recording, then end OBS
+      from a Terminal with `kill -9 $(pidof obs)` after about 20 seconds. The partial `.mp4` must still play in
+      MediaPlayer (fragmented file, no remux).
 
 ### Hardware encoders (haiku-video-accel)
 
@@ -534,6 +537,10 @@ settings (the same key Haiku's own shortcuts use). OBS's "Alt" is Haiku's Contro
 - [ ] *Studio Mode*: two previews render; transitions animate.
 - [ ] *View → Multiview*: renders all scenes.
 - [ ] Source properties dialogs show their live preview at the top.
+- [ ] *Settings → General → Hide OBS windows from screen capture* is shown. Turn it on, add a Screen Capture of the
+      whole screen and open a Windowed Projector of it: OBS's main window and its dialogs show as plain grey in
+      the projector (the projector itself is not hidden). A screenshot (Print Screen) shows them grey too. Turn
+      the setting off: they appear again without restarting OBS. The log has no "Could not hide" warnings.
 
 ## 12. Tools
 

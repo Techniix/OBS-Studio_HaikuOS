@@ -288,6 +288,17 @@ the preview must not be a native child window. Haiku displays are ordinary (alie
 - `GetPreferredLocales()`: `BLocaleRoster::GetPreferredLanguages()`, falling back to `LC_MESSAGES`.
 - `GetDefaultVideoSavePath()`: the home folder (`B_USER_DIRECTORY`).
 - Hotkey translation (section 3), CPU frequency for system info.
+- "Hide OBS windows from screen capture" (Settings > General, off by default): Renga's
+  `BScreenCapture::SetWindowHidden()` (batch 5, `49102adf`) makes OBS's non-projector windows read as plain grey in
+  every capture, recording and screenshot, while they stay visible on screen, like Windows' `WDA_EXCLUDEFROMCAPTURE`.
+  It applies while the user's "Hide from capture" switch in the Screen recording preferences is on (the default).
+  The Haiku Qt plugin's `winId()` is the window's `BWindow`. Windows and applications the user marks in the Screen
+  recording preferences are greyed by app_server for every recorder, so OBS needs nothing for them.
+
+**Recording format.** OBS's default recording format is Hybrid MP4 (`hybrid_mp4`, OBS's own MP4 muxer): it writes
+a fragmented MP4 while recording and finalises it as a normal MP4 at the end, so a recording interrupted by a crash
+or power loss stays playable and needs no remux. This is the crash-safe default Renga asks recorders for (batch 5);
+MKV with "Automatically remux to MP4" is the alternative, and fragmented MP4/MOV are in the format list.
 
 `frontend/utility/system-info-haiku.cpp` fills the capabilities report used by Enhanced Broadcasting.
 `CrashHandler_Haiku.cpp` is a stub: Haiku's Debugger writes crash reports to the Desktop on its own.

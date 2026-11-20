@@ -657,7 +657,15 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	delete ui->processPriority;
 	delete ui->enableNewSocketLoop;
 	delete ui->enableLowLatencyMode;
+#ifdef __HAIKU__
+	/* Renga: hiding OBS's windows from capture is supported (BScreenCapture::SetWindowHidden) */
+	if (!SetDisplayAffinitySupported()) {
+		delete ui->hideOBSFromCapture;
+		ui->hideOBSFromCapture = nullptr;
+	}
+#else
 	delete ui->hideOBSFromCapture;
+#endif
 #if !defined(__APPLE__) && !defined(__linux__)
 	delete ui->browserHWAccel;
 	delete ui->sourcesGroup;
@@ -668,7 +676,9 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	ui->processPriority = nullptr;
 	ui->enableNewSocketLoop = nullptr;
 	ui->enableLowLatencyMode = nullptr;
+#ifndef __HAIKU__
 	ui->hideOBSFromCapture = nullptr;
+#endif
 #if !defined(__APPLE__) && !defined(__linux__)
 	ui->browserHWAccel = nullptr;
 	ui->sourcesGroup = nullptr;
@@ -1288,7 +1298,7 @@ void OBSBasicSettings::LoadGeneralSettings()
 	bool openStatsOnStartup = config_get_bool(main->Config(), "General", "OpenStatsOnStartup");
 	ui->openStatsOnStartup->setChecked(openStatsOnStartup);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__HAIKU__)
 	if (ui->hideOBSFromCapture) {
 		bool hideWindowFromCapture =
 			config_get_bool(App()->GetUserConfig(), "BasicWindow", "HideOBSWindowsFromCapture");
@@ -3051,7 +3061,7 @@ void OBSBasicSettings::SaveGeneralSettings()
 		forceUpdateCheck = true;
 	}
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__HAIKU__)
 	if (ui->hideOBSFromCapture && WidgetChanged(ui->hideOBSFromCapture)) {
 		bool hide_window = ui->hideOBSFromCapture->isChecked();
 		config_set_bool(App()->GetUserConfig(), "BasicWindow", "HideOBSWindowsFromCapture", hide_window);

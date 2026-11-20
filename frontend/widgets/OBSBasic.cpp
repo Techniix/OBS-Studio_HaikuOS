@@ -487,6 +487,8 @@ static const double scaled_vals[] = {1.0, 1.25, (1.0 / 0.75), 1.5, (1.0 / 0.6), 
 #ifdef __APPLE__ // macOS
 #define DEFAULT_CONTAINER "hybrid_mov"
 #else // Windows/Linux
+/* Haiku/Renga: Hybrid MP4 is written fragmented while recording and finalised at the end, so it is already the
+ * crash-safe default Renga asks recorders for (Renga batch 5); see docs/haiku/ARCHITECTURE.md, section 5. */
 #define DEFAULT_CONTAINER "hybrid_mp4"
 #endif
 
@@ -2043,6 +2045,9 @@ void OBSBasic::SetDisplayAffinity(QWindow *window)
 		}
 	}
 
+#elif defined(__HAIKU__)
+	/* Renga: BScreenCapture::SetWindowHidden(), see platform-haiku.cpp */
+	SetWindowHiddenFromCapture(window, hideFromCapture);
 #else
 	// TODO: Implement for other platforms if possible. Don't forget to
 	// implement SetDisplayAffinitySupported too!

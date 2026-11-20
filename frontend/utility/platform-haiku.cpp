@@ -29,6 +29,7 @@
 
 #include <QKeyEvent>
 #include <QWidget>
+#include <QWindow>
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -43,6 +44,8 @@
 #include <vector>
 
 #include <FindDirectory.h>
+#include <ScreenCapture.h>
+#include <Window.h>
 #include <InterfaceDefs.h>
 #include <OS.h>
 #include <LocaleRoster.h>
@@ -199,7 +202,28 @@ void SetAlwaysOnTop(QWidget *window, bool enable)
 
 bool SetDisplayAffinitySupported(void)
 {
-	return false;
+	/* Renga's BScreenCapture::SetWindowHidden() (OBSBasic::SetDisplayAffinity) */
+	return true;
+}
+
+/*
+ * "Hide OBS windows from screen capture" (Settings > General) on Renga (batch 5, 49102adf):
+ * BScreenCapture::SetWindowHidden() makes one of the caller's windows read as plain grey in every capture,
+ * recording and screenshot while the user's "Hide from capture" switch in the Screen recording preferences is on
+ * (the default), as Windows' WDA_EXCLUDEFROMCAPTURE does; the window stays visible on screen. The Haiku Qt platform
+ * plugin's winId() is the window's BWindow (qhaikuwindow.cpp, QHaikuWindow::winId()). The call only sends the
+ * window's server token to app_server, so it is safe from Qt's thread. OBSBasic::SetDisplayAffinity() passes
+ * top-level windows and skips projectors, which are meant to be captured.
+ */
+void SetWindowHiddenFromCapture(QWindow *window, bool hidden)
+{
+	if (!window)
+		return;
+	BWindow *bwindow = reinterpret_cast<BWindow *>(window->winId());
+	status_t status = BPrivate::BScreenCapture::SetWindowHidden(bwindow, hidden);
+	if (status != B_OK)
+		blog(LOG_WARNING, "Could not %s an OBS window %s screen capture: %s", hidden ? "hide" : "show",
+		     hidden ? "from" : "in", strerror(status));
 }
 
 void TaskbarOverlayInit() {}

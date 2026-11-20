@@ -35,6 +35,11 @@ bool IsAlwaysOnTop(QWidget *window);
 void SetAlwaysOnTop(QWidget *window, bool enable);
 
 bool SetDisplayAffinitySupported(void);
+#ifdef __HAIKU__
+class QWindow;
+/* Renga: hide (or show again) one of OBS's top-level windows in every screen capture */
+void SetWindowHiddenFromCapture(QWindow *window, bool hidden);
+#endif
 
 bool HighContrastEnabled();
 
