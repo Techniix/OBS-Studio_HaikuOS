@@ -331,6 +331,10 @@ converts to the sound card, applies the master volume and mixes OBS's players wi
   the monitoring device). Only if the registrar knows no signature for OBS is Desktop Audio not monitored, since
   the loopback could then not tell OBS's streams apart.
 
+Virtual devices (Renga batch 11) are listed after the sound cards as "<name> (virtual device)", with the route
+`renga:virtual:<name>` as the device id, which `SetRoute()` takes like a device name. Monitoring into one plays
+nowhere and can be recorded by other programs from that virtual device.
+
 ## 7. haiku-media: audio and video capture
 
 `plugins/haiku-media/`, built on the Media Kit's `BMediaRecorder`.
@@ -416,6 +420,15 @@ application:
 - The selection is written to the loopback's `renga:loopback_signature` parameter. The mixer compares
   signatures every cycle, so the capture follows the application across restarts.
 - The recorded sound is taken before the master volume, so it does not change with the speaker volume.
+- Virtual devices (Renga batch 11, `35ce7b3b`): the list also offers the user's virtual devices
+  (`AudioStreamControl::GetVirtualDevices()`, made on the Audio preferences' Mixing page). The source records
+  the route `renga:virtual:<name>` as its signature, which gives every stream routed there: a submix (a "Stream"
+  bus of chosen applications) that the speakers do not play. OBS is excluded from it as from Desktop Audio,
+  because OBS's monitoring can be routed to a virtual device too (section 6). A removed virtual device stays
+  selected as "(virtual device not found)".
+- Renga's ducking and microphone processing need no OBS code. Ducking does not touch loopbacks of single
+  applications; the microphone's gate, gain and high-pass run in the sound card's node, so with OBS's own
+  filters on a microphone users may want Renga's processing off for that device.
 - Per-source audio of a browser source ("Control audio via OBS") uses its own loopback of the helper's team and
   puts that team on the mixer's loopback-only list (O-3, O-18; section 10). Desktop Audio needs nothing for it:
   loopback-only streams are left out of all-streams loopbacks.

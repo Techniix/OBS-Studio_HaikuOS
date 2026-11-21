@@ -273,6 +273,16 @@ Not OBS requests; Renga's notes for recorders. How OBS uses them:
   recording and finalised as a normal MP4 at the end (`plugins/obs-outputs/mp4-mux.c`), so an interrupted
   recording stays playable without a remux. MKV with "Automatically remux to MP4" stays available.
 
+### Renga batch 11 (2026-11-21, `35ce7b3b`): virtual devices, ducking, microphone processing
+
+Not OBS requests. How OBS uses them:
+
+- **Virtual devices.** Application Audio Capture lists them and records `renga:virtual:<name>`, leaving OBS's
+  own streams out; the audio monitoring device list offers them as routes
+  (`plugins/haiku-media/loopback-audio.cpp`, `libobs/audio-monitoring/haiku/haiku-sound-player.cpp`).
+- **Ducking, microphone processing.** No OBS change. Noted for users in ARCHITECTURE.md section 8.
+- **Several inputs in one virtual device.** Still open in Renga; OBS needs nothing extra once it works.
+
 ### Planned Renga work OBS will use as it lands
 
 No request needed; OBS adapts when these arrive:

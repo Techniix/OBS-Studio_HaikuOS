@@ -259,8 +259,14 @@ void loopback_update(void *data, obs_data_t *settings)
 		blog(LOG_WARNING, "[haiku-media] '%s': not capturing OBS's own audio", obs_source_get_name(la->source));
 		signature.clear();
 	}
-	/* No exclusions: the loopback records the one application chosen, never OBS (refused above). */
-	la->capture->Configure(signature, HaikuOpenParams(), !signature.empty());
+	/* A virtual device (Renga batch 11, 35ce7b3b): the "signature" renga:virtual:<name> records every stream
+	 * routed there. OBS's monitoring can be routed to one too (libobs/audio-monitoring/haiku), so OBS is left
+	 * out of it as from Desktop Audio: recording a monitored source back through its own monitor would feed
+	 * it back into itself. An application loopback needs no exclusions: it records the one application
+	 * chosen, never OBS (refused above). */
+	const bool virtual_device = BPrivate::AudioStreamControl::VirtualName(signature.c_str()) != nullptr;
+	la->capture->Configure(signature, virtual_device ? desktop_audio_params() : HaikuOpenParams(),
+			       !signature.empty());
 }
 
 void *loopback_create(obs_data_t *settings, obs_source_t *source, bool per_application)
@@ -355,13 +361,15 @@ void application_audio_defaults(obs_data_t *settings)
  * changed or Refresh was pressed. The properties are built from the last list, without waiting.
  */
 struct ApplicationEntry {
-	std::string signature;
+	std::string signature; /* or a virtual device's route, renga:virtual:<name> */
 	std::string name;
 	bool playing; /* name: the stream's display name; else the application's file name */
+	bool virtual_device = false; /* name: the virtual device's name */
 
 	bool operator==(const ApplicationEntry &other) const
 	{
-		return signature == other.signature && name == other.name && playing == other.playing;
+		return signature == other.signature && name == other.name && playing == other.playing &&
+		       virtual_device == other.virtual_device;
 	}
 };
 
@@ -485,6 +493,19 @@ private:
 		 * signature as a hidden parameter of kind "renga:app_signature". Streams of the media add-on
 		 * server and of programs without a signature have none and cannot be told apart by the loopback. */
 		if (BMediaRoster::IsRunning() && control.Update() == B_OK) {
+			/* Renga batch 11: the user's virtual devices first, recorded by their route (a submix the
+			 * user routes chosen applications to in the Audio preferences or their Output menus) */
+			BStringList virtual_devices;
+			if (control.GetVirtualDevices(virtual_devices) == B_OK) {
+				for (int32 i = 0; i < virtual_devices.CountStrings(); i++) {
+					const BString &name = virtual_devices.StringAt(i);
+					if (name.IsEmpty())
+						continue;
+					const BString route =
+						BPrivate::AudioStreamControl::VirtualRoute(name.String());
+					list.push_back({route.String(), name.String(), false, true});
+				}
+			}
 			for (int32 i = 0; i < control.CountStreams(); i++) {
 				const BPrivate::AudioStream *stream = control.StreamAt(i);
 				if (wanted(stream->signature.String()))
@@ -545,7 +566,10 @@ void fill_application_list(obs_property_t *list, const char *current)
 	struct dstr label = {0};
 	bool current_listed = false;
 	for (const ApplicationEntry &entry : application_list().Get()) {
-		if (entry.playing) {
+		if (entry.virtual_device) {
+			dstr_printf(&label, T_("Application.VirtualDevice"), entry.name.c_str());
+			obs_property_list_add_string(list, label.array, entry.signature.c_str());
+		} else if (entry.playing) {
 			dstr_printf(&label, T_("Application.Playing"), entry.name.c_str());
 			obs_property_list_add_string(list, label.array, entry.signature.c_str());
 		} else {
@@ -554,7 +578,12 @@ void fill_application_list(obs_property_t *list, const char *current)
 		current_listed = current_listed || entry.signature == current;
 	}
 
-	if (current && *current && !current_listed && HaikuOwnSignature() != current) {
+	const char *missing_virtual = BPrivate::AudioStreamControl::VirtualName(current);
+	if (missing_virtual && !current_listed) {
+		/* a virtual device the user removed (or one of an older scene collection); kept selected */
+		dstr_printf(&label, T_("Application.VirtualMissing"), missing_virtual);
+		obs_property_list_add_string(list, label.array, current);
+	} else if (current && *current && !current_listed && HaikuOwnSignature() != current) {
 		dstr_printf(&label, T_("Application.NotRunning"), current);
 		obs_property_list_add_string(list, label.array, current);
 	}

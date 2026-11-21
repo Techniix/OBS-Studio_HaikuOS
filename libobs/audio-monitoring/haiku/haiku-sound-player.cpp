@@ -126,7 +126,29 @@ extern "C" void obs_haiku_enum_output_devices(obs_haiku_device_cb cb, void *para
 
 	for (const std::string &name : output_devices(roster))
 		if (!cb(param, name.c_str(), name.c_str()))
-			break;
+			return;
+
+	/* Renga batch 11 (35ce7b3b): the virtual devices the user made on the Audio preferences' Mixing page. A
+	 * stream routed to "renga:virtual:<name>" (AudioStreamControl::VirtualRoute()) plays on no sound card and
+	 * is left out of "What you hear"; a loopback started for that route as its signature records it. So
+	 * monitoring OBS's sources into one gives a submix that other programs (or an Application Audio Capture
+	 * of the virtual device in another OBS) can record, without the speakers playing it. The id is the route
+	 * itself, which obs_haiku_route_streams() hands to SetRoute() like a device name. One parameter-web read
+	 * on the caller's thread, like the dormant-node query above; nothing is listed if it fails (an older
+	 * mixer without the parameter). libobs has no translations here, hence the plain English suffix. */
+	BPrivate::AudioStreamControl control;
+	BStringList virtual_devices;
+	if (control.Update() != B_OK || control.GetVirtualDevices(virtual_devices) != B_OK)
+		return;
+	for (int32 i = 0; i < virtual_devices.CountStrings(); i++) {
+		const BString &name = virtual_devices.StringAt(i);
+		if (name.IsEmpty())
+			continue;
+		const BString id = BPrivate::AudioStreamControl::VirtualRoute(name.String());
+		const std::string label = std::string(name.String()) + " (virtual device)";
+		if (!cb(param, label.c_str(), id.String()))
+			return;
+	}
 }
 
 /* The signature the mixer knows OBS's streams by: AudioMixer::_IdentifyApplication() asks the registrar for

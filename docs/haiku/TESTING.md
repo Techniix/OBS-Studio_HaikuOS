@@ -316,6 +316,10 @@ is needed if OBS crashes.
         capturing when the application plays.
   - [ ] Monitoring Application Audio Capture of another application (*Monitor and Output*) gives no echo.
   - [ ] The captured level does not change with the master volume.
+  - [ ] Virtual device: make one in *Audio preferences → Mixing* (for example "Stream") and route MediaPlayer to
+        it in its *Output* menu. The *Application* list shows "Stream (virtual device)"; selecting it records
+        MediaPlayer, which the speakers no longer play. Desktop Audio does not record it. Delete the virtual
+        device: the source shows "Stream (virtual device not found)".
 - [ ] OBS has an application signature: `ScreenRecording --list` shows (after the first capture) or the log shows `application/x-vnd.obs-studio`
       (needed for routing, self-exclusion and the screen permission). Note if it does not.
 
@@ -345,6 +349,9 @@ chosen device by name (the mixer's `renga:routes`).
       returns to OBS's monitoring device.
 - [ ] If the log says OBS has no application signature the mixer could know its streams by, routing cannot work;
       send the log line.
+- [ ] With a virtual device made (section 4), the monitoring device list shows "<name> (virtual device)".
+      Monitoring into it is silent on the speakers, and an Application Audio Capture of that virtual device in
+      OBS stays silent (OBS is left out of it, so there is no feedback).
 
 ## 6. Browser source and docks
 
